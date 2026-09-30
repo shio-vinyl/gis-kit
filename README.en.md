@@ -19,7 +19,7 @@ Vector, raster, DEM terrain, network accessibility, and tracing and georeferenci
 
 ## How this started
 
-Anyone who does GIS knows the moment: you just want to dissolve a layer by a field, check its CRS, or compute slope from a DEM, and instead you are opening a desktop GIS, waiting for it to load, adding layers and digging through menus for the right tool. The job takes five minutes; the ceremony takes half of that.
+Anyone who does GIS knows the moment: you just want to dissolve a layer by a field, check its CRS, or compute slope from a DEM, and instead you are opening a desktop GIS, waiting for it to load, adding layers and digging through menus for the right tool.
 
 gis-kit grew out of that. I took the operations I find useful but never want to launch QGIS for, wrote them up as scripts one by one, and handed them to an agent. There are now more than 40 tools covering most of what I run into day to day. More will keep going in: practical features for specific scenarios, and some more research-oriented experiments.
 
@@ -46,7 +46,7 @@ gis-kit is aimed at everyday scale: a few layers, one DEM, one city's road netwo
 - **Vector**: clip, dissolve, merge, spatial join, buffer, field and topology checks and fixes, area and urban metrics, packaged as versioned daily result bundles.
 - **Raster and terrain**: zonal statistics, reprojection, COG output, windowed processing for large rasters; DEM slope, aspect, contours and profiles; optional GRASS for hydrology, viewsheds and terrain cost.
 - **Networks and coverage**: directed road networks, OD, facility coverage scenarios, demand-weighted coverage. Without demand weights, it won't make up a population coverage figure.
-- **Historical map vectorization**: the most interesting part of the box, and the most research-flavoured. The model looks at the scanned image and traces roads and boundaries section by section in pixel space; the scripts handle cropping, non-generative enhancement, coordinate conversion, versioning and overlay checks, then affine or TPS georeferencing. No generative infill, and no automatic line tracing standing in for the model's own reading. To be honest, I haven't found a stable way to optimize it yet; right now it works, and accuracy and cost are still being figured out.
+- **Historical map vectorization**: still under research and not yet mature. The model looks at the scanned image and traces roads and boundaries section by section in pixel space; the scripts handle cropping, non-generative enhancement, coordinate conversion, versioning and overlay checks, then affine or TPS georeferencing. No generative infill, and no automatic line tracing standing in for the model's own reading. At the moment only the astra6.0 and sol6.1 model series run it reliably; I recommend low reasoning effort for both, since raising it doesn't noticeably improve results.
 - **Repeated delivery**: `--trace` records the steps you actually ran, which can be turned into a recipe and replayed on the next batch of data; `semantic-check` tells you whether selected fields were quietly changed between steps.
 
 ## Quick start
