@@ -1,0 +1,25 @@
+# gis-kit 默认偏好；按需修改本文件。
+# 字体按 family → fallback 顺序选择第一个已安装字体；都不存在时使用 DejaVu Sans（不含中文字形）。
+
+defaults:
+  crs: "EPSG:4326"
+  output_format: "gpkg"
+  encoding: "utf-8"
+
+font:
+  family: "Noto Sans CJK SC"
+  fallback:
+    - "Source Han Sans SC"
+    - "PingFang SC"
+    - "Microsoft YaHei"
+    - "SimHei"
+    - "WenQuanYi Micro Hei"
+  size:
+    title: 16
+    label: 10
+    tick: 8
+
+plot:
+  dpi: 300
+  figsize: [12, 8]
+  export_format: "png"

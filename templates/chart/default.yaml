@@ -1,0 +1,40 @@
+# 统计图表 - 默认样式
+
+category: chart
+
+style:
+  palette: "categorical_10"
+  background: "#FFFFFF"
+  grid:
+    enabled: true
+    color: "#EAECEE"
+    linewidth: 0.5
+    linestyle: "--"
+  bar:
+    edgecolor: "#2C3E50"
+    linewidth: 0.5
+    alpha: 0.85
+  pie:
+    startangle: 90
+    autopct: "%1.1f%%"
+    shadow: false
+  hist:
+    bins: 20
+    edgecolor: "#FFFFFF"
+    linewidth: 0.8
+    alpha: 0.8
+
+layout:
+  title:
+    fontsize: 14
+    fontweight: "bold"
+    color: "#2C3E50"
+  axis_label:
+    fontsize: 11
+    color: "#566573"
+  tick:
+    fontsize: 9
+    color: "#7F8C8D"
+  legend:
+    fontsize: 9
+    framealpha: 0.9

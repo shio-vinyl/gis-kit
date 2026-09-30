@@ -1,0 +1,52 @@
+# 用地分类图 - 国标配色（参考 GB 50137-2011）
+# 城乡用地分类与规划建设用地标准
+
+category: landuse
+
+classification:
+  R:
+    name: "居住用地"
+    color: "#FFFF00"
+  A:
+    name: "公共管理与公共服务用地"
+    color: "#FF69B4"
+  B:
+    name: "商业服务业设施用地"
+    color: "#FF0000"
+  M:
+    name: "工业用地"
+    color: "#8B4513"
+  W:
+    name: "物流仓储用地"
+    color: "#A0522D"
+  S:
+    name: "道路与交通设施用地"
+    color: "#808080"
+  U:
+    name: "公用设施用地"
+    color: "#4169E1"
+  G:
+    name: "绿地与广场用地"
+    color: "#228B22"
+  E:
+    name: "非建设用地"
+    color: "#90EE90"
+
+style:
+  edgecolor: "#333333"
+  linewidth: 0.3
+  label:
+    enabled: false
+  legend:
+    enabled: true
+    loc: "lower right"
+    fontsize: 9
+    framealpha: 0.9
+
+layout:
+  title:
+    fontsize: 16
+    fontweight: "bold"
+    color: "#333333"
+  background: "#FFFFFF"
+  padding: 0.03

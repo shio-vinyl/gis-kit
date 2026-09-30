@@ -1,0 +1,46 @@
+# 用地分类图 - 自定义样式
+# 用户可根据项目需求修改分类和配色
+
+category: landuse
+
+classification:
+  residential:
+    name: "居住"
+    color: "#F9E79F"
+  commercial:
+    name: "商业"
+    color: "#F5B7B1"
+  industrial:
+    name: "工业"
+    color: "#D5DBDB"
+  green:
+    name: "绿地"
+    color: "#A9DFBF"
+  public:
+    name: "公共服务"
+    color: "#AED6F1"
+  transport:
+    name: "交通"
+    color: "#D2B4DE"
+  mixed:
+    name: "混合用地"
+    color: "#FAD7A0"
+
+style:
+  edgecolor: "#566573"
+  linewidth: 0.4
+  label:
+    enabled: false
+  legend:
+    enabled: true
+    loc: "lower right"
+    fontsize: 9
+    framealpha: 0.9
+
+layout:
+  title:
+    fontsize: 16
+    fontweight: "bold"
+    color: "#2C3E50"
+  background: "#FFFFFF"
+  padding: 0.03

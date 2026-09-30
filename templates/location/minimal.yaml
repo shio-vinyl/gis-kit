@@ -1,0 +1,46 @@
+# 区位图 - 极简样式
+# 纯线框，适合作为底图或叠加使用
+
+category: location
+
+layers:
+  province:
+    facecolor: "none"
+    edgecolor: "#2C3E50"
+    linewidth: 1.2
+    label:
+      enabled: false
+
+  city:
+    facecolor: "none"
+    edgecolor: "#7F8C8D"
+    linewidth: 0.8
+    label:
+      enabled: false
+
+  district:
+    facecolor: "none"
+    edgecolor: "#BDC3C7"
+    linewidth: 0.5
+    label:
+      enabled: false
+
+  highlight:
+    facecolor: "#3498DB"
+    edgecolor: "#2C3E50"
+    linewidth: 1.5
+    alpha: 0.3
+    label:
+      enabled: true
+      field: "name"
+      fontsize: 10
+      fontweight: "bold"
+      color: "#2C3E50"
+
+layout:
+  title:
+    fontsize: 14
+    fontweight: "normal"
+    color: "#2C3E50"
+  background: "#FFFFFF"
+  padding: 0.05

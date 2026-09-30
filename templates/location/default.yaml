@@ -1,0 +1,58 @@
+# 区位图 - 默认样式
+# 适用于行政区划嵌套展示
+
+category: location
+
+layers:
+  province:
+    facecolor: "#EAECEE"
+    edgecolor: "#2C3E50"
+    linewidth: 1.5
+    label:
+      enabled: true
+      field: "name"
+      fontsize: 12
+      fontweight: "bold"
+      color: "#2C3E50"
+
+  city:
+    facecolor: "#D5D8DC"
+    edgecolor: "#566573"
+    linewidth: 1.0
+    label:
+      enabled: true
+      field: "name"
+      fontsize: 10
+      fontweight: "normal"
+      color: "#566573"
+
+  district:
+    facecolor: "#AED6F1"
+    edgecolor: "#2980B9"
+    linewidth: 0.8
+    label:
+      enabled: true
+      field: "name"
+      fontsize: 8
+      fontweight: "normal"
+      color: "#2980B9"
+
+  highlight:
+    facecolor: "#E74C3C"
+    edgecolor: "#C0392B"
+    linewidth: 2.0
+    alpha: 0.6
+    label:
+      enabled: true
+      field: "name"
+      fontsize: 11
+      fontweight: "bold"
+      color: "#C0392B"
+
+layout:
+  title:
+    fontsize: 18
+    fontweight: "bold"
+    color: "#2C3E50"
+  background: "#FFFFFF"
+  padding: 0.05

@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Discover GIS capabilities without importing backends; forward to their native CLI."""
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+SCRIPTS = Path(__file__).resolve().parent
+
+
+def catalog(scripts: Path = SCRIPTS) -> list[dict]:
+    """The installed scripts and reference texts are the catalog; no registry."""
+    references = {p.name: p.read_text(encoding='utf-8')
+                  for p in sorted((scripts.parent / 'references').glob('*.md'))}
+    result = []
+    for path in sorted(scripts.glob('*.py')):
+        if path.name.startswith('_') or path.name == 'gis.py':
+            continue
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=path.name)
+        summary = (ast.get_docstring(tree) or '').strip().split('\n')[0]
+        result.append({'name': path.stem, 'summary': summary,
+                       'references': ['references/' + name for name, text in references.items()
+                                      if path.name in text]})
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        'gis.py list [--json] [--search TEXT]; gis.py TOOL --help; '
+        'gis.py [--trace DIRECTORY] TOOL ... . Existing script CLIs remain supported.'))
+    parser.add_argument('--trace', type=Path, help='Opt-in local execution records; no stdout/stderr or environment capture')
+    parser.add_argument('tool', nargs='?', help='list, or a public script name without .py')
+    parser.add_argument('arguments', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.tool is None:
+        parser.print_help()
+        return 0
+    if args.tool == 'list':
+        listing = argparse.ArgumentParser(prog='gis.py list', description='Read script docstrings and existing reference links; no backend imports')
+        listing.add_argument('--json', action='store_true')
+        listing.add_argument('--search', default='')
+        options = listing.parse_args(args.arguments)
+        rows = [row for row in catalog() if options.search.casefold() in json.dumps(row, ensure_ascii=False).casefold()]
+        if options.json:
+            print(json.dumps({'commands': rows}, ensure_ascii=False, indent=2))
+        else:
+            for row in rows:
+                print(f"{row['name']:22} {row['summary']}")
+        return 0
+    # Resolve only an existing public script, never a path or a private worker.
+    scripts = {p.stem: p for p in SCRIPTS.glob('*.py')
+               if not p.name.startswith('_') and p.name != 'gis.py'}
+    if args.tool not in scripts:
+        parser.error('Unknown tool; use gis.py list')
+    command = [sys.executable, str(scripts[args.tool]), *args.arguments]
+    try:
+        if args.trace is not None:
+            from _execution_trace import run_traced
+            return run_traced(args.trace, args.tool, args.arguments, command)
+        result = subprocess.run(command)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    except KeyboardInterrupt:
+        return 130
+    except (OSError, ValueError) as error:
+        parser.exit(1, f'ERROR: {error}\n')
+
+
+if __name__ == '__main__':
+    sys.exit(main())

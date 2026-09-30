@@ -1,0 +1,12 @@
+# 核心依赖：矢量、栅格、计量、检查图与模板。
+# 下限取自已测版本；精确组合见 requirements-tested.txt。
+numpy>=2.2
+shapely>=2.1
+geopandas>=1.1
+pyogrio>=0.12
+pyproj>=3.7
+pandas>=2.3
+rasterio>=1.4
+matplotlib>=3.9
+Pillow>=11.3
+PyYAML>=6.0

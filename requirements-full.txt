@@ -1,0 +1,12 @@
+# 完整依赖：核心 + 路网、统计、图像增强、表格导出与测试。
+# Spatial SQL 另见 requirements-spatial-sql.txt；QGIS、GRASS、PySAL 等后端不在此列。
+-r requirements-core.txt
+scipy>=1.13
+scikit-learn>=1.6
+scikit-image>=0.24
+opencv-python>=4.12
+networkx>=3.4
+pyarrow>=21.0
+openpyxl>=3.1
+tabulate>=0.9
+pytest>=8.4
