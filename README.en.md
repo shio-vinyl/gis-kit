@@ -2,9 +2,9 @@
 
 # gis-kit
 
-**A GIS toolbox for AI agents.**
+**Everyday GIS operations as scripts, easy for AI agents to call.**
 
-Vector, raster, DEM terrain, network accessibility, and tracing and georeferencing scanned maps. Everyday GIS work, handed to Claude Code, Codex and similar agents to finish on the command line.
+A skill for Claude Code, Codex and other agents.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](requirements-tested.txt)
@@ -17,31 +17,23 @@ Vector, raster, DEM terrain, network accessibility, and tracing and georeferenci
 
 ---
 
-## How this started
+## What this is
 
-Anyone who does GIS knows the moment: you just want to dissolve a layer by a field, check its CRS, or compute slope from a DEM, and instead you are opening a desktop GIS, waiting for it to load, adding layers and digging through menus for the right tool.
-
-gis-kit grew out of that. I took the operations I find useful but never want to launch QGIS for, wrote them up as scripts one by one, and handed them to an agent. There are now more than 40 tools covering most of what I run into day to day. More will keep going in: practical features for specific scenarios, and some more research-oriented experiments.
-
-## A toolbox, not a rulebook
-
-A lot of agent skills are written as rules for the model: do this first, then that, and in this situation you must do the other thing, with the whole procedure fixed in the prompt. gis-kit goes the other way. It assumes today's models are capable enough to understand a task, look things up and plan on their own, so what it mainly provides is tools:
+This is the GIS toolbox I use myself: operations I find useful, written up as scripts the way I understand them, now more than 40 of them. What sets it apart from an ordinary script collection is that it's set up for agents to call: a single entry point lists and searches the tools, each tool's `--help` is its parameter reference, and the agent can look things up and combine them on its own.
 
 ```bash
-python scripts/gis.py list                # see what's in the box (standard library only)
+python scripts/gis.py list                # tool catalogue (standard library only)
 python scripts/gis.py list --search raster
-python scripts/gis.py raster --help       # each tool's own parameter help
+python scripts/gis.py raster --help       # parameter reference
 ```
 
-The agent browses the catalogue, reads the help, and decides which pieces to use and how to chain them. Each tool only has to do its own part well: deterministic computation, atomic writes, a read-back after writing, and a QA plot when one is useful.
+[SKILL.md](SKILL.md) only lays down a few basic judgements for handling data, such as CRS, units, NoData, and marking inferred results as `candidate` / `hold`. Which tools to use and how to chain them is up to the agent.
 
-The rules haven't vanished entirely. They stay where the data itself tends to mislead: a CRS label is not a reprojection, degrees are not metres, NoData must not leak into statistics, anything inferred is marked `candidate`, anything uncertain is marked `hold`, and none of it is reported as settled fact. These hold no matter how strong the model is. They live in [SKILL.md](SKILL.md), and they are the only conventions an agent needs to keep while using the toolbox.
+For ordinary-sized tasks this is enough. When the data is very large or performance matters, have the agent call a desktop GIS backend such as QGIS or GRASS; big tables can also go through the optional DuckDB spatial SQL path.
 
-## When to open a desktop GIS anyway
+More practical features for specific scenarios, and some research-oriented ones, will be added over time.
 
-gis-kit is aimed at everyday scale: a few layers, one DEM, one city's road network. When the data is genuinely large or performance really matters, the better move is to have the agent call a professional backend such as QGIS or GRASS, or use the optional DuckDB spatial SQL path for big tables. gis-kit isn't trying to replace a desktop GIS. It fills the wide space between "dash off some GeoPandas" and "open the full desktop application".
-
-## What's in the box
+## Current tools
 
 - **Vector**: clip, dissolve, merge, spatial join, buffer, field and topology checks and fixes, area and urban metrics, packaged as versioned daily result bundles.
 - **Raster and terrain**: zonal statistics, reprojection, COG output, windowed processing for large rasters; DEM slope, aspect, contours and profiles; optional GRASS for hydrology, viewsheds and terrain cost.
@@ -68,7 +60,7 @@ python3.10 -m venv ~/.venvs/gis-kit
 ~/.venvs/gis-kit/bin/python ~/.claude/skills/gis-kit/scripts/daily.py environment
 ```
 
-**3. Then ask the way you'd brief a colleague**
+**3. Just ask the agent**
 
 > Dissolve `parcels.gpkg` by land-use type, compute areas in a CGCS2000 projection, and give me a QA plot.
 >
@@ -78,7 +70,7 @@ python3.10 -m venv ~/.venvs/gis-kit
 >
 > Trace the roads on this scanned historical map and georeference it with my control points.
 
-The agent takes it from there: it reads [SKILL.md](SKILL.md), pulls in whichever `references/` documents it needs, and picks the tools and parameters itself.
+The agent reads [SKILL.md](SKILL.md), consults the relevant `references/` documents as needed, and picks the tools and parameters itself.
 
 ## Environment and dependencies
 

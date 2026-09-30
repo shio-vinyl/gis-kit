@@ -2,9 +2,9 @@
 
 # gis-kit
 
-**给 AI agent 的一只 GIS 工具箱。**
+**把常用的 GIS 操作写成脚本，方便 AI agent 调用。**
 
-矢量、栅格、DEM 地形、路网可达、扫描地图描绘与配准。日常的 GIS 活儿，交给 Claude Code、Codex 这类 agent 在命令行里做完。
+面向 Claude Code、Codex 等 agent 的 skill。
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](requirements-tested.txt)
@@ -17,31 +17,23 @@
 
 ---
 
-## 缘起
+## 这是什么
 
-做 GIS 的人大概都有这种时刻：只是想把一个图层按字段融合一下、看一眼它的 CRS、给 DEM 算个坡度，却要打开桌面 GIS，等它启动，加载图层，在菜单里翻半天找工具。
-
-gis-kit 就是从这里长出来的。我把自己平时觉得有用、但每次都不想为它专门开 QGIS 的那些操作，一个个写成脚本搬了进来，然后交给 agent 去用。现在它有 40 多个工具，覆盖了我日常遇到的大部分场景。接下来还会继续往里添东西，一类是特定场景下的实用功能，另一类是偏研究性的尝试。
-
-## 给工具箱，不给规矩
-
-很多 agent skill 的写法是给模型立规矩：先做什么、再做什么、遇到某种情况必须怎样，把一套流程写死在提示词里。gis-kit 换了个方向。它假定今天的模型已经足够强，能自己理解任务、查资料、做规划，所以这里提供的主要是工具：
+这是我自己用的 GIS 工具箱：平时觉得有用的操作，按我自己的理解写成了脚本，现在有 40 多个。和普通脚本集的区别在于调用方式照顾了 agent：有一个统一入口可以列出和搜索工具，每个工具的 `--help` 就是参数说明，agent 可以自己查、自己组合。
 
 ```bash
-python scripts/gis.py list                # 看看箱子里有什么（只需标准库）
+python scripts/gis.py list                # 工具目录（只需标准库）
 python scripts/gis.py list --search raster
-python scripts/gis.py raster --help       # 每个工具自己的参数说明
+python scripts/gis.py raster --help       # 参数说明
 ```
 
-agent 自己翻目录、读 help，决定用哪几件、按什么顺序拼起来。每件工具只管把自己那部分做扎实：计算是确定性的，文件原子写出，写完回读一遍，需要时出一张检查图。
+[SKILL.md](SKILL.md) 里只写了几条处理数据时的基本判断，比如 CRS、单位、NoData，以及推定结果要标成 `candidate` / `hold`。具体用哪个工具、怎么串起来，由 agent 自己决定。
 
-规矩没有完全消失，只留在数据本身容易骗人的地方：CRS 标签不等于重投影，经纬度不是米，NoData 不能混进统计，推定出来的东西标成 `candidate`，拿不准的标成 `hold`，不把它们写成确定结论。这几条和模型强不强无关，写在 [SKILL.md](SKILL.md) 里，是 agent 用这套工具时唯一需要守的约定。
+一般规模的任务用它就够了。数据量很大或对性能要求高时，还是让 agent 调用 QGIS、GRASS 这类桌面 GIS 后端，大表也可以走可选的 DuckDB 空间 SQL。
 
-## 什么时候还是该开桌面 GIS
+之后会继续加一些特定场景的实用功能和研究性功能。
 
-gis-kit 瞄准的是日常规模：几个图层、一块 DEM、一个城市的路网。数据量真的很大，或者对性能要求很高时，更合适的做法是让 agent 调用专业后端，比如 QGIS、GRASS，或者用可选的 DuckDB 空间 SQL 处理大表。gis-kit 自己不打算变成一个桌面 GIS 的替代品。它更像是在“随手写段 GeoPandas”和“打开完整桌面软件”之间，补上中间那一大片。
-
-## 箱子里现在有什么
+## 现有工具
 
 - **矢量**：裁剪、融合、合并、空间关联、缓冲、字段与拓扑的检查修复、面积与城市指标，结果打包成带版本的日常结果包。
 - **栅格与地形**：分区统计、重投影、COG 输出，大栅格按窗口处理；DEM 的坡度、坡向、等高线、剖面；可选接 GRASS 做水文、可视域和地形成本。
@@ -68,7 +60,7 @@ python3.10 -m venv ~/.venvs/gis-kit
 ~/.venvs/gis-kit/bin/python ~/.claude/skills/gis-kit/scripts/daily.py environment
 ```
 
-**3. 然后就像跟同事交代活儿一样说**
+**3. 直接对 agent 说**
 
 > 把 `parcels.gpkg` 按用地类型融合，用 CGCS2000 投影算面积，出一张检查图。
 >
@@ -78,7 +70,7 @@ python3.10 -m venv ~/.venvs/gis-kit
 >
 > 把这张扫描老地图上的道路描出来，用我给的控制点配准。
 
-剩下的交给 agent：它会读 [SKILL.md](SKILL.md)，按需翻 `references/` 里的参考文档，自己挑工具、定参数。
+agent 会读 [SKILL.md](SKILL.md)，按需查看 `references/` 里的参考文档，自己选工具和参数。
 
 ## 环境与依赖
 
