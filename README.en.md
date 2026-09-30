@@ -46,7 +46,7 @@ gis-kit is aimed at everyday scale: a few layers, one DEM, one city's road netwo
 - **Vector**: clip, dissolve, merge, spatial join, buffer, field and topology checks and fixes, area and urban metrics, packaged as versioned daily result bundles.
 - **Raster and terrain**: zonal statistics, reprojection, COG output, windowed processing for large rasters; DEM slope, aspect, contours and profiles; optional GRASS for hydrology, viewsheds and terrain cost.
 - **Networks and coverage**: directed road networks, OD, facility coverage scenarios, demand-weighted coverage. Without demand weights, it won't make up a population coverage figure.
-- **Scanned maps**: my own favourite part. The model looks at the image and traces roads and boundaries section by section in pixel space; the scripts handle cropping, non-generative enhancement, coordinate conversion, versioning and overlay checks, then affine or TPS georeferencing. No generative infill, and no automatic line tracing standing in for the model's own reading.
+- **Historical map vectorization**: the most interesting part of the box, and the most research-flavoured. The model looks at the scanned image and traces roads and boundaries section by section in pixel space; the scripts handle cropping, non-generative enhancement, coordinate conversion, versioning and overlay checks, then affine or TPS georeferencing. No generative infill, and no automatic line tracing standing in for the model's own reading. To be honest, I haven't found a stable way to optimize it yet; right now it works, and accuracy and cost are still being figured out.
 - **Repeated delivery**: `--trace` records the steps you actually ran, which can be turned into a recipe and replayed on the next batch of data; `semantic-check` tells you whether selected fields were quietly changed between steps.
 
 ## Quick start
@@ -86,7 +86,7 @@ Dependencies come in layers: `requirements-core.txt` covers vector, raster and Q
 
 The agent should always use the same interpreter; see [Runtime environment](references/runtime-environment.md). QGIS, GRASS and PySAL are optional backends that need their own installation. Chinese map labels use the first installed font from the list in `config/user.yaml`, Noto Sans CJK SC by default; if none is installed it falls back to DejaVu Sans, and Chinese text won't render.
 
-Finished maps, Scene / Storyboard and map videos belong to the separate gis-composer runtime, located through `GIS_COMPOSER_HOME`. gis-kit doesn't depend on it and produces diagnostic and QA plots without it.
+Finished maps, Scene / Storyboard and map videos are handled by a separate project, gis-composer. It isn't public yet; I want to polish it for a while longer before releasing it. gis-kit doesn't depend on it and produces diagnostic and QA plots without it; if you do have it, it's located through `GIS_COMPOSER_HOME`.
 
 ## Tests
 
