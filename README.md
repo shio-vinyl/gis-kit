@@ -19,7 +19,9 @@
 
 ## 这是什么
 
-这是我自己用的 GIS 工具箱：平时觉得有用的操作，按我自己的理解写成了脚本，现在有 40 多个。和普通脚本集的区别在于调用方式照顾了 agent：有一个统一入口可以列出和搜索工具，每个工具的 `--help` 就是参数说明，agent 可以自己查、自己组合。
+这是我自己用的 GIS 工具箱。我把平时用得上的操作写成脚本，目前有 40 多个。
+
+这些脚本有一个统一入口，agent 可以列出和搜索工具，通过 `--help` 查看参数，再按任务组合调用。
 
 ```bash
 python scripts/gis.py list                # 工具目录（只需标准库）
@@ -27,19 +29,19 @@ python scripts/gis.py list --search raster
 python scripts/gis.py raster --help       # 参数说明
 ```
 
-[SKILL.md](SKILL.md) 里只写了几条处理数据时的基本判断，比如 CRS、单位、NoData，以及推定结果要标成 `candidate` / `hold`。具体用哪个工具、怎么串起来，由 agent 自己决定。
+[SKILL.md](SKILL.md) 记录了处理数据时的基本要求：确认 CRS、单位和 NoData，保留 `candidate` / `hold` 等状态。具体选哪个工具、怎样衔接，由 agent 根据任务决定。
 
-一般规模的任务用它就够了。数据量很大或对性能要求高时，还是让 agent 调用 QGIS、GRASS 这类桌面 GIS 后端，大表也可以走可选的 DuckDB 空间 SQL。
+我平时用它处理一般规模的任务。数据量较大或对性能有更高要求时，可以让 agent 调用 QGIS、GRASS 等 GIS 后端，大表也可以使用可选的 DuckDB 空间 SQL。
 
-之后会继续加一些特定场景的实用功能和研究性功能。
+我会继续按实际需要补充工具，也会保留一些研究性的功能。
 
 ## 现有工具
 
-- **矢量**：裁剪、融合、合并、空间关联、缓冲、字段与拓扑的检查修复、面积与城市指标，结果打包成带版本的日常结果包。
-- **栅格与地形**：分区统计、重投影、COG 输出，大栅格按窗口处理；DEM 的坡度、坡向、等高线、剖面；可选接 GRASS 做水文、可视域和地形成本。
-- **路网与覆盖**：有向路网、OD、设施覆盖情景、需求加权覆盖。没有需求权重时，它不会硬报一个人口覆盖率。
-- **栅格图像的语义矢量化**：模型直接识图并绘制点、线、面，程序负责坐标换算、版本记录、几何检查与导出；主要以历史地图开展研究，目前推荐 GPT-6 Astra 和 GPT-6.1，详见下文。
-- **重复交付**：用 `--trace` 记下一次实际跑过的步骤，整理成 recipe，下次换一批数据照着再跑一遍；`semantic-check` 可以检查某些字段在步骤之间有没有被悄悄改掉。
+1. 矢量处理支持裁剪、融合、合并、空间关联和缓冲，也有字段与拓扑检查修复、面积与城市指标计算。日常结果可以打包保存，并记录版本。
+2. 栅格与地形工具支持分区统计、重投影和 COG 输出，大栅格按窗口处理。DEM 可计算坡度、坡向、等高线和剖面；水文、可视域和地形成本可选用 GRASS 后端。
+3. 路网工具处理有向路网、OD 和设施覆盖情景，也支持需求加权覆盖。缺少需求权重时，不报告人口覆盖率。
+4. 栅格图像的语义矢量化由模型直接识图并绘制点、线、面，程序负责坐标换算、版本记录、几何检查与导出。我主要用历史地图做研究，目前推荐 GPT-6 Astra 和 GPT-6.1，过程和测试情况见下文。
+5. 重复任务可以用 `--trace` 记录实际执行的步骤，整理成 recipe 后用于下一批数据。`semantic-check` 检查指定的语义字段在步骤之间是否丢失或改变。
 
 ## 栅格图像的语义矢量化
 
@@ -143,11 +145,20 @@ agent 会读 [SKILL.md](SKILL.md)，按需查看 `references/` 里的参考文�
 
 ## 环境与依赖
 
-依赖分了几层：`requirements-core.txt` 够做矢量、栅格和检查图；`requirements-full.txt` 再加上路网、统计、图像增强和测试；`requirements-tested.txt` 是 Python 3.10 下全部测试通过的精确版本；`requirements-spatial-sql.txt` 是可选的 DuckDB。pip 装 GDAL 相关包吃力的平台，可以用 `environment.yml` 走 conda-forge。
+1. `requirements-core.txt` 包含矢量、栅格和检查图所需的核心依赖。
+2. `requirements-full.txt` 在核心依赖之外加入路网、统计、图像增强和测试工具。
+3. `requirements-tested.txt` 记录 Python 3.10 下完整测试通过时使用的精确版本。
+4. `requirements-spatial-sql.txt` 提供可选的 DuckDB 空间 SQL 依赖。
 
-agent 运行时要始终用同一个解释器，细节见[运行环境](references/runtime-environment.md)。QGIS、GRASS、PySAL 属于可选后端，需要单独安装。中文图面按 `config/user.yaml` 里的顺序选第一个装了的字体，默认 Noto Sans CJK SC；一个都没有时会回退到 DejaVu Sans，这时中文会显示不出来。
+如果 pip 安装 GDAL 相关包有困难，可以用 `environment.yml` 创建 conda-forge 环境。
 
-正式出图、Scene / Storyboard 和地图影片由另一个项目 gis-composer 负责。它暂时还没公开，我想再打磨一阵子再放出来。gis-kit 不依赖它，没有它也照样能出诊断图和检查图；装了的话通过 `GIS_COMPOSER_HOME` 定位。
+agent 运行时应始终使用同一个 Python 解释器，细节见[运行环境](references/runtime-environment.md)。QGIS、GRASS 和 PySAL 是可选后端，需要单独安装。
+
+中文图面按 `config/user.yaml` 中的顺序选择第一个已安装的字体，默认是 Noto Sans CJK SC。如果列表中的字体都未安装，会回退到 DejaVu Sans，中文将无法正常显示。
+
+正式地图、Scene / Storyboard 和地图影片由我的另一个项目 gis-composer 负责。它暂时还没有公开，我想再整理一段时间。
+
+gis-kit 不依赖 gis-composer，可以独立生成诊断图和检查图。安装了 gis-composer 时，通过 `GIS_COMPOSER_HOME` 指定它的位置。
 
 ## 测试
 
@@ -155,11 +166,15 @@ agent 运行时要始终用同一个解释器，细节见[运行环境](referenc
 PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider tests
 ```
 
-`tests/test_*.py` 是自包含的回归测试，用的都是合成数据或手算数据。`tests/run_*_acceptance.py` 用真实文件跑完整链路，需要自己准备 OSM、Natural Earth、DEM 等外部数据，输出目录放在仓库之外，每个脚本开头都写了需要哪些输入。
+`tests/test_*.py` 是自包含的回归测试，使用合成数据或手算数据。
+
+`tests/run_*_acceptance.py` 用真实文件检查完整处理链。运行前需要准备 OSM、Natural Earth 或 DEM 等外部数据，并把输出目录放在仓库之外。每个脚本开头列出了所需输入。
 
 ## 数据与隐私
 
-脚本在本地跑，但 agent 读到的内容可能会进入远端模型的上下文。`--trace` 记下的轨迹里有路径和业务参数，分享前先看一遍。仓库不附带完整第三方数据集；文档中的测试图使用谭其骧《中国历史地图集》局部裁片，底图版权归原权利人，不适用本仓库的代码许可证。用 OSM（ODbL）、Natural Earth（公有领域）等数据时，请遵守各自的许可和署名要求。
+脚本在本地运行，agent 读取的内容可能会进入远端模型的上下文。`--trace` 记录包含文件路径和任务参数，分享前请检查。
+
+仓库不附带完整的第三方数据集。文档测试图使用了谭其骧《中国历史地图集》的局部裁片，底图版权归原权利人，不适用本仓库的代码许可证。使用 OSM（ODbL）、Natural Earth（公有领域）等数据时，请遵守各自的许可和署名要求。
 
 ## 许可证
 
