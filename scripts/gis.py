@@ -50,7 +50,8 @@ def capabilities() -> dict:
             row['reason'] = 'not importable: ' + ', '.join(missing)
         features.append(row)
     return {'contract': 'capabilities', 'schema_version': 1, 'engine': 'gis-kit', 'engine_version': VERSION,
-            'commands': ['capabilities', 'list'], 'contracts': {}, 'features': features}
+            'commands': ['capabilities', 'describe', 'list'], 'contracts': {'describe': {'write': [1]}},
+            'features': features}
 
 
 def main(argv: list[str] | None = None) -> int:

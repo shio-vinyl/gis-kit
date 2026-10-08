@@ -76,6 +76,26 @@ def test_capabilities_no_site_packages_and_version():
     assert {f['name'] for f in doc['features']} == set(gis.FEATURES)
     assert all(not f['available'] and f['reason'].startswith('not importable') for f in doc['features'])
     assert cli('capabilities').returncode == 2
+    assert doc['contracts'] == {'describe': {'write': [1]}} and 'describe' in doc['commands']
+
+
+def test_describe_reads_headers_only(tmp_path):
+    vector = dataset(tmp_path / 'v.gpkg')
+    gpd.GeoDataFrame({'id': [1]}, geometry=[box(0, 0, 1, 1)]).to_file(tmp_path / 'nocrs.shp')
+    raster = tmp_path / 'r.tif'
+    with rasterio.open(raster, 'w', driver='GTiff', width=4, height=3, count=1, dtype='float32', nodata=float('nan'),
+                       crs='EPSG:32650', transform=from_origin(500000, 3000000, 30, 30)) as dst:
+        dst.write(np.zeros((1, 3, 4), 'float32'))
+    card = json.loads(cli('describe', vector, '--json').stdout)
+    layer = card['layers'][0]
+    assert card['contract'] == 'describe' and card['schema_version'] == 1 and card['kind'] == 'vector'
+    assert layer['feature_count'] == 2 and layer['crs']['id'] == 'EPSG:32631' and layer['crs']['units'] == 'metre'
+    assert {'name': 'review', 'type': 'string'} in layer['fields'] and card['warnings'] == []
+    nocrs = json.loads(cli('describe', tmp_path / 'nocrs.shp', '--json').stdout)
+    assert nocrs['layers'][0]['crs'] is None and [w['code'] for w in nocrs['warnings']] == ['crs_missing']
+    grid = json.loads(cli('describe', raster, '--json').stdout)
+    assert grid['raster']['nodata'] == ['nan'] and grid['raster']['resolution'] == [30.0, 30.0] and grid['warnings'] == []
+    assert cli('describe', tmp_path / 'missing.gpkg', '--json').returncode == 2
 
 
 @pytest.mark.parametrize('tool', ['../daily', '_grass_worker', '/tmp/daily.py', 'gis'])

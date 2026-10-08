@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `gis.py describe <path> --json`：按 gis-plugin describe 约定输出只读元数据卡片，不读要素或像元。
 - `gis.py capabilities --json`：按 gis-plugin capabilities 约定输出版本与可导入性探测，不导入后端。
 
 ## v0.1.0 — 2026-09-30

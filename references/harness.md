@@ -15,6 +15,8 @@
 
 `gis.py capabilities --json` 按 gis-plugin 的 capabilities 约定（`schema_version` 1）输出版本与能力组，供外部诊断使用。能力组只用 `find_spec` 做可导入性探测，不导入后端；`available` 不等于真实操作验收，环境核实仍用 `daily.py environment`。
 
+`gis.py describe <path> --json` 按 gis-plugin 的 describe 约定（`schema_version` 1）输出元数据卡片：矢量的图层、几何类型、要素数、CRS 与单位、范围、字段，栅格的尺寸、波段、数据类型、NoData、分辨率；只读文件头与系统表，不读要素或像元。要素数或范围需扫描才能得到时记为 null。`warnings` 只列确定性事实（如缺 CRS、未设 NoData）。深入查看仍用 `inspect-data`。
+
 `daily.py` 与 `recipe.py` 共用现有 `_recipe_operations.py` 中的操作集合，避免可执行操作在 recipe 中漏列；network 适配沿用源拓扑接口的 `--access-areas` / `--barriers`。`batch.py` 的独立文件并行与 recipe 的有依赖顺序缓存继续分开，未为入口形式合并。
 
 ## 显式 execution trace
