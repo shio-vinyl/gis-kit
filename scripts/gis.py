@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
 from pathlib import Path
 import subprocess
 import sys
 
 SCRIPTS = Path(__file__).resolve().parent
+VERSION = '0.1.0'
+# Importability probes only (find_spec, no import); see references/runtime-environment.md.
+FEATURES = {
+    'vector': ('geopandas', 'shapely', 'pyogrio', 'pyproj', 'pandas', 'numpy'),
+    'raster': ('rasterio', 'numpy'),
+    'plot': ('matplotlib', 'PIL', 'yaml'),
+    'clustering': ('sklearn', 'scipy'),
+    'image-enhance': ('cv2',),
+    'network': ('networkx',),
+    'spatial-sql': ('duckdb', 'pyarrow', 'pyproj'),
+}
 
 
 def catalog(scripts: Path = SCRIPTS) -> list[dict]:
@@ -28,12 +40,25 @@ def catalog(scripts: Path = SCRIPTS) -> list[dict]:
     return result
 
 
+def capabilities() -> dict:
+    """gis-plugin capabilities contract (schema_version 1); probes without importing backends."""
+    features = []
+    for name, modules in FEATURES.items():
+        missing = [m for m in modules if importlib.util.find_spec(m) is None]
+        row = {'name': name, 'available': not missing}
+        if missing:
+            row['reason'] = 'not importable: ' + ', '.join(missing)
+        features.append(row)
+    return {'contract': 'capabilities', 'schema_version': 1, 'engine': 'gis-kit', 'engine_version': VERSION,
+            'commands': ['capabilities', 'list'], 'contracts': {}, 'features': features}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        'gis.py list [--json] [--search TEXT]; gis.py TOOL --help; '
+        'gis.py list [--json] [--search TEXT]; gis.py capabilities --json; gis.py TOOL --help; '
         'gis.py [--trace DIRECTORY] TOOL ... . Existing script CLIs remain supported.'))
     parser.add_argument('--trace', type=Path, help='Opt-in local execution records; no stdout/stderr or environment capture')
-    parser.add_argument('tool', nargs='?', help='list, or a public script name without .py')
+    parser.add_argument('tool', nargs='?', help='list, capabilities, or a public script name without .py')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.tool is None:
@@ -50,6 +75,12 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for row in rows:
                 print(f"{row['name']:22} {row['summary']}")
+        return 0
+    if args.tool == 'capabilities':
+        probe = argparse.ArgumentParser(prog='gis.py capabilities', description='Version and importability probes for gis-plugin; no backend imports')
+        probe.add_argument('--json', action='store_true', required=True)
+        probe.parse_args(args.arguments)
+        print(json.dumps(capabilities(), ensure_ascii=False, indent=2))
         return 0
     # Resolve only an existing public script, never a path or a private worker.
     scripts = {p.stem: p for p in SCRIPTS.glob('*.py')

@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -63,6 +64,18 @@ def test_discovery_no_site_packages_and_help_passthrough():
     assert forwarded.returncode == native.returncode == 0
     assert forwarded.stdout == native.stdout and forwarded.stderr == native.stderr
     assert '--access-areas' in forwarded.stdout
+
+
+def test_capabilities_no_site_packages_and_version():
+    result = cli('capabilities', '--json', site=False)
+    assert result.returncode == 0, result.stderr
+    doc = json.loads(result.stdout)
+    assert doc['contract'] == 'capabilities' and doc['schema_version'] == 1 and doc['engine'] == 'gis-kit'
+    changelog = (SCRIPTS.parent / 'CHANGELOG.md').read_text(encoding='utf-8')
+    assert re.search(r'^## v(\d+\.\d+\.\d+)', changelog, re.M).group(1) == gis.VERSION == doc['engine_version']
+    assert {f['name'] for f in doc['features']} == set(gis.FEATURES)
+    assert all(not f['available'] and f['reason'].startswith('not importable') for f in doc['features'])
+    assert cli('capabilities').returncode == 2
 
 
 @pytest.mark.parametrize('tool', ['../daily', '_grass_worker', '/tmp/daily.py', 'gis'])

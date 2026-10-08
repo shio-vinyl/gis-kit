@@ -13,6 +13,8 @@
 
 `gis.py <工具名> ...` 使用同一个解释器启动对应公开脚本；不改 cwd、参数、标准输出/错误或原 CLI 退出语义（信号终止映射为 128+信号）。拒绝路径穿越和 `_` 私有 worker；所有旧脚本入口保留。它不决定算法、不重试、不安装、不在任务间保持服务。直接调用原脚本也不自动记录轨迹。
 
+`gis.py capabilities --json` 按 gis-plugin 的 capabilities 约定（`schema_version` 1）输出版本与能力组，供外部诊断使用。能力组只用 `find_spec` 做可导入性探测，不导入后端；`available` 不等于真实操作验收，环境核实仍用 `daily.py environment`。
+
 `daily.py` 与 `recipe.py` 共用现有 `_recipe_operations.py` 中的操作集合，避免可执行操作在 recipe 中漏列；network 适配沿用源拓扑接口的 `--access-areas` / `--barriers`。`batch.py` 的独立文件并行与 recipe 的有依赖顺序缓存继续分开，未为入口形式合并。
 
 ## 显式 execution trace
