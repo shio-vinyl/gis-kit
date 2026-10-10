@@ -28,6 +28,8 @@ from pyproj import CRS
 from shapely.geometry import Polygon
 from shapely.validation import explain_validity
 
+from _safe_io import iter_vector_chunks
+
 DEFAULT_CHECKS = "gaps,overlaps,slivers,invalid-geometries,duplicates"
 KNOWN_CHECKS = {"gaps", "overlaps", "slivers", "invalid-geometries", "duplicates", "self-intersections"}
 DEFAULT_MAX_ISSUES = 10_000
@@ -659,14 +661,19 @@ def _write_errors(
             raise ValueError(f"Staged error GeoPackage layers differ from requested output: {layers!r}")
         expected_crs = CRS.from_user_input(source_crs)
         for layer_name, rows in groups.items():
-            check = gpd.read_file(str(staging), layer=layer_name, engine="pyogrio")
-            if len(check) != len(rows):
+            count = 0
+            for start, check in iter_vector_chunks(staging, layer=layer_name):
+                if check.crs is None or CRS.from_user_input(check.crs) != expected_crs:
+                    raise ValueError(f"Staged error layer {layer_name!r} did not retain the input CRS")
+                part = rows[start:start + len(check)]
+                if len(part) != len(check):
+                    raise ValueError(f"Staged error layer {layer_name!r} failed feature-count verification")
+                for field_name in ("source_a_id", "source_b_id", "source_a_position", "source_b_position"):
+                    if check[field_name].tolist() != [row[field_name] for row in part]:
+                        raise ValueError(f"Staged error layer {layer_name!r} failed {field_name} verification")
+                count += len(check)
+            if count != len(rows):
                 raise ValueError(f"Staged error layer {layer_name!r} failed feature-count verification")
-            if check.crs is None or CRS.from_user_input(check.crs) != expected_crs:
-                raise ValueError(f"Staged error layer {layer_name!r} did not retain the input CRS")
-            for field_name in ("source_a_id", "source_b_id", "source_a_position", "source_b_position"):
-                if check[field_name].tolist() != [row[field_name] for row in rows]:
-                    raise ValueError(f"Staged error layer {layer_name!r} failed {field_name} verification")
 
         if overwrite:
             os.replace(staging, destination)

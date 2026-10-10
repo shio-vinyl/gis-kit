@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Iterable
 
+import pandas as pd
 import pyogrio
 from pyproj import CRS
 
@@ -85,6 +86,30 @@ def _cleanup(path: Path) -> None:
             candidate.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def iter_vector_chunks(
+    path: str | Path,
+    *,
+    layer: str | None = None,
+    chunk_size: int = 100_000,
+):
+    """Yield ``(offset, frame)`` pieces of a vector layer in file order.
+
+    Each frame keeps the RangeIndex a full read would give its rows, so callers can
+    compare it with ``expected.iloc[offset:offset + len(frame)]``. At least one
+    (possibly empty) frame is yielded, so CRS and columns are always observable.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    offset = 0
+    while True:
+        frame = pyogrio.read_dataframe(Path(path), layer=layer, skip_features=offset, max_features=chunk_size)
+        frame.index = pd.RangeIndex(offset, offset + len(frame))
+        yield offset, frame
+        offset += len(frame)
+        if len(frame) < chunk_size:
+            return
 
 
 def validate_vector_file(

@@ -1,6 +1,7 @@
 """Windowed local and bounded global raster operations; no implicit alignment."""
 import csv
 import hashlib
+import itertools
 import math
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import numpy as np
 import rasterio as rio
 from pyproj import CRS
 from rasterio.features import geometry_mask, rasterize
-from rasterio.windows import from_bounds
+from rasterio.windows import Window, from_bounds
 from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 
@@ -247,6 +248,20 @@ def encode(data, p):
     return encoded, valid, nodata, error
 
 
+def row_strips(ds, pixels, bands=None):
+    """Yield ``(band, window)`` full-width row strips of at most ``pixels`` cells (one row minimum)."""
+    rows = max(1, pixels//ds.width)
+    for band in bands or range(1, ds.count+1):
+        for y in range(0, ds.height, rows):
+            yield band, Window(0, y, ds.width, min(rows, ds.height-y))
+
+
+def band_fsum(ds, band, pixels=1 << 20):
+    """Exactly rounded sum of a band's unmasked values; fsum is order-independent, so strips match a full read."""
+    return math.fsum(itertools.chain.from_iterable(
+        ds.read(band, window=strip, masked=True).compressed() for _, strip in row_strips(ds, pixels, [band])))
+
+
 def write(stage, filename, data, ds, p, descriptions=None):
     """Typed output, explicit rounding and full decoded readback before publication."""
     from raster import inspect, positive_integer, windows
@@ -283,7 +298,9 @@ def write(stage, filename, data, ds, p, descriptions=None):
             slices = (slice(None), *win.toslices())
             if not np.array_equal(np.ma.getmaskarray(decoded), ~valid[slices]) or not np.array_equal(decoded.data, encoded[slices], equal_nan=True):
                 raise ValueError('Decoded output mismatch')
-        digest.update(out.read().astype(dtype.newbyteorder('<')).tobytes())
+        # Canonical band/row-order hash, read in full-width row strips.
+        for band, strip in row_strips(out, positive_integer(p.get('block_size', 256))**2):
+            digest.update(out.read(band, window=strip).astype(dtype.newbyteorder('<')).tobytes())
     return {'artifact': filename, 'artifact_sha256': fingerprint(path),
             'output': metadata, 'decoded_sha256': digest.hexdigest(), 'valid_pixels': int(valid.sum()),
             'max_abs_encoding_error': error}
@@ -378,7 +395,7 @@ def allocate(ds, arrays, p, stage, budget):
     # Source contributions are essential: a mixed boundary pixel cannot reconstruct zone identity.
     with rio.open(stage/'contributions.tif') as check:
         for i, record in enumerate(records, 1):
-            back = math.fsum(check.read(i, masked=True).compressed())
+            back = band_fsum(check, i)
             if abs(back-record['allocated']) > record['tolerance']:
                 raise ValueError('Source contribution back-calculation failed')
             record['readback_total'] = back
@@ -437,7 +454,7 @@ def redistribute(source, target, data, p, stage, budget):
         out /= dst_area
     result = write(stage, 'result.tif', np.where(touched, out, np.nan), target, p)
     with rio.open(stage/'result.tif') as check:
-        back = math.fsum(check.read(1, masked=True).compressed())*(dst_area if kind == 'density' else 1)
+        back = band_fsum(check, 1)*(dst_area if kind == 'density' else 1)
         if abs(back-assigned) > tolerance:
             raise ValueError('Conservative output back-calculation failed')
     support = write(stage, 'coverage.tif', np.where(touched, np.clip(covered_area/dst_area, 0., 1.), np.nan), target, p, ['known_source_area_fraction'])

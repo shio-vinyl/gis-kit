@@ -37,6 +37,12 @@ def windows(width,height,size):
         for x in range(0,width,size): yield Window(x,y,min(size,width-x),min(size,height-y))
 
 
+def band_matches(ds,band,expected,equal_nan=True,size=1024):
+    """Compare one decoded band with an in-memory array window by window, without a second full copy."""
+    if ds.shape!=expected.shape: return False
+    return all(np.array_equal(ds.read(band,window=w),expected[w.toslices()],equal_nan=equal_nan) for w in windows(ds.width,ds.height,size))
+
+
 def inspect(ds):
     if ds.crs is None: raise ValueError('Raster requires known CRS')
     if not np.isfinite(list(ds.transform)).all() or ds.transform.determinant==0: raise ValueError('Invalid raster transform')

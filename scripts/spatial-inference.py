@@ -19,7 +19,8 @@ from rasterio.transform import from_origin
 from _daily import stable,number
 from _metric import analysis_frame
 from _delivery import bundle,digest,write_json
-from _safe_io import write_vector_atomic
+from _safe_io import iter_vector_chunks, write_vector_atomic
+from raster import band_matches
 from daily import fingerprint,clean
 
 
@@ -58,9 +59,13 @@ def infer(frame,xy,p,stage,backend):
         out[name]=values;out[name.replace('_p','_q')]=adjusted
     out['island']=[i in islands for i in range(n)]
     write_vector_atomic(out,stage/'statistics.gpkg')
-    back=gpd.read_file(stage/'statistics.gpkg')
-    if back[p['id']].astype(str).tolist()!=out[p['id']].astype(str).tolist():raise ValueError('Statistics ID readback mismatch')
-    for key in ('local_I','local_p','local_q','gi_star','gi_z','gi_p','gi_q'):np.testing.assert_allclose(back[key].to_numpy(float),out[key].to_numpy(float),rtol=0,atol=0,equal_nan=True)
+    count=0
+    for start,back in iter_vector_chunks(stage/'statistics.gpkg'):
+        part=out.iloc[start:start+len(back)]
+        if back[p['id']].astype(str).tolist()!=part[p['id']].astype(str).tolist():raise ValueError('Statistics ID readback mismatch')
+        for key in ('local_I','local_p','local_q','gi_star','gi_z','gi_p','gi_q'):np.testing.assert_allclose(back[key].to_numpy(float),part[key].to_numpy(float),rtol=0,atol=0,equal_nan=True)
+        count+=len(back)
+    if count!=len(out):raise ValueError('Statistics ID readback mismatch')
     write_json(stage/'weights.json',dict(ids=frame[p['id']].astype(str).tolist(),neighbors=neighbors,radius_m=radius,edge_rule='distance <= radius; no self',islands=islands))
     return dict(global_I=stats['global_I'],global_p=stats['global_p'],backend={k:stats[k] for k in ('esda','libpysal','numpy')},islands=islands,p_method='min(1,2*PySAL folded-tail p_sim); conditional local permutations; global random labels',adjustment='Benjamini-Yekutieli separately for local Moran and Gi* families; islands and undefined Gi* variance excluded',weights='Moran row standardized; Gi* binary including unit diagonal',execution='Existing PySAL with NUMBA_DISABLE_JIT=1; in-process NumPy boolean alias and esda 2.3.1 empty-neighborhood zero-lag guard; no installed edits or JIT bitwise equivalence claim',global_island_rule='All objects included, islands zero spatial lag',quadrants='PySAL: 1 HH, 2 LH, 3 LL, 4 HL; quadrant alone is not significance')
 
@@ -77,7 +82,7 @@ def kde(frame,xy,factor,p,stage):
     profile=dict(driver='GTiff',height=h,width=w,count=1,dtype='float64',crs=frame.crs,transform=from_origin(xmin/factor,ymax/factor,resolution/factor,resolution/factor))
     with rio.open(stage/'density.tif','w',**profile) as d:d.write(values,1);d.set_band_unit(1,'records/km2')
     with rio.open(stage/'density.tif') as d:
-        if not np.array_equal(values,d.read(1)):raise ValueError('KDE readback mismatch')
+        if not band_matches(d,1,values,equal_nan=False):raise ValueError('KDE readback mismatch')
     return dict(unit='records per square kilometre',kernel='Gaussian Euclidean, bandwidth in metres',boundary='No edge correction or renormalization; tails outside study omitted; outer grid may extend by <1 cell',interpretation='Record density; not population density or significance')
 
 

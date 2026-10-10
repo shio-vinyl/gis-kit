@@ -15,7 +15,7 @@ import numpy as np
 import rasterio as rio
 from pyproj import CRS
 from _delivery import bundle, digest, write_json
-from raster import inspect, band_data, positive_integer
+from raster import inspect, band_data, band_matches, positive_integer
 from terrain import summary
 
 
@@ -129,7 +129,7 @@ def execute(operation, source, p, output, grass):
                 path=stage/f'{name}.tif'
                 with rio.open(path,'w',**profile) as d:d.write(a,1)
                 with rio.open(path) as d:
-                    if not np.array_equal(d.read(1),a,equal_nan=True):raise ValueError('Published raster readback mismatch')
+                    if not band_matches(d,1,a):raise ValueError('Published raster readback mismatch')
                 summaries[name]={'file':path.name,'sha256':digest(path),'summary':summary(a)}
             resource_report=json.loads((work/'worker.json').read_text())
         if before!=digest(source) or code!={n:digest(Path(__file__).with_name(n)) for n in code}:raise ValueError('Input or implementation changed')

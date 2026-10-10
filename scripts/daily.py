@@ -21,7 +21,7 @@ import shapely
 from _cartography import morphology, weighted_summary, generalize
 from _conflation import match, match_split, match_transfer, edge_match
 from _analysis import compare, profile, distribution, grid_summary, time_slice, cleanup, cluster, cleanup_adopt
-from _safe_io import write_vector_atomic
+from _safe_io import iter_vector_chunks, write_vector_atomic
 from _daily import normalize, update, relations, overlay, allocate, rules, geometry, grid, select, attribute_join
 from _recipe_operations import DAILY_OPERATIONS
 from _delivery import fingerprint
@@ -109,20 +109,22 @@ def execute(args):
         if isinstance(result,gpd.GeoDataFrame):
             if len(result) and (result.geometry.isna().any() or not result.geometry.is_valid.all()): raise ValueError('Invalid output geometry')
             record['validation']=write_vector_atomic(result,staging/'result.gpkg')
-            reread=gpd.read_file(staging/'result.gpkg',engine='pyogrio')
-            if len(result) and not all(a.equals(b) for a,b in zip(result.geometry,reread.geometry)): raise ValueError('Geometry readback differs')
-            for column in result.columns:
-                if column==result.geometry.name: continue
-                for expected,actual in zip(result[column],reread[column]):
-                    if pd.isna(expected) and pd.isna(actual): continue
-                    if pd.isna(expected) or pd.isna(actual) or expected != actual:
-                        raise ValueError(f'Attribute readback differs: {column}')
+            for start,reread in iter_vector_chunks(staging/'result.gpkg'):
+                part=result.iloc[start:start+len(reread)]
+                if len(part) and not all(a.equals(b) for a,b in zip(part.geometry,reread.geometry)): raise ValueError('Geometry readback differs')
+                for column in result.columns:
+                    if column==result.geometry.name: continue
+                    for expected,actual in zip(part[column],reread[column]):
+                        if pd.isna(expected) and pd.isna(actual): continue
+                        if pd.isna(expected) or pd.isna(actual) or expected != actual:
+                            raise ValueError(f'Attribute readback differs: {column}')
             artifact='result.gpkg'
         else:
             artifact='result.csv'; result.to_csv(staging/artifact,index=False)
-            reread=pd.read_csv(staging/artifact,dtype=str,keep_default_na=False)
-            if len(reread)!=len(result) or list(reread.columns)!=list(result.columns): raise ValueError('Table readback differs')
-            record['validation']={'rows':len(reread),'columns':list(reread.columns)}
+            columns=list(pd.read_csv(staging/artifact,dtype=str,keep_default_na=False,nrows=0).columns)
+            rows=sum(len(chunk) for chunk in pd.read_csv(staging/artifact,dtype=str,keep_default_na=False,chunksize=100_000))
+            if rows!=len(result) or columns!=list(result.columns): raise ValueError('Table readback differs')
+            record['validation']={'rows':rows,'columns':columns}
         record['artifact']={'name':artifact,'sha256':fingerprint(staging/artifact)}
         (staging/'record.json').write_text(json.dumps(clean(record),ensure_ascii=False,indent=2,allow_nan=False)+'\n')
         if hashes != [fingerprint(p) for p in paths]: raise ValueError('Input changed before publication')

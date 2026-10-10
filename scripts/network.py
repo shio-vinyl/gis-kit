@@ -14,7 +14,7 @@ from shapely.ops import substring
 from _daily import stable, number
 from _metric import analysis_frame
 from _delivery import bundle, digest, write_json
-from _safe_io import write_vector_atomic
+from _safe_io import iter_vector_chunks, write_vector_atomic
 from daily import fingerprint, clean
 
 
@@ -121,10 +121,14 @@ def execute(source,p,origins,facilities,output,access_areas=None,barriers=None):
         write_vector_atomic(routes,stage/'routes.gpkg');write_vector_atomic(segments,stage/'service.gpkg')
         for name,extra in extras.items():write_vector_atomic(extra,stage/(name+'.gpkg'))
         for name,expected in [('routes',routes),('service',segments),*extras.items()]:
-            actual=gpd.read_file(stage/(name+'.gpkg'))
-            if len(actual)!=len(expected) or actual.crs!=expected.crs or not actual.geometry.equals(expected.geometry):raise ValueError('Network geometry readback mismatch')
-            for column in expected.columns.drop('geometry'):
-                if actual[column].astype(str).tolist()!=expected[column].astype(str).tolist():raise ValueError('Network attribute readback mismatch')
+            count=0
+            for start,actual in iter_vector_chunks(stage/(name+'.gpkg')):
+                part=expected.iloc[start:start+len(actual)]
+                if actual.crs!=expected.crs or not actual.geometry.equals(part.geometry):raise ValueError('Network geometry readback mismatch')
+                for column in expected.columns.drop('geometry'):
+                    if actual[column].astype(str).tolist()!=part[column].astype(str).tolist():raise ValueError('Network attribute readback mismatch')
+                count+=len(actual)
+            if count!=len(expected):raise ValueError('Network geometry readback mismatch')
         if hashes!=[fingerprint(x) for x in paths]:raise ValueError('Input changed')
         rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         write_json(stage/'record.json',clean(dict(status='candidate',parameters=p,details=details,input_hashes=hashes,input_files=[str(x) for x in paths],implementation=digest(__file__),access_implementation=digest(Path(__file__).with_name('_network_access.py')) if extras else None,networkx=nx.__version__,resources={'wall_seconds':time.perf_counter()-started,'max_rss_bytes':rss if sys.platform=='darwin' else rss*1024})))
