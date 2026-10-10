@@ -10,7 +10,7 @@ import numpy as np
 import geopandas as gpd
 from _daily import stable, number
 from _delivery import bundle, digest, write_json
-from _safe_io import write_vector_atomic
+from _safe_io import iter_vector_chunks, write_vector_atomic
 from daily import fingerprint, clean
 
 
@@ -87,8 +87,12 @@ def execute(source,p,output):
     result,details=score(frame,p,restricted)
     with bundle(output) as stage:
         write_vector_atomic(result,stage/'scores.gpkg')
-        back=gpd.read_file(stage/'scores.gpkg');np.testing.assert_allclose(back.score,result.score,rtol=0,atol=0,equal_nan=True)
-        if back.selected.tolist()!=result.selected.tolist() or back.reasons.tolist()!=result.reasons.tolist():raise ValueError('Scenario readback mismatch')
+        count=0
+        for start,back in iter_vector_chunks(stage/'scores.gpkg'):
+            part=result.iloc[start:start+len(back)];np.testing.assert_allclose(back.score,part.score,rtol=0,atol=0,equal_nan=True)
+            if back.selected.tolist()!=part.selected.tolist() or back.reasons.tolist()!=part.reasons.tolist():raise ValueError('Scenario readback mismatch')
+            count+=len(back)
+        if count!=len(result):raise ValueError('Scenario readback mismatch')
         if hashes!=[fingerprint(x) for x in paths]:raise ValueError('Input changed')
         rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         write_json(stage/'record.json',clean(dict(status='candidate',parameters=p,inputs=[dict(name=x.name,sha256=h) for x,h in zip(paths,hashes)],details=details,artifact_sha256=digest(stage/'scores.gpkg'),resources={'wall_seconds':time.perf_counter()-start,'max_rss_bytes':rss if sys.platform=='darwin' else rss*1024},implementation=digest(__file__))))

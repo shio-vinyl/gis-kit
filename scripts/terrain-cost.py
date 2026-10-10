@@ -17,8 +17,8 @@ import numpy as np
 import rasterio as rio
 from shapely.geometry import LineString
 from _delivery import bundle, digest, write_json
-from _safe_io import write_vector_atomic
-from raster import inspect, band_data
+from _safe_io import iter_vector_chunks, write_vector_atomic
+from raster import inspect, band_data, band_matches
 from terrain import derivatives, summary
 
 _spec = importlib.util.spec_from_file_location('terrain_backend', Path(__file__).with_name('terrain-backend.py'))
@@ -166,13 +166,18 @@ def execute(source, friction, p, output, grass):
             dest = stage/f'{name}.tif'; unit = units.get(name, 's')
             with rio.open(dest, 'w', **profile) as ds: ds.write(a, 1); ds.set_band_unit(1, unit)
             with rio.open(dest) as ds:
-                if ds.crs != profile['crs'] or ds.transform != profile['transform'] or ds.units != (unit,) or not np.array_equal(ds.read(1), a, equal_nan=True):
+                if ds.crs != profile['crs'] or ds.transform != profile['transform'] or ds.units != (unit,) or not band_matches(ds, 1, a):
                     raise ValueError('Raster readback mismatch')
             artifacts[dest.name] = dict(sha256=digest(dest), summary=summary(a))
         routes = gpd.GeoDataFrame(rows, columns=['route_id', 'cost_seconds', 'geometry'], geometry='geometry', crs=profile['crs'])
         write_vector_atomic(routes, stage/'routes.gpkg')
-        back = gpd.read_file(stage/'routes.gpkg')
-        if not back.geometry.equals(routes.geometry) or back.route_id.tolist() != routes.route_id.tolist() or back.cost_seconds.tolist() != routes.cost_seconds.tolist() or back.crs != routes.crs:
+        count = 0
+        for start, back in iter_vector_chunks(stage/'routes.gpkg'):
+            part = routes.iloc[start:start+len(back)]
+            if not back.geometry.equals(part.geometry) or back.route_id.tolist() != part.route_id.tolist() or back.cost_seconds.tolist() != part.cost_seconds.tolist() or back.crs != routes.crs:
+                raise ValueError('Route readback mismatch')
+            count += len(back)
+        if count != len(routes):
             raise ValueError('Route readback mismatch')
         artifacts['routes.gpkg'] = dict(sha256=digest(stage/'routes.gpkg'), count=len(routes))
         if hashes != [digest(x) for x in paths] or code != {n: digest(Path(__file__).with_name(n)) for n in code}:

@@ -105,13 +105,13 @@ def main() -> None:
     try:
         if ext == ".csv":
             df.to_csv(staged,index=index,encoding=args.encoding)
-            check=pd.read_csv(staged,encoding=args.encoding)
+            rows=sum(len(chunk) for chunk in pd.read_csv(staged,encoding=args.encoding,chunksize=100_000))
         else:
             with pd.ExcelWriter(staged,engine="openpyxl") as writer:
                 df.to_excel(writer,index=index,sheet_name="data")
                 auto_fit_columns(writer,"data",df)
-            check=pd.read_excel(staged)
-        if len(check)!=len(df): raise ValueError("Table row count differs on readback")
+            rows=len(pd.read_excel(staged))
+        if rows!=len(df): raise ValueError("Table row count differs on readback")
         if args.overwrite:
             if output_path.is_symlink(): raise ValueError("Output became a symlink")
             os.replace(staged,output_path)
