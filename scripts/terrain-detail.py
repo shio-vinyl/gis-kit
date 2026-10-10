@@ -15,7 +15,7 @@ from pyproj import CRS
 from shapely.geometry import LineString
 from _daily import geometry
 from _delivery import bundle, digest, write_json
-from _safe_io import write_vector_atomic
+from _safe_io import iter_vector_chunks, write_vector_atomic
 from raster import inspect, band_data, positive_integer
 
 
@@ -84,9 +84,13 @@ def execute(source,p,output):
             q=p['profile']; frame=gpd.read_file(inputs[1],layer=q.get('layer'))
             points,reports['profile']=profile_points(frame,q,z,t,c)
             write_vector_atomic(points,stage/'profile.gpkg')
-            decoded=gpd.read_file(stage/'profile.gpkg')
-            np.testing.assert_allclose(decoded['elevation_m'],points['elevation_m'],rtol=0,atol=0,equal_nan=True)
-            if decoded['sample_status'].tolist()!=points['sample_status'].tolist():raise ValueError('Profile status readback differs')
+            count=0
+            for start,decoded in iter_vector_chunks(stage/'profile.gpkg'):
+                part=points.iloc[start:start+len(decoded)]
+                np.testing.assert_allclose(decoded['elevation_m'],part['elevation_m'],rtol=0,atol=0,equal_nan=True)
+                if decoded['sample_status'].tolist()!=part['sample_status'].tolist():raise ValueError('Profile status readback differs')
+                count+=len(decoded)
+            if count!=len(points):raise ValueError('Profile status readback differs')
             artifacts['profile']={'file':'profile.gpkg','rows':len(points),'sha256':digest(stage/'profile.gpkg'),'status_counts':points['sample_status'].value_counts().to_dict()}
         if hashes!=[digest(f) for f in inputs] or code!={n:digest(Path(__file__).with_name(n)) for n in code}:raise ValueError('Input or implementation changed')
         rss=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss

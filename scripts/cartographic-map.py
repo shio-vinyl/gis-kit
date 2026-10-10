@@ -11,6 +11,7 @@ from PIL import Image
 from shapely.ops import orient
 from _cartography import prepare,positive
 from _delivery import bundle,digest,write_json
+from _safe_io import iter_vector_chunks
 from daily import fingerprint
 
 
@@ -32,8 +33,11 @@ def execute(source,params,output):
     with bundle(output) as out:
         work.geometry=work.geometry.map(orient)
         work.to_file(out/'objects.gpkg',driver='GPKG',engine='pyogrio')
-        check=gpd.read_file(out/'objects.gpkg',engine='pyogrio')
-        if len(check)!=len(work) or not all(a.equals(b) for a,b in zip(work.geometry,check.geometry)):raise ValueError('Map vector readback differs')
+        count=0
+        for start,check in iter_vector_chunks(out/'objects.gpkg'):
+            if not all(a.equals(b) for a,b in zip(work.geometry.iloc[start:start+len(check)],check.geometry)):raise ValueError('Map vector readback differs')
+            count+=len(check)
+        if count!=len(work):raise ValueError('Map vector readback differs')
         # 10 mm margins; explicit axes bypass tight bounding box and preserve physical scale.
         pagew,pageh=width+20,height+20
         template={'layers':{'province':{'facecolor':'#c8d8e4','edgecolor':'#364757','color_field':p.get('color_field'),'label':{'enabled':True,'fontsize':p.get('font_size',8)}}},

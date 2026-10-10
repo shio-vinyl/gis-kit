@@ -10,6 +10,7 @@ import numpy as np
 from pyproj import CRS
 from shapely.geometry import Point
 from _delivery import bundle, digest, write_json
+from _safe_io import iter_vector_chunks
 from daily import fingerprint
 
 spec=importlib.util.spec_from_file_location('georef',Path(__file__).with_name('raster-georef.py'))
@@ -87,14 +88,18 @@ def package(specification,output):
             from shapely import transform as transform_geometry
             matrix=np.array(r['matrix']);area=G.region(r)
             for layer,_ in pyogrio.list_layers(folder/'vectors.gpkg'):
-                f=gpd.read_file(folder/'vectors.gpkg',layer=layer)
                 source=gpd.read_file(p['pixel_gpkg'],layer=layer)
                 selected=source.loc[source.geometry.map(lambda g:g is not None and not g.is_empty and area.covers(g))]
                 expected=transform_geometry(selected.geometry.array,lambda coords:coords@matrix[:,:2].T+matrix[:,2])
-                if len(f)!=len(selected) or f.crs!=CRS(r['target_crs']) or not f.geometry.is_valid.all() or not all(a.equals(b) for a,b in zip(f.geometry,expected)):raise ValueError('Vector readback failed')
-                if not f.drop(columns=f.geometry.name).reset_index(drop=True).equals(selected.drop(columns=selected.geometry.name).reset_index(drop=True)):
-                    raise ValueError('Vector attribute readback failed')
-                layers.append({'layer':layer,'rows':len(f)})
+                attributes=selected.drop(columns=selected.geometry.name).reset_index(drop=True);rows=0
+                for start,f in iter_vector_chunks(folder/'vectors.gpkg',layer=layer):
+                    stop=start+len(f)
+                    if f.crs!=CRS(r['target_crs']) or not f.geometry.is_valid.all() or not all(a.equals(b) for a,b in zip(f.geometry,expected[start:stop])):raise ValueError('Vector readback failed')
+                    if not f.drop(columns=f.geometry.name).reset_index(drop=True).equals(attributes.iloc[start:stop].reset_index(drop=True)):
+                        raise ValueError('Vector attribute readback failed')
+                    rows=stop
+                if rows!=len(selected):raise ValueError('Vector readback failed')
+                layers.append({'layer':layer,'rows':rows})
             # Replace temporary absolute output references with portable relative references.
             for name in ('raster.tif','vectors.gpkg'):
                 manifest=folder/(name+'.manifest.json');record=json.loads(manifest.read_text());record['output']['path']=name;record['transform']['path']='transform.json';write_json(manifest,record)

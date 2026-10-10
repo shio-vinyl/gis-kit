@@ -20,6 +20,7 @@ from rasterio.enums import ColorInterp
 from shapely import intersects_xy,segmentize,transform as transform_geometry
 from shapely.geometry import box,Point
 from _delivery import bundle,digest,write_json
+from _safe_io import iter_vector_chunks
 
 spec=importlib.util.spec_from_file_location('affine_georef',Path(__file__).with_name('raster-georef.py'));affine=importlib.util.module_from_spec(spec);spec.loader.exec_module(affine)
 
@@ -67,10 +68,14 @@ def vector_handoff(pixel_vectors, pixel_manifest, step, base, stage):
             if not frame.geometry.is_valid.all():raise ValueError('Transformed geometry invalid; candidate withheld')
             frame=frame.set_crs(base['target_crs'],allow_override=True)
             frame.to_file(stage/'vectors.gpkg',layer=layer,driver='GPKG',engine='pyogrio')
-            read=gpd.read_file(stage/'vectors.gpkg',layer=layer,engine='pyogrio')
-            if read.crs!=frame.crs or not np.array_equal(read.geometry.to_wkb(),frame.geometry.to_wkb()):
-                raise ValueError('Vector geometry or CRS readback differs')
-            assert_frame_equal(read.drop(columns=read.geometry.name).reset_index(drop=True),frame.drop(columns=frame.geometry.name).reset_index(drop=True),check_dtype=False)
+            count=0
+            for start,read in iter_vector_chunks(stage/'vectors.gpkg',layer=layer):
+                part=frame.iloc[start:start+len(read)]
+                if read.crs!=frame.crs or not np.array_equal(read.geometry.to_wkb(),part.geometry.to_wkb()):
+                    raise ValueError('Vector geometry or CRS readback differs')
+                assert_frame_equal(read.drop(columns=read.geometry.name).reset_index(drop=True),part.drop(columns=part.geometry.name).reset_index(drop=True),check_dtype=False)
+                count+=len(read)
+            if count!=len(frame):raise ValueError('Vector geometry or CRS readback differs')
             summaries.append(dict(layer=layer,count=len(frame)))
     if not summaries:raise ValueError('No sampled objects fully inside frame')
     shutil.copyfile(pixel_vectors,stage/'source-pixels.gpkg');shutil.copyfile(pixel_manifest,stage/'source-pixels.json')
@@ -141,7 +146,7 @@ def execute(image,gcps,p,output,backend=None,pixel_vectors=None,pixel_manifest=N
             yy,xx=np.indices((height,width));rgba[:,:,3][~intersects_xy(area,xx,yy)]=0
             minx,miny=boundary.min(axis=0);maxx,maxy=boundary.max(axis=0);res=p['resolution'];w=int(np.ceil((maxx-minx)/res));h=int(np.ceil((maxy-miny)/res))
             if w*h>20000000:raise ValueError('Warp target exceeds pixel guard')
-            target=from_origin(minx,maxy,res,res);dst=np.zeros((4,h,w),dtype='uint8')
+            target=from_origin(minx,maxy,res,res)
             controls=[GroundControlPoint(row=x['pixel'][1]+.5,col=x['pixel'][0]+.5,x=x['target_world'][0],y=x['target_world'][1]) for x in base['points'] if x['role']=='fit']
             # Rasterio 1.4 reproject hardcodes a 0.125 px approximation for GCPs.
             # Native gdalwarp -et 0 disables this approximation; never weaken pixel checks.
@@ -152,19 +157,22 @@ def execute(image,gcps,p,output,backend=None,pixel_vectors=None,pixel_manifest=N
             run=subprocess.run(command,capture_output=True,text=True)
             if run.returncode:raise ValueError('Explicit gdalwarp failed; no result published')
             source.unlink()
-            with rio.open(stage/'warped.tif') as d:dst=d.read()
             report['warp_backend']=dict(version=subprocess.check_output([backend,'--version'],text=True).strip(),approximation_error_px=0)
             with rio.open(stage/'warped.tif') as d:
                 if d.count!=4 or d.dtypes!=('uint8',)*4 or d.crs!=rio.crs.CRS.from_user_input(base['target_crs']) or d.colorinterp!=(ColorInterp.red,ColorInterp.green,ColorInterp.blue,ColorInterp.alpha):
                     raise ValueError('Warp CRS, bands, dtype or alpha contract differs')
-                if not np.array_equal(d.dataset_mask(),dst[3]):raise ValueError('Warp dataset mask differs from alpha')
+                valid=0
+                for _,win in d.block_windows(4):
+                    alpha=d.read(4,window=win)
+                    if not np.array_equal(d.dataset_mask(window=win),alpha):raise ValueError('Warp dataset mask differs from alpha')
+                    valid+=int((alpha>0).sum())
                 actual=d.transform
                 for corner in ((0,0),(w,0),(0,h),(w,h)):
                     pixel=(~target)*(actual*corner)
                     if max(abs(pixel[i]-corner[i]) for i in (0,1))>1e-9:raise ValueError('Warp grid shifted beyond 1e-9 pixel roundoff')
                 target=actual
-            if not np.any(dst[3]):raise ValueError('Warp produced no valid pixels')
-            report['warp']=dict(file='warped.tif',sha256=digest(stage/'warped.tif'),valid_pixels=int((dst[3]>0).sum()),shape=[h,w],transform=list(target)[:6])
+            if not valid:raise ValueError('Warp produced no valid pixels')
+            report['warp']=dict(file='warped.tif',sha256=digest(stage/'warped.tif'),valid_pixels=valid,shape=[h,w],transform=list(target)[:6])
         if pixel_vectors is not None and not reasons:
             report['vector_handoff']=vector_handoff(pixel_vectors,pixel_manifest,vector_step_px,base,stage)
         report['pixel_convention']=base['pixel_convention'];report['target_crs']=base['target_crs'];report['target_units']=base['target_units']
