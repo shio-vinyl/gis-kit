@@ -174,6 +174,178 @@ def cmd_drop(args: argparse.Namespace) -> None:
     print(f"Dropped layer '{layer}' from {input_path}")
 
 
+def quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _rewrite_trigger_sql(sql: str, idents: dict[str, str], literals: dict[str, str]) -> str:
+    """Rename identifiers and exact-match string literals in trigger SQL.
+
+    Walks the statement token by token so names inside other literals,
+    comments or longer identifiers are left alone. Bare OLD./NEW. are the
+    trigger pseudo-rows, never a table reference.
+    """
+    ident_map = {k.lower(): v for k, v in idents.items()}
+    out = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            value = sql[i + 1:j].replace("''", "'")
+            if value in literals:
+                out.append("'" + literals[value].replace("'", "''") + "'")
+            else:
+                out.append(sql[i:j + 1])
+            i = j + 1
+        elif ch in '"`[':
+            close = {'"': '"', '`': '`', '[': ']'}[ch]
+            j = i + 1
+            while j < n:
+                if sql[j] == close:
+                    if close != ']' and j + 1 < n and sql[j + 1] == close:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            value = sql[i + 1:j]
+            if close != ']':
+                value = value.replace(close * 2, close)
+            target = ident_map.get(value.lower())
+            out.append(quote_ident(target) if target is not None else sql[i:j + 1])
+            i = j + 1
+        elif sql.startswith('--', i):
+            j = sql.find('\n', i)
+            j = n if j == -1 else j
+            out.append(sql[i:j])
+            i = j
+        elif sql.startswith('/*', i):
+            j = sql.find('*/', i + 2)
+            j = n if j == -1 else j + 2
+            out.append(sql[i:j])
+            i = j
+        elif ch.isalpha() or ch == '_':
+            j = i + 1
+            while j < n and (sql[j].isalnum() or sql[j] in '_$'):
+                j += 1
+            word = sql[i:j]
+            target = ident_map.get(word.lower())
+            follow = sql[j:].lstrip()[:1]
+            pseudo_row = word.lower() in ('old', 'new') and follow == '.'
+            if target is not None and not pseudo_row and follow != '(':
+                out.append(quote_ident(target))
+            else:
+                out.append(word)
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
+def _table_exists(cursor, name: str) -> bool:
+    return cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone() is not None
+
+
+def _rename_gpkg_layer(path: Path, old_name: str, new_name: str) -> None:
+    """Rename a GPKG feature/attribute table in place, as GDAL's GPKG driver does."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            clash = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE lower(name) = lower(?)", (new_name,)
+            ).fetchone()
+            if clash:
+                raise ValueError(f"an object named '{clash[0]}' already exists")
+
+            row = cursor.execute(
+                "SELECT column_name FROM gpkg_geometry_columns WHERE table_name = ?", (old_name,)
+            ).fetchone()
+            geom_col = row[0] if row else None
+            old_rtree = f"rtree_{old_name}_{geom_col}" if geom_col else None
+            new_rtree = f"rtree_{new_name}_{geom_col}" if geom_col else None
+            has_rtree = bool(old_rtree) and _table_exists(cursor, old_rtree)
+            if has_rtree:
+                for candidate in (new_rtree, *(f"{new_rtree}_{s}" for s in ("rowid", "node", "parent"))):
+                    clash = cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE lower(name) = lower(?)", (candidate,)
+                    ).fetchone()
+                    if clash:
+                        raise ValueError(f"spatial index object '{clash[0]}' already exists")
+
+            # Triggers on the feature table embed the old table/rtree names;
+            # drop them first so ALTER TABLE does not have to re-parse bodies
+            # calling ST_* functions that plain sqlite3 does not provide.
+            triggers = cursor.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?", (old_name,)
+            ).fetchall()
+            idents = {old_name: new_name}
+            if has_rtree:
+                idents[old_rtree] = new_rtree
+            renamed_triggers = []
+            for trig_name, trig_sql in triggers:
+                new_trig = trig_name
+                if has_rtree and trig_name.startswith(old_rtree + '_'):
+                    new_trig = new_rtree + trig_name[len(old_rtree):]
+                elif trig_name.endswith('_feature_count_' + old_name):
+                    new_trig = trig_name[:-len(old_name)] + new_name
+                if new_trig != trig_name:
+                    clash = cursor.execute(
+                        "SELECT 1 FROM sqlite_master WHERE lower(name) = lower(?)", (new_trig,)
+                    ).fetchone()
+                    if clash:
+                        raise ValueError(f"trigger '{new_trig}' already exists")
+                renamed_triggers.append((trig_name, new_trig, trig_sql))
+            for trig_name, new_trig, trig_sql in renamed_triggers:
+                cursor.execute(f"DROP TRIGGER {quote_ident(trig_name)}")
+
+            cursor.execute(f"ALTER TABLE {quote_ident(old_name)} RENAME TO {quote_ident(new_name)}")
+            if has_rtree:
+                cursor.execute(f"ALTER TABLE {quote_ident(old_rtree)} RENAME TO {quote_ident(new_rtree)}")
+
+            for trig_name, new_trig, trig_sql in renamed_triggers:
+                trig_idents = dict(idents)
+                trig_idents[trig_name] = new_trig
+                cursor.execute(_rewrite_trigger_sql(trig_sql, trig_idents, {old_name: new_name}))
+
+            cursor.execute(
+                "UPDATE gpkg_contents SET identifier = ? WHERE table_name = ? AND identifier = ?",
+                (new_name, old_name, old_name),
+            )
+            for table, columns in (
+                ("gpkg_contents", ("table_name",)),
+                ("gpkg_geometry_columns", ("table_name",)),
+                ("gpkg_extensions", ("table_name",)),
+                ("gpkg_ogr_contents", ("table_name",)),
+                ("gpkg_data_columns", ("table_name",)),
+                ("gpkg_metadata_reference", ("table_name",)),
+                ("gpkgext_relations", ("base_table_name", "related_table_name", "mapping_table_name")),
+            ):
+                if not _table_exists(cursor, table):
+                    continue
+                for column in columns:
+                    cursor.execute(
+                        f"UPDATE {table} SET {column} = ? WHERE {column} = ?", (new_name, old_name)
+                    )
+            cursor.execute("COMMIT")
+        except BaseException:
+            cursor.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
+
+
 def cmd_rename(args: argparse.Namespace) -> None:
     input_path = resolve_path(args.input)
     guard_gdb_write(input_path, "layer rename in")
@@ -187,38 +359,17 @@ def cmd_rename(args: argparse.Namespace) -> None:
         sys.exit(f"Error: layer '{old_name}' not found. Available: {', '.join(names)}")
     if new_name in names:
         sys.exit(f"Error: layer '{new_name}' already exists")
+    if not new_name:
+        sys.exit("Error: new layer name must not be empty")
+    if input_path.suffix.lower() != ".gpkg":
+        sys.exit("Error: layer rename is only supported for GeoPackage (.gpkg) files")
 
     try:
-        gdf = gpd.read_file(input_path, layer=old_name, engine="pyogrio")
+        _rename_gpkg_layer(input_path, old_name, new_name)
     except Exception as e:
-        sys.exit(f"Error reading layer '{old_name}': {e}")
+        sys.exit(f"Error renaming layer '{old_name}': {e}")
 
-    try:
-        gdf.to_file(input_path, layer=new_name, driver="GPKG", engine="pyogrio", mode="a")
-    except Exception as e:
-        sys.exit(f"Error writing new layer: {e}")
-
-    try:
-        import sqlite3
-        conn = sqlite3.connect(str(input_path))
-        cursor = conn.cursor()
-        cursor.execute(f"DROP TABLE IF EXISTS \"{old_name}\"")
-        cursor.execute(f"DELETE FROM gpkg_contents WHERE table_name = ?", (old_name,))
-        cursor.execute(f"DELETE FROM gpkg_geometry_columns WHERE table_name = ?", (old_name,))
-        try:
-            cursor.execute(f"DELETE FROM gpkg_extensions WHERE table_name = ?", (old_name,))
-        except Exception:
-            pass
-        try:
-            cursor.execute(f"DELETE FROM gpkg_ogr_contents WHERE table_name = ?", (old_name,))
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        sys.exit(f"Error dropping old layer: {e}")
-
-    print(f"Renamed '{old_name}' -> '{new_name}' ({len(gdf)} features)")
+    print(f"Renamed '{old_name}' -> '{new_name}' in {input_path}")
 
 
 def cmd_copy(args: argparse.Namespace) -> None:
