@@ -96,6 +96,13 @@ def test_describe_reads_headers_only(tmp_path):
     grid = json.loads(cli('describe', raster, '--json').stdout)
     assert grid['raster']['nodata'] == ['nan'] and grid['raster']['resolution'] == [30.0, 30.0] and grid['warnings'] == []
     assert cli('describe', tmp_path / 'missing.gpkg', '--json').returncode == 2
+    try:
+        import jsonschema
+    except ImportError:
+        return
+    schema = json.loads((Path(gis.__file__).resolve().parents[1] / 'references' / 'describe.schema.json').read_text(encoding='utf-8'))
+    for doc in (card, nocrs, grid):
+        jsonschema.validate(doc, schema)
 
 
 @pytest.mark.parametrize('tool', ['../daily', '_grass_worker', '/tmp/daily.py', 'gis'])

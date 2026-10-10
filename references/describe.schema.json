@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gis-kit/references/describe.schema.json",
+  "title": "GIS data description card",
+  "description": "Output of `gis.py describe <path> --json` (gis-kit): metadata read from headers and system tables only; no features or pixels are read. Readers ignore unknown fields.",
+  "type": "object",
+  "required": ["contract", "schema_version", "path", "kind", "driver", "revision", "warnings"],
+  "properties": {
+    "contract": { "const": "describe" },
+    "schema_version": { "const": 1 },
+    "path": { "description": "Absolute path that was described.", "type": "string" },
+    "kind": { "enum": ["vector", "raster"] },
+    "driver": { "description": "GDAL/OGR driver short name.", "type": "string" },
+    "revision": {
+      "description": "Identity of the described file, so readers can tell when a card is stale.",
+      "type": "object",
+      "required": ["size", "mtime"],
+      "properties": {
+        "size": { "type": ["integer", "null"], "minimum": 0 },
+        "mtime": { "type": "number" }
+      }
+    },
+    "layers": {
+      "description": "Vector layers (kind=vector), at most `layer_limit` of them.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "geometry_type", "feature_count", "crs", "extent", "fields", "field_count"],
+        "properties": {
+          "name": { "type": "string" },
+          "geometry_type": { "type": ["string", "null"] },
+          "feature_count": { "description": "null when the driver cannot count without scanning.", "type": ["integer", "null"], "minimum": 0 },
+          "crs": { "$ref": "#/$defs/crs" },
+          "extent": { "$ref": "#/$defs/extent" },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name", "type"],
+              "properties": { "name": { "type": "string" }, "type": { "type": "string" } }
+            }
+          },
+          "field_count": { "description": "Total fields; `fields` may be truncated.", "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "layer_count": { "type": "integer", "minimum": 0 },
+    "raster": {
+      "description": "Raster metadata (kind=raster).",
+      "type": "object",
+      "required": ["width", "height", "band_count", "dtypes", "nodata", "crs", "resolution", "extent"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 0 },
+        "height": { "type": "integer", "minimum": 0 },
+        "band_count": { "type": "integer", "minimum": 0 },
+        "dtypes": { "type": "array", "items": { "type": "string" } },
+        "nodata": { "description": "Per band: a number, \"nan\" for a NaN NoData, or null when unset.", "type": "array", "items": { "anyOf": [{ "type": ["number", "null"] }, { "const": "nan" }] } },
+        "crs": { "$ref": "#/$defs/crs" },
+        "resolution": { "type": ["array", "null"], "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+        "extent": { "$ref": "#/$defs/extent" }
+      }
+    },
+    "warnings": {
+      "description": "Deterministic facts that are easy to miss; never advice.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "crs": {
+      "type": ["object", "null"],
+      "required": ["id", "name", "geographic", "units"],
+      "properties": {
+        "id": { "description": "Authority code such as EPSG:4490, or null when none is identified.", "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "geographic": { "type": "boolean" },
+        "units": { "type": ["string", "null"] }
+      }
+    },
+    "extent": {
+      "description": "[xmin, ymin, xmax, ymax] in the layer's own CRS, or null.",
+      "type": ["array", "null"],
+      "items": { "type": "number" },
+      "minItems": 4,
+      "maxItems": 4
+    }
+  }
+}

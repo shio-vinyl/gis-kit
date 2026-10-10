@@ -41,7 +41,7 @@ def catalog(scripts: Path = SCRIPTS) -> list[dict]:
 
 
 def capabilities() -> dict:
-    """gis-plugin capabilities contract (schema_version 1); probes without importing backends."""
+    """Capabilities document (schema_version 1) for external diagnostics such as gis-plugin; probes without importing backends."""
     features = []
     for name, modules in FEATURES.items():
         missing = [m for m in modules if importlib.util.find_spec(m) is None]
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{row['name']:22} {row['summary']}")
         return 0
     if args.tool == 'capabilities':
-        probe = argparse.ArgumentParser(prog='gis.py capabilities', description='Version and importability probes for gis-plugin; no backend imports')
+        probe = argparse.ArgumentParser(prog='gis.py capabilities', description='Version, contract and importability probes for external diagnostics; no backend imports')
         probe.add_argument('--json', action='store_true', required=True)
         probe.parse_args(args.arguments)
         print(json.dumps(capabilities(), ensure_ascii=False, indent=2))

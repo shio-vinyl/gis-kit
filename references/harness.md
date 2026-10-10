@@ -13,9 +13,18 @@
 
 `gis.py <工具名> ...` 使用同一个解释器启动对应公开脚本；不改 cwd、参数、标准输出/错误或原 CLI 退出语义（信号终止映射为 128+信号）。拒绝路径穿越和 `_` 私有 worker；所有旧脚本入口保留。它不决定算法、不重试、不安装、不在任务间保持服务。直接调用原脚本也不自动记录轨迹。
 
-`gis.py capabilities --json` 按 gis-plugin 的 capabilities 约定（`schema_version` 1）输出版本与能力组，供外部诊断使用。能力组只用 `find_spec` 做可导入性探测，不导入后端；`available` 不等于真实操作验收，环境核实仍用 `daily.py environment`。
+`gis.py capabilities --json` 输出 `contract: capabilities`、`schema_version` 1 的 JSON：`engine_version`、支持 `--json` 的 `commands`、读写的文件格式及版本（`contracts`）和能力组（`features`），供外部诊断工具（如 gis-plugin 的 doctor）读取，gis-kit 自身不依赖它们。能力组只用 `find_spec` 做可导入性探测，不导入后端；`available` 不等于真实操作验收，环境核实仍用 `daily.py environment`。
 
-`gis.py describe <path> --json` 按 gis-plugin 的 describe 约定（`schema_version` 1）输出元数据卡片：矢量的图层、几何类型、要素数、CRS 与单位、范围、字段，栅格的尺寸、波段、数据类型、NoData、分辨率；只读文件头与系统表，不读要素或像元。要素数或范围需扫描才能得到时记为 null。`warnings` 只列确定性事实（如缺 CRS、未设 NoData）。深入查看仍用 `inspect-data`。
+`gis.py describe <path> --json` 输出给 Agent 看的元数据卡片，格式以 [describe.schema.json](describe.schema.json)（`contract: describe`，`schema_version` 1）为准；gis-kit 是该格式的唯一产出方，其它工具（如 gis-plugin 的注入 hook）只读取。
+
+- 只读文件头与系统表，不读要素或像元；要素数或范围需扫描才能得到时为 `null`。
+- 矢量给出图层（最多 20 个，`layer_count` 为总数）、几何类型、要素数、CRS、范围、字段（最多 50 个，`field_count` 为总数）；栅格给出尺寸、波段、数据类型、逐波段 NoData（NaN 记为 `"nan"`，未设置为 `null`）、分辨率、CRS、范围。
+- `crs` 含 `id`（如 `EPSG:4490`，无法识别时为 `null`）、`name`、`geographic`、`units`；没有 CRS 时整个为 `null`。
+- `warnings` 只列确定性事实（`crs_missing`、`nodata_unset`），不给建议。
+- `revision`（大小与修改时间）供读取方判断卡片是否过期。
+- 兼容变更只新增可选字段，读取方须忽略不认识的字段；不兼容变更才升 `schema_version`。
+
+深入查看仍用 `inspect-data`。
 
 `daily.py` 与 `recipe.py` 共用现有 `_recipe_operations.py` 中的操作集合，避免可执行操作在 recipe 中漏列；network 适配沿用源拓扑接口的 `--access-areas` / `--barriers`。`batch.py` 的独立文件并行与 recipe 的有依赖顺序缓存继续分开，未为入口形式合并。
 
