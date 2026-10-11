@@ -14,6 +14,7 @@ import tempfile
 import numpy as np
 import rasterio as rio
 from pyproj import CRS
+from _budget import check_raster
 from _delivery import bundle, digest, write_json
 from raster import inspect, band_data, band_matches, positive_integer
 from terrain import summary
@@ -40,6 +41,9 @@ def validate(operation, p, ds):
     if ds.count!=1 or min(ds.shape)<3 or ds.width*ds.height>positive_integer(p.get('max_pixels',1000000)):
         raise ValueError('Requires single-band bounded grid of at least 3x3')
     if ds.units[0] not in (None,'m','metre'): raise ValueError('Band unit conflicts with metre')
+    # Input grid, read-back outputs, and for viewshed the stacked outputs plus the visible count.
+    outputs=4 if operation=='hydrology' else len(p['observers']) if isinstance(p.get('observers'),list) else 0
+    check_raster(ds,arrays=1+outputs+(outputs+1 if operation=='viewshed' else 0))
     def point(xy):
         if not isinstance(xy,list) or len(xy)!=2: raise ValueError('Point requires [x,y]')
         for v in xy: finite(v,-1e20)

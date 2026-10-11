@@ -76,7 +76,9 @@ def test_capabilities_no_site_packages_and_version():
     assert {f['name'] for f in doc['features']} == set(gis.FEATURES)
     assert all(not f['available'] and f['reason'].startswith('not importable') for f in doc['features'])
     assert cli('capabilities').returncode == 2
-    assert doc['contracts'] == {'describe': {'write': [1]}} and 'describe' in doc['commands']
+    assert doc['contracts'] == {'describe': {'write': [1]},
+                                'memory_budget': {'env': 'GIS_KIT_MEMORY_BUDGET', 'exit_code': 3, 'error': [1]}}
+    assert 'describe' in doc['commands']
 
 
 def test_describe_reads_headers_only(tmp_path):
@@ -95,6 +97,7 @@ def test_describe_reads_headers_only(tmp_path):
     assert nocrs['layers'][0]['crs'] is None and [w['code'] for w in nocrs['warnings']] == ['crs_missing']
     grid = json.loads(cli('describe', raster, '--json').stdout)
     assert grid['raster']['nodata'] == ['nan'] and grid['raster']['resolution'] == [30.0, 30.0] and grid['warnings'] == []
+    assert grid['raster']['decoded_bytes'] == 4*3*4
     assert cli('describe', tmp_path / 'missing.gpkg', '--json').returncode == 2
     try:
         import jsonschema
@@ -183,7 +186,7 @@ def test_trace_overlapping_and_duplicate_identities_rejected(tmp_path, recorded)
 
 def test_trace_redacts_and_never_captures_output_or_environment(tmp_path, monkeypatch):
     secret = 'fixture-sensitive-value'
-    monkeypatch.setattr(trace.subprocess, 'run', lambda command: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(trace.subprocess, 'run', lambda command, env=None: SimpleNamespace(returncode=0))
     trace.run_traced(tmp_path / 'trace', 'geocode', ['--api-key', secret, '--url=https://example.invalid/?token=' + secret], ['unused'])
     text = next((tmp_path / 'trace').glob('*.json')).read_text()
     event = json.loads(text)
@@ -194,13 +197,13 @@ def test_trace_redacts_and_never_captures_output_or_environment(tmp_path, monkey
 
 
 def test_trace_interruption_and_launch_failure(tmp_path, monkeypatch):
-    def interrupt(command):
+    def interrupt(command, env=None):
         raise KeyboardInterrupt
     monkeypatch.setattr(trace.subprocess, 'run', interrupt)
     assert trace.run_traced(tmp_path / 'interrupt', 'inspect-data', [], ['unused']) == 130
     event = json.loads(next((tmp_path / 'interrupt').glob('*.json')).read_text())
     assert event['execution_status'] == 'interrupted' and not event['recipe_eligible']
-    def fail(command):
+    def fail(command, env=None):
         raise FileNotFoundError('missing test executable')
     monkeypatch.setattr(trace.subprocess, 'run', fail)
     with pytest.raises(FileNotFoundError):
@@ -447,7 +450,7 @@ def test_trace_nonfinite_snapshot_still_runs_native_command(tmp_path, monkeypatc
     params.write_text('{"extra": ' + literal + '}')
     calls = []
     monkeypatch.setattr(trace.subprocess, 'run',
-                        lambda command: calls.append(command) or SimpleNamespace(returncode=0))
+                        lambda command, env=None: calls.append(command) or SimpleNamespace(returncode=0))
     args = ['grid', str(source), '--params', str(params), '--output', str(tmp_path / 'out')]
     assert trace.run_traced(tmp_path / 'trace', 'daily', args, ['native-command']) == 0
     event = json.loads(next((tmp_path / 'trace').glob('*.json')).read_text())

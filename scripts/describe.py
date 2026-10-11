@@ -62,6 +62,7 @@ def describe_vector(path: Path) -> tuple[dict, list[dict]]:
 
 
 def describe_raster(path: Path) -> tuple[dict, list[dict]]:
+    import numpy as np
     import rasterio
     warnings = []
     with rasterio.open(path) as src:
@@ -70,6 +71,8 @@ def describe_raster(path: Path) -> tuple[dict, list[dict]]:
         nodata = [None if v is None else 'nan' if math.isnan(v) else float(v) for v in src.nodatavals]
         raster = {'width': src.width, 'height': src.height, 'band_count': src.count,
                   'dtypes': list(src.dtypes), 'nodata': nodata, 'crs': crs,
+                  # Size of all bands decoded in their own dtypes; a fact, not a memory estimate.
+                  'decoded_bytes': src.width*src.height*sum(np.dtype(d).itemsize for d in src.dtypes),
                   'resolution': [float(src.res[0]), float(src.res[1])] if src.transform.is_rectilinear else None,
                   'extent': _extent(src.bounds)}
         driver = src.driver

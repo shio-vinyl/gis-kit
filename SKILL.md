@@ -32,6 +32,7 @@ description: 处理 GIS 矢量与栅格数据、空间分析、DEM 地形、路�
 
 只读取当前任务需要的参考；具体命令从 `list --json` 的 `references` 与原生 help 下钻。
 
+- 大数据与内存：需要读前拦截时用 `gis.py --memory-budget`，契约见[内存预算](references/memory-budget.md)。
 - 大表与空间 SQL：先按[Spatial SQL 与规模路径](references/spatial-sql.md)选择 DuckDB / GDAL 等成熟引擎；可选薄入口直接接收原生 SQL，回读检查 Parquet 输出，不默认全量载入 GeoPandas。
 - 矢量准备与分析：[基础工作流](references/vector-workflows.md)、[日常结果包](references/daily-vector.md)、[匹配与制图综合](references/vector-cartography.md)、[分析扩展](references/analysis-extensions.md)。
 - 栅格与专业分析：[数值栅格](references/raster-numeric.md)、[栅格整理](references/raster-cleanup.md)、[地形诊断](references/terrain-analysis.md)、[路网与需求覆盖](references/network-access.md)、[其他专业分析](references/professional-analysis.md)。
