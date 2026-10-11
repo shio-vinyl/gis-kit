@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import geopandas as gpd
+from _budget import check_vector
 
 
 def sanitize(value: str) -> str:
@@ -42,6 +43,7 @@ def main():
     if args.layer:
         read_kwargs["layer"] = args.layer
 
+    check_vector(input_path, args.layer)
     gdf = gpd.read_file(input_path, **read_kwargs)
 
     if args.by not in gdf.columns:

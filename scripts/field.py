@@ -15,12 +15,14 @@ from pathlib import Path
 import geopandas as gpd
 from _metric import analysis_frame
 from _safe_io import write_vector_atomic
+from _budget import check_vector
 
 
 def read_input(args) -> gpd.GeoDataFrame:
     kwargs = {"engine": "pyogrio"}
     if hasattr(args, "layer") and args.layer:
         kwargs["layer"] = args.layer
+    check_vector(args.input, kwargs.get("layer"))
     return gpd.read_file(args.input, **kwargs)
 
 

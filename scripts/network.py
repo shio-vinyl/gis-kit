@@ -16,6 +16,7 @@ from _metric import analysis_frame
 from _delivery import bundle, digest, write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from daily import fingerprint, clean
+from _budget import check_vector
 
 
 def build(edges,p):
@@ -113,9 +114,11 @@ def execute(source,p,origins,facilities,output,access_areas=None,barriers=None):
         if access_areas is None or barriers is None:raise ValueError('Explicit access areas and barriers layers required (empty permitted)')
         from _network_access import analyze as accessible
         paths.extend([Path(access_areas),Path(barriers)]);hashes=[fingerprint(x) for x in paths]
+        for x in paths:check_vector(x)
         routes,segments,details,extras=accessible(*(gpd.read_file(x) for x in paths[:3]),p,*(gpd.read_file(x) for x in paths[3:]))
     else:
         if access_areas is not None or barriers is not None:raise ValueError('Access layers require source_vertices topology')
+        for x in paths:check_vector(x)
         routes,segments,details=analyze(*(gpd.read_file(x) for x in paths),p)
     with bundle(output) as stage:
         write_vector_atomic(routes,stage/'routes.gpkg');write_vector_atomic(segments,stage/'service.gpkg')

@@ -57,6 +57,8 @@ except ImportError:
         return ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                 "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
+from _budget import check_vector
+
 
 def _setup_font():
     font = get_chinese_font()
@@ -80,6 +82,7 @@ def _read_data(path: str, layer: str | None = None):
     kwargs = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

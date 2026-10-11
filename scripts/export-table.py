@@ -18,12 +18,14 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 from _metric import analysis_frame
+from _budget import check_vector
 
 
 def read_layer(path: Path, layer: str | None) -> gpd.GeoDataFrame:
     kwargs: dict = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

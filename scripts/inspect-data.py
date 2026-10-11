@@ -17,6 +17,7 @@ from pathlib import Path
 import geopandas as gpd
 import pyogrio
 from _table import tabulate
+from _budget import check_vector
 
 
 def resolve_path(raw: str) -> Path:
@@ -66,6 +67,8 @@ def pick_layer(path: Path, layer: str | None) -> str:
 
 def read_layer(path: Path, layer: str, rows: int | None = None) -> gpd.GeoDataFrame:
     try:
+        if rows is None:
+            check_vector(path, layer)
         return gpd.read_file(path, layer=layer, engine="pyogrio", rows=rows)
     except Exception as e:
         sys.exit(f"Error reading layer '{layer}': {e}")

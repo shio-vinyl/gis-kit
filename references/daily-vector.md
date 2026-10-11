@@ -96,4 +96,4 @@ XY 使用 `x`、`y` 替换 `wkt`，支持十进制度和 `12°30'0"N`、`12:30:0
 
 `field.py` 面积/长度按米制计算，`--crs` 保留为显式分析投影；新增字段碰撞拒绝，质心先在分析投影计算再回到源 CRS。`export-table.py --include-coords` 同样支持 `--analysis-crs`，X/Y 仍采用源 CRS。表格导出先暂存与回读再发布，已有表格须显式 `--overwrite`，输入同路径拒绝。
 
-`convert.py`、`field.py`、`fix.py` 使用已有安全写出，支持 GPKG/GeoJSON/FlatGeobuf 单文件，覆盖独立单层成果需 `--overwrite`；拒绝输入同路径、多层 GPKG 替换、活动 sidecar 和多文件格式。不再静默覆盖 Shapefile/GDB；需要这些格式时另行确认具备该格式事务契约的导出路径。`field.py --inplace` 明确拒绝并要求新文件；`edit.py` 未给输出时改为 `_edited.gpkg` 副本，已有输出拒绝覆盖。转换目录批处理中任一文件失败会非零退出；批次内已成功文件保留，不宣称整批原子事务。
+`convert.py`、`field.py`、`fix.py` 使用已有安全写出，支持 GPKG/GeoJSON/FlatGeobuf 单文件，覆盖独立单层成果需 `--overwrite`；拒绝输入同路径、多层 GPKG 替换、活动 sidecar 和多文件格式。不再静默覆盖 Shapefile/GDB；需要这些格式时另行确认具备该格式事务契约的导出路径。`field.py --inplace` 明确拒绝并要求新文件；`edit.py` 未给输出时改为 `_edited.gpkg` 副本，已有输出拒绝覆盖。转换目录批处理中任一文件失败会非零退出；批次内已成功文件保留，不宣称整批原子事务。超过 10 万要素的图层转为 GPKG 时按块读写，结果与一次性写出一致，见[内存预算](memory-budget.md)。

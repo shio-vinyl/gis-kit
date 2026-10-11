@@ -39,6 +39,14 @@ GIS_KIT_MEMORY_BUDGET=2GiB "$PY" "$GIS_SKILL/scripts/terrain.py" ...
 
 ## 覆盖范围
 
-目前接入检查的位置：`terrain`、`terrain-detail`、`terrain-backend`、`terrain-cost`，`raster` 的 display / warp / align / mosaic，以及数值栅格的整幅运算和 redistribute 目标网格。按窗口处理的路径内存由窗口大小决定，不检查。矢量工具尚未接入；进度见 GitHub issue #4。
+**栅格**：`terrain`、`terrain-detail`、`terrain-backend`、`terrain-cost`、`hydro-review`，`raster` 的 display / warp / align / mosaic，栅格整理（cleanup）操作，以及数值栅格的整幅运算和 redistribute 目标网格。按窗口处理的路径内存由窗口大小决定，不检查。
+
+**矢量**：读入整个图层的公开工具都在读之前检查，包括 buffer、clip、dissolve、edit、field、fix、join、split、stats、indicators、topo、plot、plot-chart、inspect-data、export-table、daily、network、suitability、spatial-inference、cartographic-map、atlas，以及 raster 的矢量掩膜、扫描图配准的像素矢量。
+
+- 有多个输入的工具（join、network、suitability、topo 等）对每个输入分别检查，**不累加**；几份输入加起来超出预算时可能放行。
+- 只读一部分数据时不检查：`clip` 带 `--bbox` 或 `--where`、`inspect-data head`、`dissolve --no-global-merge`（本来就按块处理）。
+- CSV / Excel 表格读入、`gpkg sql` 的查询结果、写出后的回读校验不在检查范围内。
+
+**分块读写，不受预算限制**：`convert` 输出 GPKG 时，以及 `gpkg import` / `copy` / `export`（输出 GPKG 或 Shapefile）时，超过一个分块（10 万要素）的图层按块读写，峰值内存由块大小决定，所以不做整读预检。写之前会先扫一遍数据，按整份读取时的规则确定每列 dtype 和图层几何类型（例如某整数字段只要有空值就写成浮点；Polygon 与 MultiPolygon 混合时在 GPKG 中统一为 MultiPolygon），保证结果与一次性写出一致。GeoJSON、FlatGeobuf 等格式在 GDAL 中追加写会重新载入整个文件，仍走整读路径并做预检。
 
 `describe` 卡片里栅格的 `decoded_bytes`（全部波段按各自 dtype 解码后的大小）是一个确定值，可用于事先判断；工作副本（如 float64）会更大。

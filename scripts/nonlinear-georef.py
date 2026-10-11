@@ -23,6 +23,7 @@ from _delivery import bundle,digest,write_json
 from _safe_io import iter_vector_chunks
 
 spec=importlib.util.spec_from_file_location('affine_georef',Path(__file__).with_name('raster-georef.py'));affine=importlib.util.module_from_spec(spec);spec.loader.exec_module(affine)
+from _budget import check_vector
 
 
 def transformer(report):
@@ -55,7 +56,7 @@ def vector_handoff(pixel_vectors, pixel_manifest, step, base, stage):
     omitted=[];summaries=[];area=affine.region(base)
     with transformer(base) as tr:
         for layer,_ in pyogrio.list_layers(pixel_vectors):
-            source=gpd.read_file(pixel_vectors,layer=layer,engine='pyogrio')
+            check_vector(pixel_vectors,layer);source=gpd.read_file(pixel_vectors,layer=layer,engine='pyogrio')
             if source.geometry.has_z.any():raise ValueError('Only two-dimensional sampled geometry supported')
             keep=source.geometry.apply(lambda g:g is not None and not g.is_empty and g.is_valid and area.covers(g))
             omitted.extend(dict(layer=layer,row=int(i),id=str(source.loc[i].get('id',i)),reason='outside/crossing frame, empty or invalid geometry') for i in source.index[~keep])

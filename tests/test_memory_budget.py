@@ -107,3 +107,37 @@ def test_cli_budget_large_enough_or_unset_succeeds(tmp_path, monkeypatch, budget
 def test_cli_rejects_invalid_budget(tmp_path):
     result = run_terrain(tmp_path, '--memory-budget', 'lots')
     assert result.returncode == 2 and 'Invalid memory size' in result.stderr
+
+
+def vectors(path, n=2000):
+    gpd.GeoDataFrame({'zone': np.arange(n) % 5, 'name': [f'feature-{i}' for i in range(n)]},
+                     geometry=[Polygon([(i, 0), (i+1, 0), (i+1, 1), (i, 1)]) for i in range(n)],
+                     crs='EPSG:3857').to_file(path, engine='pyogrio')
+    return path
+
+
+def gis(*args, budget='64KiB'):
+    return subprocess.run([sys.executable, str(SCRIPTS/'gis.py'), '--memory-budget', budget, *map(str, args)],
+                          capture_output=True, text=True)
+
+
+def budget_record(result):
+    assert result.returncode == 3, result.stderr
+    return json.loads(result.stderr.strip().splitlines()[-1].removeprefix(B.ERROR_PREFIX))
+
+
+def test_cli_vector_tools_refuse_whole_reads_over_budget(tmp_path):
+    source = vectors(tmp_path/'zones.gpkg')
+    record = budget_record(gis('dissolve', source, '--by', 'zone', '--output', tmp_path/'out.gpkg'))
+    assert record['tool'] == 'dissolve' and record['basis'] == 'sampled_features'
+    assert record['input'] == str(source) and record['estimated_bytes'] > record['budget_bytes']
+    assert not (tmp_path/'out.gpkg').exists()
+    assert budget_record(gis('join', '--left', source, '--right', vectors(tmp_path/'other.gpkg', 10), '--output', tmp_path/'j.gpkg'))['input'] == str(source)
+    assert budget_record(gis('inspect-data', source, 'summary'))['tool'] == 'inspect-data'
+
+
+def test_cli_partial_reads_are_not_checked(tmp_path):
+    source = vectors(tmp_path/'zones.gpkg')
+    head = gis('inspect-data', source, 'head', '-n', '3')
+    assert head.returncode == 0, head.stderr
+    assert gis('dissolve', source, '--by', 'zone', '--output', tmp_path/'ok.gpkg', budget='1GiB').returncode == 0

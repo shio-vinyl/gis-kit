@@ -13,7 +13,10 @@ import sys
 from pathlib import Path
 
 import geopandas as gpd
-from _safe_io import AtomicVectorOutput
+from pyproj import CRS
+
+from _budget import check_vector
+from _safe_io import AtomicVectorOutput, stream_vector
 
 SUPPORTED_EXTENSIONS = {".gpkg", ".shp", ".geojson", ".json", ".kml", ".gdb"}
 
@@ -38,6 +41,7 @@ def read_file(path: Path, layer: str | None, encoding: str | None) -> gpd.GeoDat
         kwargs["encoding"] = encoding
     if path.suffix.lower() == ".gdb":
         kwargs["engine"] = "pyogrio"
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 
@@ -50,7 +54,33 @@ def write_file(gdf, path, layer, *, overwrite=False, protected_paths=()):
                    required_fields=[c for c in gdf.columns if c != gdf.geometry.name])
 
 
+def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, overwrite) -> bool:
+    """Chunked read/reproject/append for layers larger than one chunk; False means use one full read."""
+    with AtomicVectorOutput(output_path, overwrite=overwrite, protected_paths=[input_path]) as out:
+        if out_layer and out.driver == "GPKG":
+            out.layer = out_layer
+        meta = {}
+
+        def write(frame, first, **options):
+            if first:
+                meta.update(crs=frame.crs, fields=[c for c in frame.columns if c != frame.geometry.name])
+            out.write(frame, append=not first, **options)
+
+        count = stream_vector(input_path, write, driver=out.driver, layer=layer,
+                              transform=(lambda frame: frame.to_crs(crs)) if crs else None,
+                              **({"encoding": encoding} if encoding else {}))
+        if count is None:
+            return False
+        out.commit(expected_features=count, expected_crs=meta["crs"], required_fields=meta["fields"])
+    print(f"Streamed {count} features from {input_path}" + (f" (layer: {layer})" if layer else "")
+          + (f"; reprojected to {CRS.from_user_input(crs).to_string()}" if crs else ""))
+    print(f"Written to {output_path}" + (f" (layer: {out_layer})" if out_layer else ""))
+    return True
+
+
 def convert_single(input_path: Path, output_path: Path, layer: str | None, output_layer: str | None, crs: str | None, encoding: str | None, overwrite=False) -> None:
+    if stream_convert(input_path, output_path, layer, output_layer or layer, crs, encoding, overwrite):
+        return
     gdf = read_file(input_path, layer, encoding)
     print(f"Read {len(gdf)} features from {input_path}" + (f" (layer: {layer})" if layer else ""))
 

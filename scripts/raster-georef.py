@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from pyproj import CRS, Transformer
 from _model_actor import validate_actor
+from _budget import check_vector
 
 
 def write(path,value):
@@ -250,7 +251,7 @@ def vectors(pixel_gpkg, transform, output, manifest, allow_hold=False):
     omitted=[]
     layers=[]
     for layer,_ in pyogrio.list_layers(pixel_gpkg):
-        frame=gpd.read_file(pixel_gpkg,layer=layer,engine='pyogrio')
+        check_vector(pixel_gpkg,layer);frame=gpd.read_file(pixel_gpkg,layer=layer,engine='pyogrio')
         keep=frame.geometry.apply(lambda g:g is not None and not g.is_empty and area.covers(g))
         omitted.extend({'layer':layer,'row':int(i),'id':str(frame.loc[i].get('id',i)),
                         'reason':'outside/crossing frame or empty geometry'} for i in frame.index[~keep])

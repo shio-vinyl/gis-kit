@@ -16,6 +16,7 @@ import pyogrio
 from shapely.geometry import box
 
 from _safe_io import write_vector_atomic
+from _budget import check_vector
 
 
 def read_gdf(path, layer=None, bbox=None, *, columns=None, where=None):
@@ -28,6 +29,8 @@ def read_gdf(path, layer=None, bbox=None, *, columns=None, where=None):
         kwargs["columns"] = columns
     if where:
         kwargs["where"] = where
+    if not bbox and not where:  # filtered reads load only part of the layer
+        check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

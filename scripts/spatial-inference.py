@@ -22,6 +22,7 @@ from _delivery import bundle,digest,write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from raster import band_matches
 from daily import fingerprint,clean
+from _budget import check_vector
 
 
 def prepare(frame,p):
@@ -87,7 +88,7 @@ def kde(frame,xy,factor,p,stage):
 
 
 def execute(source,p,output,backend):
-    started=time.perf_counter();before=fingerprint(source);frame,xy,factor=prepare(gpd.read_file(source),p)
+    started=time.perf_counter();before=fingerprint(source);check_vector(source);frame,xy,factor=prepare(gpd.read_file(source),p)
     base={'id','study','analysis_crs','operation'};extra={'value','radius_m','permutations','seed'} if p['operation']=='infer' else {'bandwidth_m','resolution_m','bounds'}
     if p['operation'] not in ('infer','kde') or set(p)-(base|extra):raise ValueError('Unknown inference parameter')
     with bundle(output) as stage:

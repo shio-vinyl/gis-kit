@@ -14,12 +14,14 @@ import geopandas as gpd
 from pathlib import Path
 from _safe_io import write_vector_atomic
 from shapely import wkt
+from _budget import check_vector
 
 
 def read_gdf(path, layer=None):
     kwargs = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 
