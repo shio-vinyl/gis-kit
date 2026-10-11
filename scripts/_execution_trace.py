@@ -170,7 +170,7 @@ def finish_capture(capture):
         raise ValueError('Held, unknown or unsupported result status; review outside recipe replay')
 
 
-def run_traced(directory, tool, argv, command):
+def run_traced(directory, tool, argv, command, env=None):
     directory = Path(directory).resolve()
     record = {'schema_version': 1, 'kind': 'gis-kit-execution', 'id': uuid.uuid4().hex,
               'tool': tool, 'argv': redact_argv(argv), 'cwd': str(Path.cwd()),
@@ -192,7 +192,7 @@ def run_traced(directory, tool, argv, command):
     print(f"Trace: {path}", file=sys.stderr)
     code = 1
     try:
-        process = subprocess.run(command)
+        process = subprocess.run(command, env=env)
         code = process.returncode
         record['returncode'] = code
         record['execution_status'] = 'finished' if code == 0 else 'failed'

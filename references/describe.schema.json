@@ -54,6 +54,7 @@
         "height": { "type": "integer", "minimum": 0 },
         "band_count": { "type": "integer", "minimum": 0 },
         "dtypes": { "type": "array", "items": { "type": "string" } },
+        "decoded_bytes": { "description": "width x height x the sum of band dtype sizes: all bands decoded in their own dtypes. Optional; working copies (e.g. float64) are larger.", "type": "integer", "minimum": 0 },
         "nodata": { "description": "Per band: a number, \"nan\" for a NaN NoData, or null when unset.", "type": "array", "items": { "anyOf": [{ "type": ["number", "null"] }, { "const": "nan" }] } },
         "crs": { "$ref": "#/$defs/crs" },
         "resolution": { "type": ["array", "null"], "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },

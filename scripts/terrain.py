@@ -13,6 +13,7 @@ from pyproj import CRS
 import scipy
 from scipy.ndimage import correlate, minimum_filter, maximum_filter
 
+from _budget import check_raster
 from _delivery import bundle, digest, write_json
 from raster import inspect, band_data, positive_integer
 
@@ -75,6 +76,8 @@ def execute(source, params, output):
             limit = positive_integer(params.get('max_pixels', 5000000))
             if ds.width*ds.height > limit:
                 raise ValueError('Raster exceeds max_pixels memory guard')
+            # z, zero-filled copy, east/north gradients, slope/aspect/relief and a filter temporary.
+            check_raster(ds, arrays=8)
             dx, dy = t.a*axes[0].unit_conversion_factor, -t.e*axes[1].unit_conversion_factor
             band = positive_integer(params.get('band', 1))
             if ds.units[band-1] is not None and ds.units[band-1] not in (params['vertical_unit'], {'metre':'m','foot':'ft','us_survey_foot':'us_survey_foot'}[params['vertical_unit']]):

@@ -6,9 +6,12 @@ import argparse
 import ast
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+
+import _budget
 
 SCRIPTS = Path(__file__).resolve().parent
 VERSION = '0.1.0'
@@ -50,18 +53,28 @@ def capabilities() -> dict:
             row['reason'] = 'not importable: ' + ', '.join(missing)
         features.append(row)
     return {'contract': 'capabilities', 'schema_version': 1, 'engine': 'gis-kit', 'engine_version': VERSION,
-            'commands': ['capabilities', 'describe', 'list'], 'contracts': {'describe': {'write': [1]}},
+            'commands': ['capabilities', 'describe', 'list'],
+            'contracts': {'describe': {'write': [1]},
+                          'memory_budget': {'env': _budget.ENV, 'exit_code': _budget.EXIT_CODE, 'error': [1]}},
             'features': features}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         'gis.py list [--json] [--search TEXT]; gis.py capabilities --json; gis.py TOOL --help; '
-        'gis.py [--trace DIRECTORY] TOOL ... . Existing script CLIs remain supported.'))
+        'gis.py [--trace DIRECTORY] [--memory-budget SIZE] TOOL ... . Existing script CLIs remain supported.'))
     parser.add_argument('--trace', type=Path, help='Opt-in local execution records; no stdout/stderr or environment capture')
+    parser.add_argument('--memory-budget', metavar='SIZE', help=f'Opt-in read budget such as 2GiB, passed to the tool as {_budget.ENV}; '
+                        f'estimated overruns exit {_budget.EXIT_CODE} before reading')
     parser.add_argument('tool', nargs='?', help='list, capabilities, or a public script name without .py')
     parser.add_argument('arguments', nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
+    env = None
+    if args.memory_budget is not None:
+        try:
+            env = {**os.environ, _budget.ENV: str(_budget.parse_size(args.memory_budget))}
+        except ValueError as error:
+            parser.error(str(error))
     if args.tool is None:
         parser.print_help()
         return 0
@@ -92,8 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.trace is not None:
             from _execution_trace import run_traced
-            return run_traced(args.trace, args.tool, args.arguments, command)
-        result = subprocess.run(command)
+            return run_traced(args.trace, args.tool, args.arguments, command, env)
+        result = subprocess.run(command, env=env)
         return result.returncode if result.returncode >= 0 else 128 - result.returncode
     except KeyboardInterrupt:
         return 130

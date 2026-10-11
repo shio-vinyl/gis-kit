@@ -14,6 +14,8 @@ from rasterio.windows import Window, from_bounds
 from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 
+from _budget import check_raster
+
 OPERATIONS = ('transform', 'combine', 'update', 'rasterize', 'bands', 'allocate', 'redistribute')
 
 
@@ -646,6 +648,8 @@ def process(operation, datasets, p, stage, stack):
         return process_windows(operation, datasets, selectors, p, stage)
     if len(selectors)*ds.width*ds.height > positive_integer(p.get('max_elements', 10000000)):
         raise ValueError('Operand arrays exceed max_elements memory guard')
+    # Operands plus output, occupancy/validity masks and the encoded copy written out.
+    check_raster(ds, arrays=len(selectors)+4)
     arrays = [read_operand(datasets, item, p, operation) for item in selectors]
     details = {'operands': selectors, 'sources': [inspect(d) for d in datasets],
                'execution': {'mode': 'bounded_full_array'},
@@ -704,6 +708,7 @@ def process(operation, datasets, p, stage, stack):
         inspect(target)
         if target.transform.b or target.transform.d or target.transform.a <= 0 or target.transform.e >= 0 or target.width*target.height > min(positive_integer(p.get('max_pixels', 50000000)), positive_integer(p.get('max_elements', 10000000))):
             raise ValueError('Invalid or oversized target grid')
+        check_raster(target, arrays=4)  # output, touched mask, covered area and the encoded copy
         return dict(details, **redistribute(ds, target, arrays[0], p, stage, budget))
     else:
         raise ValueError('Unknown numerical operation')

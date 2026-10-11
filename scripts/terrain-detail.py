@@ -14,6 +14,7 @@ import rasterio as rio
 from pyproj import CRS
 from shapely.geometry import LineString
 from _daily import geometry
+from _budget import check_raster
 from _delivery import bundle, digest, write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from raster import inspect, band_data, positive_integer
@@ -73,6 +74,7 @@ def execute(source,p,output):
         if not c.is_projected or t.b or t.d or t.a<=0 or t.e>=0:raise ValueError('North-up projected grid required')
         if ds.count!=1 or min(ds.shape)<2 or ds.width*ds.height>positive_integer(p.get('max_pixels',5000000)):raise ValueError('Invalid or oversized single-band grid')
         if ds.units[0] not in (None,'m','metre'):raise ValueError('Band unit conflicts with metre')
+        check_raster(ds,arrays=3)  # masked float64 decode, its mask and the filled z
         z=band_data(ds,1).filled(np.nan)
     with bundle(output) as stage:
         artifacts={}; reports={}

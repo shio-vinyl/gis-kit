@@ -20,6 +20,7 @@ from rasterio.windows import Window, transform as window_transform
 from rasterio.transform import Affine
 from rasterio.merge import merge
 from shapely.geometry import box, mapping
+from _budget import check_raster, raster_bytes, require
 from _daily import stable
 from daily import fingerprint, clean
 import _raster_numeric as numeric
@@ -109,6 +110,7 @@ def process(operation,paths,p,stage):
         if operation=='inspect': return {'raster':meta}
         if operation=='display':
             from _raster_display import display
+            check_raster(ds,arrays=2)  # raw band plus its float64 decode
             return dict(display(ds,band_data(ds,band),p,stage), source=meta)
         if operation in ('zonal','sample'):
             vectors=gpd.read_file(p['vector'],layer=p.get('layer')); stable(vectors,p['id'])
@@ -145,6 +147,8 @@ def process(operation,paths,p,stage):
             else:
                 crs=p['crs']; transform,width,height=calculate_default_transform(ds.crs,crs,ds.width,ds.height,*ds.bounds,resolution=p.get('resolution'))
             if width*height>limit: raise ValueError('Target exceeds max_pixels memory guard')
+            # Source float64 decode and its NaN-filled copy, plus the target grid.
+            require(raster_bytes(ds.width,ds.height,arrays=2)+raster_bytes(width,height),basis='decoded_pixels',input=ds.name)
             profile.update(crs=crs,transform=transform,width=width,height=height)
             output=np.full((height,width),np.nan)
             reproject(band_data(ds,band).filled(np.nan),output,src_transform=ds.transform,src_crs=ds.crs,src_nodata=np.nan,
@@ -158,6 +162,9 @@ def process(operation,paths,p,stage):
             union_width=math.ceil((max(x.bounds.right for x in datasets)-min(x.bounds.left for x in datasets))/ds.res[0])
             union_height=math.ceil((max(x.bounds.top for x in datasets)-min(x.bounds.bottom for x in datasets))/ds.res[1])
             if union_width*union_height>limit: raise ValueError('Mosaic exceeds max_pixels memory guard')
+            # Largest input decode plus merge's union output and its validity mask.
+            require(max(raster_bytes(x.width,x.height,arrays=2) for x in datasets)+raster_bytes(union_width,union_height,arrays=2),
+                    basis='decoded_pixels',input=ds.name)
             # Materialize source masks so valid zero and internal masks remain distinguishable.
             copies=[]
             for i,other in enumerate(datasets):

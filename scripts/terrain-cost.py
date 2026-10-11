@@ -16,6 +16,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio as rio
 from shapely.geometry import LineString
+from _budget import check_raster
 from _delivery import bundle, digest, write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from raster import inspect, band_data, band_matches
@@ -31,6 +32,8 @@ def validate(p, ds):
     if not isinstance(p, dict) or set(p) - (common | {'start', 'end', 'walk_coeff', 'slope_factor', 'friction_lambda', 'corridor_extra_seconds', 'cost_assumptions'}):
         raise ValueError('Unknown terrain cost parameter')
     B.validate('hydrology', dict({k: v for k, v in p.items() if k in common}, flow_method='D8', threshold_cells=1), ds)
+    # z, friction, from/to cost and back direction, excess, corridor, slope and derivative temporaries.
+    check_raster(ds, arrays=10)
     if not isinstance(p.get('cost_assumptions'), str) or not p['cost_assumptions'].strip():
         raise ValueError('Explicit friction/obstacle and walking assumptions required')
     coeff = p['walk_coeff']

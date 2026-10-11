@@ -18,13 +18,15 @@
 `gis.py describe <path> --json` 输出给 Agent 看的元数据卡片，格式以 [describe.schema.json](describe.schema.json)（`contract: describe`，`schema_version` 1）为准；gis-kit 是该格式的唯一产出方，其它工具（如 gis-plugin 的注入 hook）只读取。
 
 - 只读文件头与系统表，不读要素或像元；要素数或范围需扫描才能得到时为 `null`。
-- 矢量给出图层（最多 20 个，`layer_count` 为总数）、几何类型、要素数、CRS、范围、字段（最多 50 个，`field_count` 为总数）；栅格给出尺寸、波段、数据类型、逐波段 NoData（NaN 记为 `"nan"`，未设置为 `null`）、分辨率、CRS、范围。
+- 矢量给出图层（最多 20 个，`layer_count` 为总数）、几何类型、要素数、CRS、范围、字段（最多 50 个，`field_count` 为总数）；栅格给出尺寸、波段、数据类型、逐波段 NoData（NaN 记为 `"nan"`，未设置为 `null`）、分辨率、CRS、范围，以及全部波段解码后的字节数 `decoded_bytes`。
 - `crs` 含 `id`（如 `EPSG:4490`，无法识别时为 `null`）、`name`、`geographic`、`units`；没有 CRS 时整个为 `null`。
 - `warnings` 只列确定性事实（`crs_missing`、`nodata_unset`），不给建议。
 - `revision`（大小与修改时间）供读取方判断卡片是否过期。
 - 兼容变更只新增可选字段，读取方须忽略不认识的字段；不兼容变更才升 `schema_version`。
 
 深入查看仍用 `inspect-data`。
+
+`gis.py --memory-budget SIZE TOOL ...` 为该次调用设置可选的读前内存预算；超限时退出码 3，stderr 最后一行是 `GIS_KIT_ERROR ` 加机读 JSON。契约见 [内存预算](memory-budget.md)。
 
 `daily.py` 与 `recipe.py` 共用现有 `_recipe_operations.py` 中的操作集合，避免可执行操作在 recipe 中漏列；network 适配沿用源拓扑接口的 `--access-areas` / `--barriers`。`batch.py` 的独立文件并行与 recipe 的有依赖顺序缓存继续分开，未为入口形式合并。
 
