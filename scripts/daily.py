@@ -25,6 +25,7 @@ from _safe_io import iter_vector_chunks, write_vector_atomic
 from _daily import normalize, update, relations, overlay, allocate, rules, geometry, grid, select, attribute_join
 from _recipe_operations import DAILY_OPERATIONS
 from _delivery import fingerprint
+from _budget import check_vector
 
 
 def read(path, layer=None, encoding='utf-8', sheet=0):
@@ -35,6 +36,7 @@ def read(path, layer=None, encoding='utf-8', sheet=0):
         if len(header)!=len(set(header)): raise ValueError('Duplicate CSV headers')
         return pd.read_csv(path,dtype=str,keep_default_na=False,encoding=encoding)
     if suffix in ('.xlsx','.xls'): return pd.read_excel(path,dtype=str,keep_default_na=False,sheet_name=sheet)
+    check_vector(path,layer)
     return gpd.read_file(path,layer=layer,engine='pyogrio').reset_index(drop=True)
 
 

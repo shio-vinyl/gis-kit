@@ -14,7 +14,7 @@ import rasterio as rio
 from pyproj import CRS
 from shapely.geometry import LineString
 from _daily import geometry
-from _budget import check_raster
+from _budget import check_raster, check_vector
 from _delivery import bundle, digest, write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from raster import inspect, band_data, positive_integer
@@ -83,7 +83,7 @@ def execute(source,p,output):
             write_vector_atomic(lines,stage/'contours.gpkg')
             artifacts['contours']={'file':'contours.gpkg','rows':len(lines),'sha256':digest(stage/'contours.gpkg')}
         if 'profile' in p:
-            q=p['profile']; frame=gpd.read_file(inputs[1],layer=q.get('layer'))
+            q=p['profile']; check_vector(inputs[1],q.get('layer')); frame=gpd.read_file(inputs[1],layer=q.get('layer'))
             points,reports['profile']=profile_points(frame,q,z,t,c)
             write_vector_atomic(points,stage/'profile.gpkg')
             count=0

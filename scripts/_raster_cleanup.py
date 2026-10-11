@@ -154,9 +154,12 @@ def process(operation, datasets, p, stage, stack):
     from raster import band_data, inspect, positive_integer
     import rasterio as rio
     from _delivery import write_json
+    from _budget import check_raster
     ds = datasets[0]
     if len(datasets)*ds.width*ds.height > positive_integer(p.get('max_elements', 10000000)):
         raise ValueError('Exceeded max_elements')
+    # Operand decodes plus output, labels, protection mask and the encoded copy.
+    check_raster(ds, arrays=len(datasets)+4)
     arrays = []
     for other in datasets:
         n.same_grid(ds, other)

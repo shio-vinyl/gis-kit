@@ -13,11 +13,12 @@ from _cartography import prepare,positive
 from _delivery import bundle,digest,write_json
 from _safe_io import iter_vector_chunks
 from daily import fingerprint
+from _budget import check_vector
 
 
 def execute(source,params,output):
     p=json.loads(Path(params).read_text());before=fingerprint(source)
-    data=gpd.read_file(source,layer=p.get('layer'),engine='pyogrio');work,factor=prepare(data,p)
+    check_vector(source,p.get('layer'));data=gpd.read_file(source,layer=p.get('layer'),engine='pyogrio');work,factor=prepare(data,p)
     if p.get('label',p['id']) not in work:raise ValueError('Unknown label field')
     if p.get('label_collision_policy','report') not in ('report','omit'):raise ValueError('Unknown label collision policy')
     if int(p.get('max_labels',100000))!=p.get('max_labels',100000) or p.get('max_labels',100000)<0:raise ValueError('Invalid max_labels')

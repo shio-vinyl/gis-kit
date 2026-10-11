@@ -58,6 +58,8 @@ except ImportError:
 
 _LAYER_ORDER = ["province", "city", "district", "highlight"]
 
+from _budget import check_vector
+
 
 def _parse_input(spec: str) -> tuple[str, str | None]:
     if ":" in spec and not Path(spec).exists():
@@ -70,6 +72,7 @@ def _read(path: str, layer: str | None = None) -> gpd.GeoDataFrame:
     kwargs = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

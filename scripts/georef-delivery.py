@@ -14,6 +14,7 @@ from _safe_io import iter_vector_chunks
 from daily import fingerprint
 
 spec=importlib.util.spec_from_file_location('georef',Path(__file__).with_name('raster-georef.py'))
+from _budget import check_vector
 G=importlib.util.module_from_spec(spec);spec.loader.exec_module(G)
 
 
@@ -60,7 +61,7 @@ def package(specification,output):
     for r in reports:G.verify_image(p['image'],r); G.export_gate(r,p.get('allow_hold',False))
     records=[]
     for layer,_ in pyogrio.list_layers(p['pixel_gpkg']):
-        source=gpd.read_file(p['pixel_gpkg'],layer=layer)
+        check_vector(p['pixel_gpkg'],layer);source=gpd.read_file(p['pixel_gpkg'],layer=layer)
         if source.crs is not None or source.geometry.has_z.any():
             raise ValueError('Handoff requires unreferenced 2D pixel geometry')
         import shapely

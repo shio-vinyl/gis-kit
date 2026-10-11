@@ -29,6 +29,7 @@ from shapely.geometry import Polygon
 from shapely.validation import explain_validity
 
 from _safe_io import iter_vector_chunks
+from _budget import check_vector
 
 DEFAULT_CHECKS = "gaps,overlaps,slivers,invalid-geometries,duplicates"
 KNOWN_CHECKS = {"gaps", "overlaps", "slivers", "invalid-geometries", "duplicates", "self-intersections"}
@@ -697,6 +698,7 @@ def _read_layer(path: str, layer: str | None) -> gpd.GeoDataFrame:
     kwargs: dict[str, Any] = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

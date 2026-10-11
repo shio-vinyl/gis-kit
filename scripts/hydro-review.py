@@ -16,6 +16,7 @@ from _safe_io import write_vector_atomic
 from _metric import _horizontal_meters_per_unit
 from pyproj import CRS
 from daily import fingerprint,clean
+from _budget import check_raster, check_vector
 
 
 def trace_d8(drainage, start):
@@ -42,11 +43,12 @@ def execute(rivers,streams,p,output):
     hashes=[fingerprint(rivers),digest(streams)]
     with rio.open(streams) as d:
         if d.crs is None:raise ValueError('Stream raster CRS missing')
+        check_raster(d,arrays=3)  # masked band, validity mask and the candidate pixel indices
         factor=_horizontal_meters_per_unit(CRS(d.crs));a=d.read(1,masked=True);valid=(~np.ma.getmaskarray(a))&np.isfinite(a.data)&(a.data>0)
         rr,cc=np.where(valid)
         if not len(rr):raise ValueError('No candidate stream pixels')
         xx,yy=rio.transform.xy(d.transform,rr,cc);tree=cKDTree(np.column_stack((xx,yy))*factor)
-        samples,_=geometry(gpd.read_file(rivers),None,dict(id=p['id'],method='sample',distance_m=spacing,analysis_crs=str(d.crs)))
+        check_vector(rivers);samples,_=geometry(gpd.read_file(rivers),None,dict(id=p['id'],method='sample',distance_m=spacing,analysis_crs=str(d.crs)))
         distances,_=tree.query(np.column_stack((samples.geometry.x,samples.geometry.y))*factor)
         rows,cols=rio.transform.rowcol(d.transform,samples.geometry.x,samples.geometry.y)
         inside=(np.array(rows)>=0)&(np.array(rows)<d.height)&(np.array(cols)>=0)&(np.array(cols)<d.width)

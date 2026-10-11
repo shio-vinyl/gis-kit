@@ -15,6 +15,7 @@ import geopandas as gpd
 import pandas as pd
 import shapely
 from _safe_io import write_vector_atomic
+from _budget import check_vector
 
 
 def fix_geometries(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, int]:
@@ -107,6 +108,7 @@ def main() -> None:
     read_kwargs: dict = {"engine": "pyogrio"}
     if args.layer:
         read_kwargs["layer"] = args.layer
+    check_vector(input_path, args.layer)
     gdf = gpd.read_file(input_path, **read_kwargs)
 
     total = len(gdf)

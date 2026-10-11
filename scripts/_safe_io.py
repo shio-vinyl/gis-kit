@@ -93,6 +93,7 @@ def iter_vector_chunks(
     *,
     layer: str | None = None,
     chunk_size: int = 100_000,
+    **read_kwargs,
 ):
     """Yield ``(offset, frame)`` pieces of a vector layer in file order.
 
@@ -104,12 +105,89 @@ def iter_vector_chunks(
         raise ValueError("chunk_size must be positive")
     offset = 0
     while True:
-        frame = pyogrio.read_dataframe(Path(path), layer=layer, skip_features=offset, max_features=chunk_size)
+        frame = pyogrio.read_dataframe(Path(path), layer=layer, skip_features=offset, max_features=chunk_size, **read_kwargs)
         frame.index = pd.RangeIndex(offset, offset + len(frame))
         yield offset, frame
         offset += len(frame)
         if len(frame) < chunk_size:
             return
+
+
+# Drivers that append in place; GDAL's GeoJSON/FlatGeobuf append reloads the whole file.
+STREAM_DRIVERS = frozenset({"GPKG", "ESRI Shapefile"})
+_MULTI = {frozenset({"Point", "MultiPoint"}): "MultiPoint",
+          frozenset({"LineString", "MultiLineString"}): "MultiLineString",
+          frozenset({"Polygon", "MultiPolygon"}): "MultiPolygon"}
+
+
+def full_read_plan(path: str | Path, *, driver: str, layer: str | None = None, chunk_size: int = 100_000, **read_kwargs):
+    """In one bounded pass, decide what one full read and write would: column dtypes and layer geometry type.
+
+    pyogrio types a column by whether the whole read has nulls (an Integer field with any null
+    becomes float64), and infers the layer geometry type from every geometry, so chunk-by-chunk
+    writes must be given both explicitly. Returns None when the chunks cannot be reconciled.
+    """
+    from pyogrio.geopandas import DRIVERS_NO_MIXED_DIMENSIONS, DRIVERS_NO_MIXED_SINGLE_MULTI
+    with_null: dict[str, set] = {}
+    without_null: dict[str, set] = {}
+    types: set[str] = set()
+    has_z, all_z, geometry = False, True, None
+    for _, frame in iter_vector_chunks(path, layer=layer, chunk_size=chunk_size, **read_kwargs):
+        geometry = frame.geometry.name if hasattr(frame, "geometry") else None
+        for column in frame.columns.drop(geometry) if geometry else frame.columns:
+            target = with_null if frame[column].isna().any() else without_null
+            target.setdefault(column, set()).add(frame[column].dtype)
+        if geometry:
+            series = frame.geometry
+            z = series[series.notna() & ~series.is_empty].has_z
+            has_z, all_z = has_z or bool(z.any()), all_z and bool(z.all())
+            types.update(series.geom_type.dropna().unique())
+    dtypes = {}
+    for column in with_null.keys() | without_null.keys():
+        seen = with_null.get(column) or without_null[column]
+        if len(seen) != 1:
+            return None
+        dtypes[column] = next(iter(seen))
+    plan = {"dtypes": dtypes, "geometry_type": None, "promote_to_multi": None}
+    if geometry:
+        if driver in DRIVERS_NO_MIXED_DIMENSIONS and has_z and not all_z:
+            raise ValueError(f"Mixed 2D and 3D coordinates are not supported by {driver}")
+        kind, promote = "Unknown", False
+        if len(types) == 1:
+            kind = next(iter(types))
+        elif frozenset(types) in _MULTI and driver in DRIVERS_NO_MIXED_SINGLE_MULTI:
+            kind, promote = _MULTI[frozenset(types)], True
+        plan.update(geometry_type=f"{kind} Z" if has_z and kind != "Unknown" else kind, promote_to_multi=promote)
+    return plan
+
+
+def stream_vector(path: str | Path, write, *, driver: str | None, layer: str | None = None,
+                  transform=None, chunk_size: int = 100_000, **read_kwargs) -> int | None:
+    """Copy a layer chunk by chunk through ``write(frame, first, **write_options)``; return the feature count.
+
+    Returns None without writing when one full read is the right path instead: the layer fits in
+    one chunk, the driver cannot append in place, or :func:`full_read_plan` cannot reconcile chunks.
+    """
+    if driver not in STREAM_DRIVERS:
+        return None
+    count = int(pyogrio.read_info(Path(path), layer=layer).get("features", -1))
+    if count <= chunk_size:
+        return None
+    plan = full_read_plan(path, driver=driver, layer=layer, chunk_size=chunk_size, **read_kwargs)
+    if plan is None:
+        return None
+    options = {k: plan[k] for k in ("geometry_type", "promote_to_multi") if plan[k] is not None}
+    written = 0
+    for offset, frame in iter_vector_chunks(path, layer=layer, chunk_size=chunk_size, **read_kwargs):
+        changed = {c: t for c, t in plan["dtypes"].items() if frame[c].dtype != t}
+        if changed:
+            frame = frame.astype(changed)
+        if transform is not None:
+            frame = transform(frame)
+        if len(frame) or offset == 0:
+            write(frame, offset == 0, **options)
+        written += len(frame)
+    return written
 
 
 def validate_vector_file(
@@ -186,12 +264,12 @@ class AtomicVectorOutput:
         self._entered = True
         return self
 
-    def write(self, frame, *, append: bool = False) -> None:
+    def write(self, frame, *, append: bool = False, **options) -> None:
         if not self._entered or self._published:
             raise RuntimeError("AtomicVectorOutput is not open for writing")
         if frame.columns.duplicated().any():
             raise ValueError("Duplicate output field names are forbidden")
-        kwargs = {"driver": self.driver, "append": append}
+        kwargs = {"driver": self.driver, "append": append, **options}
         if self.layer is not None:
             kwargs["layer"] = self.layer
         pyogrio.write_dataframe(frame, self.temp_path, **kwargs)

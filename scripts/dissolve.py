@@ -18,6 +18,7 @@ import pyogrio
 import shapely
 
 from _safe_io import AtomicVectorOutput, write_vector_atomic
+from _budget import check_vector
 
 
 def parse_agg(agg_str: str) -> dict:
@@ -130,6 +131,7 @@ def main():
     aggfunc = parse_agg(args.agg) if args.agg else "first"
 
     if not args.no_global_merge:
+        check_vector(input_path, args.layer)
         gdf = gpd.read_file(input_path, **read_kwargs)
         dissolved = finish_dissolve(gdf, by, aggfunc, args.multi, args.method)
         if args.method == "coverage":

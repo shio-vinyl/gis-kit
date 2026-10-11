@@ -14,7 +14,7 @@ from rasterio.windows import Window, from_bounds
 from shapely.geometry import box, mapping
 from shapely.ops import unary_union
 
-from _budget import check_raster
+from _budget import check_raster, check_vector
 
 OPERATIONS = ('transform', 'combine', 'update', 'rasterize', 'bands', 'allocate', 'redistribute')
 
@@ -43,6 +43,7 @@ def area_factor(ds):
 
 
 def polygons(path, ds, layer=None, polygon_only=True):
+    check_vector(path, layer)
     frame = gpd.read_file(path, layer=layer)
     if frame.empty or frame.crs is None or frame.geometry.isna().any() or frame.geometry.is_empty.any() or not frame.geometry.is_valid.all() or (polygon_only and not frame.geom_type.isin(['Polygon', 'MultiPolygon']).all()):
         raise ValueError('Nonempty valid polygons with CRS required')

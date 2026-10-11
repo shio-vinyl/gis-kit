@@ -16,6 +16,7 @@ from _daily import stable, relations
 from _metric import analysis_frame
 from _delivery import bundle, digest, write_json
 from daily import fingerprint, clean, environment
+from _budget import check_vector
 
 
 def execute(source, params, output):
@@ -23,7 +24,7 @@ def execute(source, params, output):
     if not set(p)<= {'schema_version','id','layer','analysis_crs','span_m','k','max_objects','group'} or p.get('schema_version',1)!=1:
         raise ValueError('Unknown atlas parameter or schema')
     original=fingerprint(source)
-    data=gpd.read_file(source,layer=p.get('layer'),engine='pyogrio').reset_index(drop=True)
+    check_vector(source,p.get('layer'));data=gpd.read_file(source,layer=p.get('layer'),engine='pyogrio').reset_index(drop=True)
     stable(data,identity)
     if len(data)>int(p.get('max_objects',200)): raise ValueError('Atlas exceeds max_objects')
     if data.crs is None: raise ValueError('Atlas requires known CRS')

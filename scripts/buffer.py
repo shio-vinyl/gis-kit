@@ -27,6 +27,7 @@ except ImportError:
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _safe_io import write_vector_atomic
+from _budget import check_vector
 
 
 CAP_STYLES = {"round": "round", "flat": "flat", "square": "square"}
@@ -89,6 +90,7 @@ def main() -> None:
 
     output = args.output or str(Path(args.input).stem) + "_buffer.gpkg"
     read_kw = {"layer": args.layer} if args.layer else {}
+    check_vector(args.input, args.layer)
     gdf = gpd.read_file(args.input, **read_kw)
     original_crs = gdf.crs
 

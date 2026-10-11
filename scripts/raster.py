@@ -20,7 +20,7 @@ from rasterio.windows import Window, transform as window_transform
 from rasterio.transform import Affine
 from rasterio.merge import merge
 from shapely.geometry import box, mapping
-from _budget import check_raster, raster_bytes, require
+from _budget import check_raster, check_vector, raster_bytes, require
 from _daily import stable
 from daily import fingerprint, clean
 import _raster_numeric as numeric
@@ -113,7 +113,7 @@ def process(operation,paths,p,stage):
             check_raster(ds,arrays=2)  # raw band plus its float64 decode
             return dict(display(ds,band_data(ds,band),p,stage), source=meta)
         if operation in ('zonal','sample'):
-            vectors=gpd.read_file(p['vector'],layer=p.get('layer')); stable(vectors,p['id'])
+            check_vector(p['vector'],p.get('layer')); vectors=gpd.read_file(p['vector'],layer=p.get('layer')); stable(vectors,p['id'])
             if vectors.crs is None: raise ValueError('Vector requires CRS')
             if operation=='zonal': return zonal(ds,vectors,p)
             vectors=vectors.to_crs(ds.crs)
@@ -186,7 +186,7 @@ def process(operation,paths,p,stage):
             else:
                 geometries=None
                 if operation=='clip':
-                    vector=gpd.read_file(p['vector'],layer=p.get('layer'))
+                    check_vector(p['vector'],p.get('layer')); vector=gpd.read_file(p['vector'],layer=p.get('layer'))
                     if vector.crs is None or not vector.geometry.is_valid.all(): raise ValueError('Valid mask CRS/geometries required')
                     geometries=[mapping(g) for g in vector.to_crs(ds.crs).geometry]
                 for win in windows(ds.width,ds.height,size):

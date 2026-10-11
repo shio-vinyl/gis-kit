@@ -13,6 +13,8 @@ from pathlib import Path
 
 import geopandas as gpd
 import pyogrio
+from _budget import check_vector
+from _safe_io import stream_vector
 from _table import tabulate
 
 
@@ -30,6 +32,22 @@ def is_gdb(path: Path) -> bool:
 def guard_gdb_write(path: Path, operation: str = "write") -> None:
     if is_gdb(path):
         sys.exit(f"Error: {operation} to File GDB is not supported. GDB files are read-only via GDAL/OGR open-source drivers. Use GPKG instead.")
+
+
+def copy_layer(source: Path, source_layer: str, target: Path, driver: str, *, layer: str | None = None, mode: str = "w") -> int:
+    """Write one layer with ``GeoDataFrame.to_file`` semantics; layers larger than one chunk are streamed."""
+    layer_kw = {"layer": layer} if layer else {}
+
+    def write(frame, first, **options):
+        frame.to_file(target, driver=driver, engine="pyogrio", mode=mode if first else "a", **layer_kw, **options)
+
+    count = stream_vector(source, write, driver=driver, layer=source_layer)
+    if count is None:
+        check_vector(source, source_layer)
+        gdf = gpd.read_file(source, layer=source_layer, engine="pyogrio")
+        gdf.to_file(target, driver=driver, engine="pyogrio", mode=mode, **layer_kw)
+        count = len(gdf)
+    return count
 
 
 def looks_like_sql(query: str) -> bool:
@@ -82,17 +100,11 @@ def cmd_import(args: argparse.Namespace) -> None:
     target_layer = args.target_layer or source_layer
 
     try:
-        gdf = gpd.read_file(source, layer=source_layer, engine="pyogrio")
+        count = copy_layer(source, source_layer, target, "GPKG", layer=target_layer, mode="a" if target.exists() else "w")
     except Exception as e:
-        sys.exit(f"Error reading source layer '{source_layer}': {e}")
+        sys.exit(f"Error importing layer '{source_layer}': {e}")
 
-    mode = "a" if target.exists() else "w"
-    try:
-        gdf.to_file(target, layer=target_layer, driver="GPKG", engine="pyogrio", mode=mode)
-    except Exception as e:
-        sys.exit(f"Error writing to target: {e}")
-
-    print(f"Imported '{source_layer}' -> '{target_layer}' ({len(gdf)} features)")
+    print(f"Imported '{source_layer}' -> '{target_layer}' ({count} features)")
 
 
 def cmd_export(args: argparse.Namespace) -> None:
@@ -106,11 +118,6 @@ def cmd_export(args: argparse.Namespace) -> None:
             sys.exit("Error: no layers found in input file")
         layer = layers[0][0]
 
-    try:
-        gdf = gpd.read_file(input_path, layer=layer, engine="pyogrio")
-    except Exception as e:
-        sys.exit(f"Error reading layer '{layer}': {e}")
-
     driver_map = {
         ".shp": "ESRI Shapefile",
         ".geojson": "GeoJSON",
@@ -123,19 +130,25 @@ def cmd_export(args: argparse.Namespace) -> None:
     suffix = output_path.suffix.lower()
     if suffix == ".parquet":
         try:
+            check_vector(input_path, layer)
+            gdf = gpd.read_file(input_path, layer=layer, engine="pyogrio")
+        except Exception as e:
+            sys.exit(f"Error reading layer '{layer}': {e}")
+        try:
             gdf.to_parquet(output_path)
         except Exception as e:
             sys.exit(f"Error writing parquet: {e}")
+        count = len(gdf)
     else:
         driver = driver_map.get(suffix)
         if driver is None:
             driver = "GPKG"
         try:
-            gdf.to_file(output_path, driver=driver, engine="pyogrio")
+            count = copy_layer(input_path, layer, output_path, driver)
         except Exception as e:
-            sys.exit(f"Error writing output: {e}")
+            sys.exit(f"Error exporting layer '{layer}': {e}")
 
-    print(f"Exported '{layer}' -> {output_path} ({len(gdf)} features)")
+    print(f"Exported '{layer}' -> {output_path} ({count} features)")
 
 
 def cmd_drop(args: argparse.Namespace) -> None:
@@ -387,17 +400,11 @@ def cmd_copy(args: argparse.Namespace) -> None:
     target_layer = args.target_layer or source_layer
 
     try:
-        gdf = gpd.read_file(source, layer=source_layer, engine="pyogrio")
+        count = copy_layer(source, source_layer, target, "GPKG", layer=target_layer, mode="a" if target.exists() else "w")
     except Exception as e:
-        sys.exit(f"Error reading source layer '{source_layer}': {e}")
+        sys.exit(f"Error copying layer '{source_layer}': {e}")
 
-    mode = "a" if target.exists() else "w"
-    try:
-        gdf.to_file(target, layer=target_layer, driver="GPKG", engine="pyogrio", mode=mode)
-    except Exception as e:
-        sys.exit(f"Error writing to target: {e}")
-
-    print(f"Copied '{source_layer}' -> '{target_layer}' ({len(gdf)} features)")
+    print(f"Copied '{source_layer}' -> '{target_layer}' ({count} features)")
 
 
 def cmd_sql(args: argparse.Namespace) -> None:

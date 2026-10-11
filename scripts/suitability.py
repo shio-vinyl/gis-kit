@@ -12,6 +12,7 @@ from _daily import stable, number
 from _delivery import bundle, digest, write_json
 from _safe_io import iter_vector_chunks, write_vector_atomic
 from daily import fingerprint, clean
+from _budget import check_vector
 
 
 def score(frame,p,restricted=None):
@@ -83,6 +84,7 @@ def score(frame,p,restricted=None):
 
 def execute(source,p,output):
     start=time.perf_counter();paths=[Path(source)]+([Path(p['restriction'])] if 'restriction' in p else []);hashes=[fingerprint(x) for x in paths]
+    for x in paths:check_vector(x)
     frame=gpd.read_file(paths[0]);restricted=gpd.read_file(paths[1]) if len(paths)>1 else None
     result,details=score(frame,p,restricted)
     with bundle(output) as stage:

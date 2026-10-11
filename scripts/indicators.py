@@ -35,12 +35,14 @@ try:
 except ImportError:  # Support direct module loading in the regression tests.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _metric import analysis_frame, analysis_frames, analysis_method
+from _budget import check_vector
 
 
 def _read(path: str, layer: str | None = None) -> gpd.GeoDataFrame:
     kwargs = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs)
 
 

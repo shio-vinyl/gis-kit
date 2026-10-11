@@ -30,6 +30,7 @@ except ImportError:
     if str(Path(__file__).resolve().parent) not in sys.path:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _safe_io import write_vector_atomic
+from _budget import check_vector
 
 
 RESERVED = {
@@ -42,6 +43,7 @@ def _read(path: str, layer: str | None) -> gpd.GeoDataFrame:
     kwargs = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    check_vector(path, layer)
     return gpd.read_file(path, **kwargs).reset_index(drop=True)
 
 
