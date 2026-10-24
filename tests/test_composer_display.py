@@ -118,3 +118,74 @@ def test_empty_layer_inventory_is_still_json(tmp_path, monkeypatch, capsys):
     from argparse import Namespace
     inspector.cmd_layers(Namespace(file=str(path), json=True))
     assert json.loads(capsys.readouterr().out) == []
+
+
+def values_params(**extra):
+    return dict(band=2, mode='values', breaks=[10, 20], unit='m', status='hold', **extra)
+
+
+def test_values_mode_encodes_class_ids_and_writes_contracts(tmp_path):
+    source = fixture(tmp_path)
+    before = source.read_bytes()
+    result = raster.process('display', [source], values_params(labels=['低', '中', '高']), tmp_path)
+    a = np.asarray(Image.open(tmp_path / 'values.png'))
+    # [[0, 10, 20], [NoData, 9, 19]] with breaks [10, 20]: lower inclusive, upper exclusive.
+    assert a[..., 0].tolist() == [[0, 1, 2], [0, 0, 1]] and a[..., 1].max() == 0
+    assert a[..., 3].tolist() == [[255, 255, 255], [0, 255, 255]]
+    contract = json.loads((tmp_path / 'raster.json').read_text())
+    scheme = json.loads((tmp_path / 'scheme.json').read_text())
+    assert contract['contract'] == 'display-raster' and contract['schema_version'] == 1
+    assert contract['encoding'] == 'class-index' and contract['sampling'] == 'nearest' and contract['scheme'] == 'scheme.json'
+    assert scheme['contract'] == 'class-scheme' and scheme['kind'] == 'sequential'
+    assert [c['label'] for c in scheme['classes']] == ['低', '中', '高']
+    assert scheme['classes'][1] == {'id': 1, 'min': 10, 'max': 20, 'label': '中'}
+    assert scheme['counts'] == [2, 2, 1] and result['class_pixels'] == [2, 2, 1] and result['nodata_pixels'] == 1
+    assert 'colors' not in scheme and source.read_bytes() == before
+
+
+def test_values_mode_continuous_rgb24_round_trips_within_quantization(tmp_path):
+    source = fixture(tmp_path)
+    p = values_params(encoding='value-rgb24', kind='continuous'); p.pop('breaks')
+    raster.process('display', [source], p, tmp_path)
+    contract = json.loads((tmp_path / 'raster.json').read_text())
+    a = np.asarray(Image.open(tmp_path / 'values.png')).astype('int64')
+    decoded = contract['offset'] + contract['scale'] * (a[..., 0] * 65536 + a[..., 1] * 256 + a[..., 2])
+    expected = np.array([[0., 10., 20.], [0., 9., 19.]])
+    valid = a[..., 3] == 255
+    assert np.all(np.abs(decoded[valid] - expected[valid]) <= contract['quantization'] + 1e-12)
+    assert contract['sampling'] == 'linear' and json.loads((tmp_path / 'scheme.json').read_text())['domain'] == [0, 20]
+
+
+def test_values_mode_categories_and_refusals(tmp_path):
+    source = fixture(tmp_path)
+    p = values_params(categories=[{'code': 0, 'label': '水', 'group': '自然'}, {'code': 9, 'label': '林'}, {'code': 10, 'label': '田'}, {'code': 19, 'label': '城'}, {'code': 20, 'label': '路'}])
+    p.pop('breaks')
+    raster.process('display', [source], p, tmp_path)
+    a = np.asarray(Image.open(tmp_path / 'values.png'))
+    assert a[..., 0].tolist() == [[0, 2, 4], [0, 1, 3]]
+    scheme = json.loads((tmp_path / 'scheme.json').read_text())
+    assert scheme['kind'] == 'categorical' and scheme['classes'][0]['group'] == '自然' and scheme['unlisted'] == 0
+    with pytest.raises(ValueError, match='no listed category'):
+        raster.process('display', [source], {**p, 'categories': p['categories'][:2]}, tmp_path)
+    with pytest.raises(ValueError, match='carries no colours'):
+        raster.process('display', [source], values_params(colors=['#000000'] * 3), tmp_path)
+    with pytest.raises(ValueError, match='encoding'):
+        raster.process('display', [source], values_params(encoding='png8'), tmp_path)
+
+
+def test_vector_scheme_cli_methods_counts_and_nodata(tmp_path):
+    frame = gpd.GeoDataFrame({'v': [1.0, 2.0, 3.0, 4.0, None], 'kind': ['a', 'b', 'a', 'c', 'b']},
+                             geometry=[box(i, 0, i + 1, 1) for i in range(5)], crs=3857)
+    data = tmp_path / 'zones.gpkg'; frame.to_file(data, layer='z')
+    def run(field, p, name):
+        settings = tmp_path / f'{name}.json'; settings.write_text(json.dumps(p))
+        result = subprocess.run([sys.executable, SCRIPTS / 'scheme.py', data, '--layer', 'z', '--field', field, '--params', settings, '--output', tmp_path / name],
+                                capture_output=True, text=True)
+        return result, (json.loads((tmp_path / name / 'scheme.json').read_text()) if result.returncode == 0 else None)
+    _, quantile = run('v', {'unit': '人', 'status': 'candidate', 'method': 'quantile', 'classes': 2}, 'q')
+    assert quantile['method'] == 'quantile' and quantile['breaks'] == [2.5] and quantile['counts'] == [2, 2]
+    assert quantile['nodata']['count'] == 1 and quantile['classes'][0]['label'] == '< 2.5 人'
+    _, categories = run('kind', {'unit': 'dimensionless', 'status': 'hold', 'categories': 'unique'}, 'c')
+    assert [c['code'] for c in categories['classes']] == ['a', 'b', 'c'] and categories['counts'] == [2, 2, 1]
+    failed, _ = run('v', {'unit': '人', 'status': 'auto', 'breaks': [2]}, 'bad')
+    assert failed.returncode != 0 and not (tmp_path / 'bad').exists()

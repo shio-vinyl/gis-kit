@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gis-kit/references/class-scheme.schema.json",
+  "title": "Class scheme",
+  "description": "What each display class means, shared by vector and raster display: codes or breaks, labels, groups, counts, unit and status. No colours; the map renderer colours classes by theme. Written by scheme.py and raster.py display (mode values). Readers ignore unknown fields and refuse unknown schema_version values.",
+  "type": "object",
+  "required": ["contract", "schema_version", "kind", "unit", "status", "classes"],
+  "properties": {
+    "contract": { "const": "class-scheme" },
+    "schema_version": { "const": 1 },
+    "kind": { "enum": ["sequential", "diverging", "continuous", "categorical"] },
+    "field": { "description": "Vector field, or 'band N' for a raster.", "type": ["string", "null"] },
+    "unit": { "description": "Explicit unit; 'dimensionless' when appropriate.", "type": "string", "minLength": 1 },
+    "status": { "enum": ["candidate", "hold", "accepted"] },
+    "method": { "description": "How classes were made: manual, quantile, equal_interval, categories or domain.", "type": "string" },
+    "breaks": {
+      "description": "Numeric kinds: strictly increasing, one fewer than classes. Lower inclusive, upper exclusive; first/last unbounded.",
+      "type": "array", "items": { "type": "number" }
+    },
+    "interval_rule": { "type": "string" },
+    "domain": { "description": "[min, max] of valid values; required for continuous.", "type": ["array", "null"], "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+    "classes": {
+      "description": "Ordered classes; id equals the array index (and the class-index raster value). Empty for continuous.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "label"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 0 },
+          "label": { "type": "string", "minLength": 1 },
+          "label_en": { "type": "string" },
+          "group": { "description": "Legend group heading for categorical schemes.", "type": "string" },
+          "code": { "description": "Categorical value in the data.", "type": ["number", "string"] },
+          "min": { "type": ["number", "null"] },
+          "max": { "type": ["number", "null"] }
+        }
+      }
+    },
+    "counts": { "description": "Valid features or pixels per class, same order as classes.", "type": "array", "items": { "type": "integer", "minimum": 0 } },
+    "unlisted": { "description": "Categorical: valid values without a listed category.", "type": "integer", "minimum": 0 },
+    "nodata": {
+      "type": "object",
+      "properties": {
+        "label": { "type": "string" },
+        "meaning": { "type": "string" },
+        "count": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@
 - 矢量工具接入内存预算：读入整个图层的公开工具在读之前按抽样估算检查；`convert`（输出 GPKG）与 `gpkg import` / `copy` / `export`（输出 GPKG 或 Shapefile）对超过 10 万要素的图层改为分块读写，字段类型与几何类型与一次性写出一致。`hydro-review` 与栅格整理操作也接入了栅格预算检查。
 - 写出后的回读校验改为分块或按窗口读取，峰值内存不再因整份回读翻倍；校验口径与 `decoded_sha256` 等记录值不变。
 - Composer 交接改为共用 Composer 项目工作区：gis-kit 把分析输入原子发布到项目的 `inputs/<分析名>/`，Composer 用 `--project` 渲染到 `runs/<run-id>/`，两边的 SHA-256 记录可以逐个核对溯源。`tests/run_composer_acceptance.py` 改为这一流程，搬移后用 `rerun` 逐字节复核，失败用例按错误代码断言；约定写在 `references/composer-display.md`（#9）。
+- 新增两份交给地图渲染器的约定：`class-scheme` v1（分类方案，只记语义不带颜色）和 `display-raster` v1（不上色的显示栅格），Schema 在 `references/`，`capabilities` 的 `contracts` 声明写出版本。`raster.py display` 新增 `"mode":"values"`：类别序号编码（`class-index`）或 24 位数值编码（`value-rgb24`），同时写出方案和 `raster.json`；原有上色模式保留，供独立使用和检查图。新脚本 `scheme.py` 为矢量字段生成分类方案，支持手动断点、分位数、等间距和类别列表，记录每类计数与 NoData 计数。Composer 验收改为同一份方案驱动矢量与栅格，并用三套主题核对颜色（#9）。
 
 ## v0.1.0 — 2026-09-30
 

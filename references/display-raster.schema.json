@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "gis-kit/references/display-raster.schema.json",
+  "title": "Display raster",
+  "description": "Uncoloured north-up EPSG:3857 display grid written by raster.py display (mode values) as raster.json beside the image and its class scheme. The map renderer colours it by theme. Readers ignore unknown fields and refuse unknown schema_version values.",
+  "type": "object",
+  "required": ["contract", "schema_version", "image", "image_sha256", "width", "height", "encoding", "sampling", "coordinates", "crs", "scheme", "unit", "status"],
+  "properties": {
+    "contract": { "const": "display-raster" },
+    "schema_version": { "const": 1 },
+    "image": { "description": "8-bit RGBA PNG, relative to this file.", "type": "string" },
+    "image_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "width": { "type": "integer", "minimum": 1 },
+    "height": { "type": "integer", "minimum": 1 },
+    "encoding": {
+      "description": "class-index: class id = R + 256*G (scheme classes). value-rgb24: value = offset + scale * (R*65536 + G*256 + B). Alpha 0 marks NoData in both.",
+      "enum": ["class-index", "value-rgb24"]
+    },
+    "offset": { "type": "number" },
+    "scale": { "type": "number", "exclusiveMinimum": 0 },
+    "quantization": { "description": "value-rgb24: maximum absolute encoding error.", "type": "number", "minimum": 0 },
+    "nodata": { "type": "string" },
+    "sampling": { "description": "nearest for class ids, linear for values.", "enum": ["nearest", "linear"] },
+    "coordinates": {
+      "description": "Image corners NW, NE, SE, SW as [lon, lat] (EPSG:4326).",
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "type": "number" } }
+    },
+    "crs": { "const": "EPSG:3857" },
+    "scheme": { "description": "Class scheme file, relative to this file.", "type": "string" },
+    "scheme_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "unit": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["candidate", "hold", "accepted"] },
+    "record": { "description": "Provenance record (inputs and their SHA-256), relative to this file.", "type": "string" }
+  },
+  "allOf": [
+    { "if": { "properties": { "encoding": { "const": "value-rgb24" } } }, "then": { "required": ["offset", "scale"] } }
+  ]
+}
