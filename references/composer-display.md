@@ -29,9 +29,24 @@
 
 这是有 `max_pixels` 上限的全量显示路径，默认 50,000,000 像元；不承诺流式内存。栅格与显示 PNG 的写出/回读完成后才发布目录，失败清理 staging，不覆写输入或既有成果。
 
-## 组合交付与验收
+## 共用 Composer 项目工作区
 
-任务专用脚本可复用 `_delivery.bundle`：在新 staging 目录准备分析文件、显示资源和 Scene，调用 Composer 薄入口完成 lint/render/QA，确认返回码、文件回读和 QA 后写已有 `record.json`，最后原子改名发布整个目录。PNG 或报告单独成功不代表成套完成。不要把这个顺序扩展为 workflow engine；已有成果目录不覆盖。完整交付状态与分析候选状态分别记录，正式采用仍需人工判断。
+Composer 的命令只在项目工作区内读写：除 `describe` 与 `project init` 外都必须用 `--project <dir>` 选定项目，产物固定写入 `runs/<run-id>/`，不接受 `--out` 等输出路径参数，越出项目的路径会被拒绝。gis-kit 的成果因此直接交到项目里：
+
+- **分析输入**：用 `_delivery.bundle(<project>/inputs/<分析名>)` 暂存分析文件与显示资源，写好 `record.json` 后原子改名发布。已有目录不覆盖。
+- **Scene**：放在项目的 `scenes/`，用 `../inputs/<分析名>/...` 相对引用分析文件。
+- **顺序**：先发布分析输入，再调用 Composer 的 `lint` 与 `qa`。不要在 staging 期间渲染：staging 目录发布后就不存在了，Composer 的 `run.json` 会记下失效路径，`rerun` 也无法复核。
+
+```sh
+node "$GIS_COMPOSER_HOME/src/agent-entry.js" project init /absolute/project --name "项目名"
+# gis-kit 发布到 /absolute/project/inputs/<分析名>/ 之后：
+node "$GIS_COMPOSER_HOME/src/agent-entry.js" --project /absolute/project lint scenes/map.scene.json --expect-no-frame
+node "$GIS_COMPOSER_HOME/src/agent-entry.js" --project /absolute/project qa scenes/map.scene.json --name draft
+```
+
+Composer 的 `run.json` 为每个读取的输入记录项目内相对路径和 SHA-256，算法与 gis-kit `record.json` 的 `files` 摘要相同，所以可以逐个核对从分析到成图的溯源。两份记录各管各的：gis-kit 的 `record.json` 只说明分析输入集已完整发布，成图是否完成看 Composer 运行记录的 `status`。分析的候选状态单独保留，正式采用仍需人工判断。不要把这个顺序扩展为 workflow engine。
+
+## 验收示例
 
 永久示例 `tests/run_composer_acceptance.py` 使用本地真实高程样区：原始像元中心统计 → 诊断网格均值 GPKG/GeoJSON 与显示重投影 → 分级 PNG → 两张 Composer 专题图。网格是构造的统计单元，未知列没有有效像元，不声称为行政边界。示例面向勃朗峰周边、单位米的样区，其他数据须调整图题、单位与断点。
 
@@ -41,6 +56,15 @@ PYTHONDONTWRITEBYTECODE=1 "$PY" "$GIS_SKILL/tests/run_composer_acceptance.py" \
   --composer "$GIS_COMPOSER_HOME" --source-description '实际来源及未核验项'
 ```
 
-示例调用真实 CLI，从不同 cwd 渲染，搬移带空格任务目录后独立重绘，对比 RGBA 与 PNG SHA256；只改样式时验证分析文件哈希不变。独立 contains 判断回算网格均值，五个内部像元与最终地图颜色核对；记录页面资源观察，检查无隐式底图。缺资源、越界路径、QA 未通过及 PNG 写出失败均不得发布完整目录；底层测试另注入部分 PNG 写出失败。外部自有文件无需 Composer 专属 record，状态也不会被自动升级。
+示例调用真实 CLI，并检查以下各项：
+- 在新输出目录里用 `project init` 建项目，分析输入发布到 `inputs/mont-blanc grid/`，从项目外的 cwd 渲染。
+- 核对 Composer `run.json` 中来自 `inputs/` 的每个文件，其哈希与 gis-kit `record.json` 一致。
+- 把整个项目搬到带空格的目录后，用 `rerun` 复核输入哈希并逐字节比对 PNG。
+- 只改样式时，分析文件哈希不变。
+- 用独立的 contains 判断回算网格均值；取五个内部像元，与最终地图颜色核对。
+- 记录页面资源，确认没有隐式底图。
+- 缺资源、越出项目的路径、QA 未通过、使用已移除的输出路径参数，都必须失败并给出对应错误代码（`SOURCE_FILE_MISSING`、`PATH_OUTSIDE_PROJECT`、`IMPORTANT_LABEL_MISSING`、`OUTPUT_FLAG_REMOVED`），失败的运行不得记为 ok。
 
-实际打开两张 PNG，检查中文长标题、十二个网格标签、图例、未知列、无默认边框。精确原生字形框仍 unavailable；自动 QA 通过不证明精确零冲突。日志中的渲染时绝对路径属于历史证据，搬移后重绘使用 Scene 的相对资源路径。
+display 自身"写出失败不发布"的保证由底层测试注入部分 PNG 写出失败来覆盖。外部自有文件无需 Composer 专属 record，状态也不会被自动升级。
+
+实际打开两张 PNG，检查中文长标题、十二个网格标签、图例、未知列、无默认边框。精确原生字形框仍 unavailable；自动 QA 通过不证明精确零冲突。日志和 Composer 输出 JSON 中的绝对路径属于历史证据；搬移后的复核依靠项目内的相对路径（Scene 资源与 `run.json` 输入）。
