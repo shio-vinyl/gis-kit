@@ -235,7 +235,7 @@ def execute(args):
     for x in args.input+[p[k] for k in ('reference','protected','scope') if k in p]:
         if any(Path(str(x)+suffix).exists() for suffix in ('.msk','.aux.xml','.ovr')): raise ValueError('External raster sidecars unsupported; prepare self-contained input')
     identities=[fingerprint(x) for x in inputs]
-    implementation={n:fingerprint(Path(__file__).with_name(n)) for n in ('raster.py','_raster_display.py','_raster_numeric.py','_raster_cleanup.py','daily.py','_daily.py','_analysis.py','_metric.py','_safe_io.py')}
+    implementation={n:fingerprint(Path(__file__).with_name(n)) for n in ('raster.py','_raster_display.py','_scheme.py','_raster_numeric.py','_raster_cleanup.py','daily.py','_daily.py','_analysis.py','_metric.py','_safe_io.py')}
     destination.parent.mkdir(parents=True,exist_ok=True)
     stage=Path(tempfile.mkdtemp(prefix='.raster-',dir=destination.parent))
     try:

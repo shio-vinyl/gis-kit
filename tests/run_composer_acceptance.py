@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Real local elevation -> grid means / classified display -> Composer project runs.
+"""Real local elevation -> grid means / class scheme / display values -> Composer project runs.
 
-gis-kit publishes its analysis and display files atomically into the Composer
-project's inputs/<name>/; Composer renders with --project into runs/<run-id>/.
-Diagnostic grid is constructed here, not an administrative/observed boundary.
-This is a runnable acceptance example, not a workflow engine or delivery protocol.
+gis-kit publishes its analysis, an uncoloured display grid (display-raster v1) and one
+class scheme (class-scheme v1) atomically into the Composer project's inputs/<name>/.
+Composer colours vector and raster from that scheme by theme and renders with --project
+into runs/<run-id>/. Diagnostic grid is constructed here, not an administrative/observed
+boundary. This is a runnable acceptance example, not a workflow engine or delivery protocol.
 """
 import argparse
 import copy
@@ -29,8 +30,9 @@ from _delivery import bundle, digest, write_json
 
 INPUT = 'mont-blanc grid'
 BREAKS = [1000, 2000, 3000, 4000]
-COLORS = ['#edf8b1', '#a1dab4', '#41b6c4', '#2c7fb8', '#253494']
 LABELS = ['< 1,000 m', '1,000–<2,000 m', '2,000–<3,000 m', '3,000–<4,000 m', '≥ 4,000 m']
+UNKNOWN = '未知 / NoData（无有效像元）'
+THEMES = ('research', 'atlas', 'presentation')
 
 
 def run(command, cwd, log, success=True):
@@ -43,31 +45,26 @@ def run(command, cwd, log, success=True):
     return result
 
 
-def scene(kind, coordinates, bounds, semantics):
+def scene(kind, theme, bounds, semantics):
     # Scenes live in the project's scenes/; analysis files are referenced in inputs/<name>/.
+    # No colours here: the class scheme says what each class means, the theme colours it.
     at = lambda name: f'../inputs/{INPUT}/{name}'
-    label_source = {'id':'names', 'type':'geojson', 'path':at('grid labels.geojson')}
-    unknown = '#d9d9d9'
-    paint = ['case', ['==', ['get','mean'], None], unknown,
-             ['step', ['get','mean'], COLORS[0], *[x for pair in zip(BREAKS,COLORS[1:]) for x in pair]]]
-    s = {'id':kind, 'theme':'data-focus', 'renderer':'maplibre',
+    s = {'id':f'{kind}-{theme}', 'theme':theme, 'renderer':'maplibre',
          'title': '勃朗峰周边 · ' + ('网格平均高程' if kind == 'vector' else '高程分级'),
          'subtitle':'本地 GEBCO 2023 标记样区 | candidate · 来源与垂直基准未独立核验 · 注记为网格均值',
          'canvas':{'width':1400,'height':1000,'pixelRatio':1},
-         'map':{'bounds':bounds,'fitPadding':{'top':150,'bottom':100,'left':60,'right':330},'renderWorldCopies':False,'background':'#f6f7f8'},
+         'map':{'bounds':bounds,'fitPadding':{'top':150,'bottom':100,'left':60,'right':330},'renderWorldCopies':False},
          'typography':{'fontFamily':'AnalysisSans','mapFontFamily':'AnalysisSans','fonts':[{'family':'AnalysisSans','path':at('font.otf'),'license':'SIL OFL 1.1; font-license.txt'}]},
-         'sources':[{'id':'grid','type':'geojson','path':at('grid means.geojson')},label_source],
+         'sources':[{'id':'grid','type':'geojson','path':at('grid means.geojson')},{'id':'names','type':'geojson','path':at('grid labels.geojson')}],
          'layers':[], 'analysis':semantics,
-         'overlay':{'frame':False,'scaleBar':False,'title':{'size':34},'subtitle':{'size':17},
-                    'legend':{'x':1080,'y':190,'width':275,'fontSize':17,'items':[{'type':'classified','title':('网格均值' if kind=='vector' else '像元高程')+' / m',
-                    'classes':[{'color':c,'label':l} for c,l in zip(COLORS,LABELS)]+[{'color':unknown,'label':'未知 / NoData（无有效像元）'}]}]}},
+         'overlay':{'frame':False,'scaleBar':False,'title':{'size':34},'subtitle':{'size':17},'legend':{'x':1080,'y':190,'width':275,'fontSize':17}},
          'qa':{'requiredLabels':[{'layerId':'names','ids':[f'{i:02}' for i in range(1,13)]}]}}
     if kind == 'raster':
-        s['sources'].insert(0, {'id':'elevation','type':'image','path':at('display/display.png'),'coordinates':coordinates})
-        s['layers'] += [{'id':'unknown','source':'grid','type':'fill','fill':unknown,'legend':False},
-                        {'id':'elevation','source':'elevation','type':'raster','paint':{'raster-resampling':'nearest','raster-fade-duration':0},'legend':False}]
+        s['sources'].insert(0, {'id':'elevation','type':'display-raster','path':at('display/raster.json')})
+        s['layers'] += [{'id':'unknown','source':'grid','type':'fill','paint':{'fill-color':'{palette.noData}','fill-opacity':1},'legend':False},
+                        {'id':'elevation','source':'elevation','type':'raster','legend':{'title':'像元高程 / m','nodata':'{palette.noData}'}}]
     else:
-        s['layers'].append({'id':'means','source':'grid','type':'fill','paint':{'fill-color':paint},'legend':False})
+        s['layers'].append({'id':'means','source':'grid','type':'fill','scheme':{'path':at('scheme/scheme.json'),'field':'mean'},'legend':{'title':'网格均值 / m','histogram':True}})
     s['layers'] += [{'id':'grid-lines','source':'grid','type':'line','paint':{'line-color':'#ffffff','line-width':1.4},'legend':False},
                     {'id':'names','source':'names','type':'symbol','text':{'field':'name','size':16,'color':'#172c3f','haloColor':'#ffffff','haloWidth':2},'placement':{'optional':False},'legend':False}]
     return s
@@ -76,6 +73,10 @@ def scene(kind, coordinates, bounds, semantics):
 def composer_json(result):
     # Composer prints one JSON document per command on stdout.
     return json.loads(result.stdout)
+
+
+def rgb(color):
+    return [int(color[j:j+2], 16) for j in (1, 3, 5)]
 
 
 def main():
@@ -106,6 +107,7 @@ def main():
         return json.loads((dest/'record.json').read_text())
     command(['node',entry,'project','init',project,'--name','gis-kit composer acceptance'])
     analysis=project/'inputs'/INPUT
+    scheme_params={'breaks':BREAKS,'labels':LABELS,'unit':'m','status':'candidate','nodata_label':UNKNOWN}
     # Publication of the analysis inputs is all-or-nothing, using the existing directory bundle helper.
     with bundle(analysis) as stage:
         shutil.copy2(source,stage/'source.tif')
@@ -140,57 +142,79 @@ def main():
         assert np.allclose(grid['mean'],reread['mean'],equal_nan=True)
         names=gpd.GeoDataFrame({'id':grid.id,'name':[f'网格 {i}\n{v:.0f} m' if np.isfinite(v) else f'网格 {i}\n未知' for i,v in zip(grid.id,grid['mean'])]},geometry=grid.geometry.centroid,crs=3857).to_crs(4326)
         names.to_file(stage/'grid labels.geojson')
-        display=raster('display',stage/'warp/result.tif',{'band':1,'breaks':BREAKS,'colors':COLORS,'unit':'m','status':'candidate'},stage/'display')
+        # One scheme for both: the vector field and the uncoloured display grid share breaks and labels.
+        settings=output/'params-scheme.json'; write_json(settings,scheme_params)
+        gis('scheme.py',stage/'analysis.gpkg','--layer','means','--field','mean','--params',settings,'--output',stage/'scheme')
+        display=raster('display',stage/'warp/result.tif',{'band':1,'mode':'values',**scheme_params},stage/'display')
+        vector_scheme=json.loads((stage/'scheme/scheme.json').read_text()); raster_scheme=json.loads((stage/'display/scheme.json').read_text())
+        assert vector_scheme['breaks']==raster_scheme['breaks']==BREAKS and [c['label'] for c in vector_scheme['classes']]==[c['label'] for c in raster_scheme['classes']]==LABELS
+        assert 'colors' not in vector_scheme and 'colors' not in raster_scheme and display['encoding']=='class-index'
         bounds=list(transform_bounds('EPSG:3857','EPSG:4326',left,bottom,right+dx,top))
         semantics={'status':'candidate','source':{'file':'source.tif','sha256':before,'description':args.source_description},
                    'vector':{'file':'analysis.gpkg','layer':'means','field':'mean','unit':'m','denominator':'valid source pixel count, equal-weight centre inclusion','zones':'constructed diagnostic grid; not administrative units'},
                    'raster':{'file':'warp/result.tif','band':1,'unit':'m','resampling':'nearest, explicit EPSG:3857 display grid'},
-                   'breaks':BREAKS,'colors':COLORS,'interval_rule':display['interval_rule'],'unknown':'null mean / no valid pixels; transparent raster over gray diagnostic grid; never zero',
+                   'class_scheme':{'vector':'scheme/scheme.json','raster':'display/scheme.json','breaks':BREAKS,'interval_rule':raster_scheme['interval_rule']},
+                   'unknown':'null mean / no valid pixels; transparent raster over the theme noData grid; never zero',
                    'upstream_identity_verified':False,'vertical_datum':'unknown'}
         controls=[]
         with rio.open(stage/'warp/result.tif') as ds:
             values=ds.read(1,masked=True)
-            # Interior, away from grid lines and centre labels; compare actual PNG color.
+            # Interior, away from grid lines and centre labels; the expected colour depends on the theme.
             for i,(rf,cf) in enumerate(((.13,.13),(.23,.77),(.44,.21),(.61,.87),(.83,.41))):
                 row,col=int(ds.height*rf),int(ds.width*cf)
                 x,y=ds.xy(row,col)
                 lon,lat=transform(ds.crs,'EPSG:4326',[x],[y])
-                color=COLORS[int(np.searchsorted(BREAKS,values[row,col],side='right'))]
-                controls.append({'id':str(i),'coordinates':[lon[0],lat[0]],'expected_rgb':[int(color[j:j+2],16) for j in (1,3,5)]})
+                controls.append({'id':str(i),'coordinates':[lon[0],lat[0]],'class':int(np.searchsorted(BREAKS,values[row,col],side='right'))})
         write_json(stage/'record.json',{'delivery':'complete','consumer':'gis-composer project inputs','analysis_status':'candidate','analysis':semantics,
                   'files':{str(f.relative_to(stage)):digest(f) for f in stage.rglob('*') if f.is_file()}})
     published=json.loads((analysis/'record.json').read_text())['files']
-    runs={}
-    for kind in ('vector','raster'):
-        spec=scene(kind,display['coordinates'],bounds,semantics)
-        if kind=='raster': spec['qa']['controlPoints']=controls
-        write_json(project/'scenes'/f'{kind}.scene.json',spec)
-        assert composer_json(composer_cmd('lint',f'scenes/{kind}.scene.json','--expect-no-frame'))['ok']
-        result=composer_json(composer_cmd('qa',f'scenes/{kind}.scene.json','--name',kind))
-        assert result['summary']['ok']
-        # Provenance: Composer hashed every file it read from inputs/<name>/ with the SHA-256 gis-kit published.
-        prefix=f'inputs/{INPUT}/'
-        used={i['ref'][len(prefix):]:i['sha256'] for i in json.loads(Path(result['run']['record']).read_text())['inputs'] if i['ref'].startswith(prefix)}
-        assert used and all(published[name]==sha for name,sha in used.items()), used
-        metrics=json.loads(Path(result['metrics']).read_text())
-        assert metrics['render']['resourceUrls']
-        assert all(url.startswith(('http://127.0.0.1:','data:','blob:')) for url in metrics['render']['resourceUrls'])
-        if kind=='raster':
-            pixels=np.asarray(Image.open(result['image']).convert('RGB'))
-            for observed,expected in zip(metrics['render']['maps']['main']['controlPoints'],controls):
-                x,y=observed['pixel']; assert np.array_equal(pixels[round(y),round(x)],expected['expected_rgb']), (observed,expected,pixels[round(y),round(x)])
-        runs[kind]={'run':result['run']['id'],'png_sha256':digest(result['image']),'inputs_from_gis_kit':sorted(used)}
+    runs={}; palettes={}
+    for theme in THEMES:
+        for kind in ('vector','raster'):
+            name=f'{kind}-{theme}'
+            spec=scene(kind,theme,bounds,semantics)
+            if kind=='raster': spec['qa']['controlPoints']=[{'id':c['id'],'coordinates':c['coordinates']} for c in controls]
+            write_json(project/'scenes'/f'{name}.scene.json',spec)
+            assert composer_json(composer_cmd('lint',f'scenes/{name}.scene.json','--expect-no-frame'))['ok']
+            result=composer_json(composer_cmd('qa',f'scenes/{name}.scene.json','--name',name))
+            assert result['summary']['ok']
+            run_dir=Path(result['run']['dir'])
+            # Provenance: Composer hashed every file it read from inputs/<name>/ with the SHA-256 gis-kit published.
+            prefix=f'inputs/{INPUT}/'
+            used={i['ref'][len(prefix):]:i['sha256'] for i in json.loads(Path(result['run']['record']).read_text())['inputs'] if i['ref'].startswith(prefix)}
+            assert used and all(published[n]==sha for n,sha in used.items()), used
+            assert ('display/values.png' in used and 'display/scheme.json' in used) if kind=='raster' else 'scheme/scheme.json' in used
+            metrics=json.loads(Path(result['metrics']).read_text())
+            assert metrics['render']['resourceUrls']
+            assert all(url.startswith(('http://127.0.0.1:','data:','blob:')) for url in metrics['render']['resourceUrls'])
+            resolved=json.loads((run_dir/'scene.resolved.json').read_text())
+            ramp=resolved['palette']['dataRamp']; assert len(ramp)==len(LABELS)  # a ramp of the class count is used as is
+            legend=resolved['overlay']['legend']['items']
+            scheme_item=next(item for item in legend if item.get('model')=='classified')
+            # Legends list classes high to low; colours come from the theme ramp.
+            assert [c['label'] for c in scheme_item['classes']][:5]==LABELS[::-1] and [c['color'] for c in scheme_item['classes']][:5]==ramp[::-1]
+            assert scheme_item['classes'][5]['label']==UNKNOWN and scheme_item['classes'][5]['color']==resolved['palette']['noData']
+            if kind=='vector':
+                assert [c.get('count') for c in scheme_item['classes']][:5]==vector_scheme['counts'][::-1]
+            else:
+                pixels=np.asarray(Image.open(result['image']).convert('RGB'))
+                for observed,expected in zip(metrics['render']['maps']['main']['controlPoints'],controls):
+                    x,y=observed['pixel']; want=rgb(ramp[expected['class']])
+                    assert np.array_equal(pixels[round(y),round(x)],want), (theme,observed,want,pixels[round(y),round(x)])
+            palettes[theme]=ramp
+            runs[name]={'run':result['run']['id'],'png_sha256':digest(result['image']),'inputs_from_gis_kit':sorted(used)}
+    assert len({tuple(r) for r in palettes.values()})==len(THEMES), 'each theme must colour the same scheme differently'
     moved=output/'moved project with spaces'; project.rename(moved)
-    protected={str(f.relative_to(moved)):digest(f) for f in (moved/'inputs').rglob('*') if f.suffix in ('.tif','.gpkg','.geojson')}
+    protected={str(f.relative_to(moved)):digest(f) for f in (moved/'inputs').rglob('*') if f.suffix in ('.tif','.gpkg','.geojson','.png','.json')}
     comparisons={}
-    for kind,item in runs.items():
+    for name in ('vector-research','raster-research'):
         # Fresh subprocess and fresh Chrome from another cwd; rerun re-checks input hashes, then compares bytes.
-        result=composer_json(command(['node',entry,'--project',moved,'rerun',item['run']],cwd=moved/'inputs'))
+        result=composer_json(command(['node',entry,'--project',moved,'rerun',runs[name]['run']],cwd=moved/'inputs'))
         assert result['rerun']['identical'] and not result['rerun']['mismatched'] and not result['rerun']['missing'], result
-        comparisons[kind]={'rerun':result['run']['id'],'byte_identical':True,'png_sha256':item['png_sha256']}
-    styled=json.loads((moved/'scenes/vector.scene.json').read_text()); styled['layers'][1]['paint']['line-color']='#263238'
+        comparisons[name]={'rerun':result['run']['id'],'byte_identical':True,'png_sha256':runs[name]['png_sha256']}
+    styled=json.loads((moved/'scenes/vector-research.scene.json').read_text()); styled['layers'][1]['paint']['line-color']='#263238'
     write_json(moved/'scenes/style-only.scene.json',styled)
-    assert digest(composer_json(composer_cmd('qa','scenes/style-only.scene.json','--name','style-only',root=moved))['image'])!=runs['vector']['png_sha256']
+    assert digest(composer_json(composer_cmd('qa','scenes/style-only.scene.json','--name','style-only',root=moved))['image'])!=runs['vector-research']['png_sha256']
     failures={}
     expected_codes={'missing-resource':'SOURCE_FILE_MISSING','outside-project':'PATH_OUTSIDE_PROJECT','qa-failed':'IMPORTANT_LABEL_MISSING','output-path-flag':'OUTPUT_FLAG_REMOVED'}
     for case in expected_codes:
@@ -208,10 +232,11 @@ def main():
         assert all(status!='ok' for status in statuses), (case,statuses)
         failures[case]=statuses or ['refused before a run was created']
     (moved/'scenes/failure.scene.json').unlink()
-    assert protected=={str(f.relative_to(moved)):digest(f) for f in (moved/'inputs').rglob('*') if f.suffix in ('.tif','.gpkg','.geojson')}
+    assert protected=={str(f.relative_to(moved)):digest(f) for f in (moved/'inputs').rglob('*') if f.suffix in ('.tif','.gpkg','.geojson','.png','.json')}
     assert digest(source)==before
-    write_json(output/'acceptance.json',{'source_sha256':before,'project':str(moved),'analysis_inputs':f'inputs/{INPUT}','runs':runs,'repeat':comparisons,'failure_cases':failures,
-               'analysis_unchanged':True,'interior_raster_color_controls':5,'observed_page_resources':'loopback/data/blob only; no basemap requests',
+    write_json(output/'acceptance.json',{'source_sha256':before,'project':str(moved),'analysis_inputs':f'inputs/{INPUT}','themes':list(THEMES),'theme_ramps':palettes,
+               'runs':runs,'repeat':comparisons,'failure_cases':failures,'analysis_unchanged':True,'interior_raster_color_controls':len(controls)*len(THEMES),
+               'observed_page_resources':'loopback/data/blob only; no basemap requests',
                'visual_review':'pending human/agent image inspection','limits':['constructed grid','upstream identity and vertical datum unverified','exact glyph bounds unavailable']})
     print(output/'acceptance.json')
 
