@@ -5,7 +5,7 @@
 - `gpkg.py rename` 改为用 sqlite3 在单个事务内原地重命名图层：同步更新 GPKG 元数据表、R-tree 空间索引及其触发器，不再整层读写，FID 与字段类型保持不变，也不再残留 `rtree_<旧名>_*` 孤表（#4）。
 - `gis.py describe <path> --json`：输出只读元数据卡片，不读要素或像元；格式见 `references/describe.schema.json`。
 - `gis.py capabilities --json`：输出版本、读写格式与可导入性探测，供外部诊断工具读取，不导入后端。
-- `gis.py --memory-budget SIZE`（或环境变量 `GIS_KIT_MEMORY_BUDGET`）：可选的读前内存预算，超限时以退出码 3 失败，并在 stderr 输出机读错误；未设置时行为不变。地形与栅格整幅运算已接入，契约见 `references/memory-budget.md`。`describe` 栅格卡片新增 `decoded_bytes`，`capabilities` 新增 `contracts.memory_budget`。
+- `gis.py --memory-budget SIZE`（或环境变量 `GIS_KIT_MEMORY_BUDGET`）：可选的读前内存预算，超限时以退出码 3 失败，并在 stderr 输出机读错误；未设置时行为不变。地形与栅格整幅运算已接入，契约见 `references/memory-budget.md`。`describe` 栅格卡片新增 `decoded_bytes`，`capabilities` 新增 `contracts.memory-budget`。
 - 矢量工具接入内存预算：读入整个图层的公开工具在读之前按抽样估算检查；`convert`（输出 GPKG）与 `gpkg import` / `copy` / `export`（输出 GPKG 或 Shapefile）对超过 10 万要素的图层改为分块读写，字段类型与几何类型与一次性写出一致。`hydro-review` 与栅格整理操作也接入了栅格预算检查。
 - 写出后的回读校验改为分块或按窗口读取，峰值内存不再因整份回读翻倍；校验口径与 `decoded_sha256` 等记录值不变。
 - Composer 交接改为共用 Composer 项目工作区：gis-kit 把分析输入原子发布到项目的 `inputs/<分析名>/`，Composer 用 `--project` 渲染到 `runs/<run-id>/`，两边的 SHA-256 记录可以逐个核对溯源。`tests/run_composer_acceptance.py` 改为这一流程，搬移后用 `rerun` 逐字节复核，失败用例按错误代码断言；约定写在 `references/composer-display.md`（#9）。
