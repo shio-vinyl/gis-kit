@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded DEM diagnostics: Horn slope/aspect and 3x3 elevation range."""
+"""Bounded DEM diagnostics: Horn slope/aspect, 3x3 elevation range and optional analytical hillshade."""
 import argparse
 import json
 from pathlib import Path
@@ -34,7 +34,20 @@ def derivatives(z, dx, dy):
     relief = maximum_filter(a, size=3) - minimum_filter(a, size=3)
     for values in (slope, aspect, relief):
         values[~complete] = np.nan
-    return {'slope': slope, 'aspect': aspect, 'relief': relief}
+    return {'slope': slope, 'aspect': aspect, 'relief': relief, '_east': east, '_north': north, '_complete': complete}
+
+
+def hillshade(east, north, complete, azimuth=315., altitude=45., z_factor=1.):
+    """Lambertian illumination 0..1 from Horn gradients; light from `azimuth` (clockwise from grid
+    north) at `altitude` degrees. Values only: the renderer colours them."""
+    az, alt = np.radians(azimuth), np.radians(altitude)
+    gx, gy = east * z_factor, north * z_factor
+    # Surface normal (-gx, -gy, 1) against the unit light vector pointing towards the sun.
+    light = np.array([np.sin(az) * np.cos(alt), np.cos(az) * np.cos(alt), np.sin(alt)])
+    shade = (-gx * light[0] - gy * light[1] + light[2]) / np.sqrt(gx * gx + gy * gy + 1)
+    shade = np.clip(shade, 0., 1.)
+    shade[~complete] = np.nan
+    return shade
 
 
 def summary(a):
@@ -47,7 +60,7 @@ def summary(a):
 
 def execute(source, params, output):
     started = time.perf_counter()
-    allowed = {'schema_version', 'band', 'vertical_unit', 'vertical_datum', 'source_description', 'max_pixels'}
+    allowed = {'schema_version', 'band', 'vertical_unit', 'vertical_datum', 'source_description', 'max_pixels', 'hillshade'}
     if not isinstance(params, dict) or set(params)-allowed or params.get('schema_version', 1) != 1:
         raise ValueError('Unknown parameter or schema')
     factors = {'metre': 1., 'foot': .3048, 'us_survey_foot': 1200/3937}
@@ -56,6 +69,14 @@ def execute(source, params, output):
     for field in ('vertical_datum', 'source_description'):
         if not isinstance(params.get(field), str) or not params[field].strip():
             raise ValueError(f'Explicit {field} required; use unknown if unverified')
+    shade = params.get('hillshade')
+    if shade is not None:
+        if not isinstance(shade, dict) or set(shade) - {'azimuth', 'altitude', 'z_factor'}:
+            raise ValueError('hillshade takes azimuth, altitude and z_factor')
+        shade = {'azimuth': 315., 'altitude': 45., 'z_factor': 1., **shade}
+        if not all(isinstance(shade[k], (int, float)) and np.isfinite(shade[k]) for k in shade) \
+                or not 0 <= shade['azimuth'] < 360 or not 0 < shade['altitude'] <= 90 or not 0 < shade['z_factor'] <= 100:
+            raise ValueError('hillshade azimuth 0..360, altitude 0..90 and z_factor 0..100 required')
     source = Path(source).resolve()
     if any(Path(str(source)+s).exists() for s in ('.msk', '.aux.xml', '.ovr')):
         raise ValueError('External sidecars unsupported; prepare self-contained raster')
@@ -77,13 +98,16 @@ def execute(source, params, output):
             if ds.width*ds.height > limit:
                 raise ValueError('Raster exceeds max_pixels memory guard')
             # z, zero-filled copy, east/north gradients, slope/aspect/relief and a filter temporary.
-            check_raster(ds, arrays=8)
+            check_raster(ds, arrays=10 if shade else 8)
             dx, dy = t.a*axes[0].unit_conversion_factor, -t.e*axes[1].unit_conversion_factor
             band = positive_integer(params.get('band', 1))
             if ds.units[band-1] is not None and ds.units[band-1] not in (params['vertical_unit'], {'metre':'m','foot':'ft','us_survey_foot':'us_survey_foot'}[params['vertical_unit']]):
                 raise ValueError('Band unit conflicts with declared vertical unit')
             z = band_data(ds, band).filled(np.nan)*factors[params['vertical_unit']]
             arrays = derivatives(z, dx, dy)
+            east, north, complete = arrays.pop('_east'), arrays.pop('_north'), arrays.pop('_complete')
+            if shade is not None:
+                arrays['hillshade'] = hillshade(east, north, complete, **shade)
             if not np.isfinite(arrays['slope']).any():
                 raise ValueError('No complete valid 3x3 neighbourhood')
             profile = dict(driver='GTiff', width=ds.width, height=ds.height, count=1,
@@ -91,7 +115,7 @@ def execute(source, params, output):
         artifacts = {}
         for name, values in arrays.items():
             path = stage/f'{name}.tif'
-            unit = 'metre' if name == 'relief' else 'degree'
+            unit = {'relief': 'metre', 'hillshade': 'ratio'}.get(name, 'degree')
             with rio.open(path, 'w', **profile) as out:
                 out.write(values, 1)
                 out.set_band_unit(1, unit)
@@ -106,9 +130,11 @@ def execute(source, params, output):
         rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         write_json(stage/'record.json', {'schema_version': 1, 'status': 'complete',
             'source': {'name': source.name, 'sha256': identity, 'grid': meta}, 'parameters': params,
-            'method': 'Horn 3x3; downhill aspect clockwise from grid north; 3x3 max-minus-min relief',
+            'method': 'Horn 3x3; downhill aspect clockwise from grid north; 3x3 max-minus-min relief'
+                      + ('; Lambertian hillshade 0..1 (light azimuth/altitude, z_factor scales gradients)' if shade else ''),
+            'hillshade': shade,
             'assumptions': ['No filling or edge interpolation', 'Flat aspect is NoData',
-                            'Projected grid distances; no ground-scale correction', 'No hydrology or event reconstruction'],
+                            'Projected grid distances; no ground-scale correction (z_factor is the only scale adjustment)', 'No hydrology or event reconstruction'],
             'spacing_metres': [dx, dy], 'elevation_metres': summary(z), 'artifacts': artifacts,
             'environment': {'python': sys.version, 'numpy': np.__version__, 'scipy': scipy.__version__,
                             'rasterio': rio.__version__, 'gdal': rio.__gdal_version__},

@@ -16,7 +16,9 @@ python terrain.py projected-dem.tif --params terrain.json --output new-result-di
 
 坡度单位为度，起伏度为邻域最大高程减最小高程（米）；支持非方形像元。平地坡向为 NoData。任何 3×3 邻点缺失或落在图像外均不计算，不插值、不填洼；源高程统计仍包含全部有效源像元。拒绝校准 scale/offset、外部栅格 sidecar、未知参数与超出像元上限；当前全量数组路径不声称流式计算。`max_pixels` 仅限制像元数，非精确内存配额。
 
-输出 `slope.tif`、`aspect.tif`、`relief.tif` 与 `record.json`。发布前逐像元回读、核对 CRS/变换/单位，并检查来源和实现哈希未变；输出目录必须全新。记录包含来源身份、假设、版本、统计、文件哈希、墙钟和本进程生命周期最大 RSS。正式使用仍需检查真实图像与源数据质量。
+可选 `"hillshade":{"azimuth":315,"altitude":45,"z_factor":1}` 另写 `hillshade.tif`：由同一组 Horn 梯度算出的朗伯光照值 0–1（单位 `ratio`，平地等于 sin 高度角），光源方位按格网北顺时针。它只是数值，不带颜色；交给 Composer 时用 `raster.py display` 的 `"mode":"values"`、`"encoding":"value-rgb24"` 写出显示栅格，由主题的晕渲色谱上色。`z_factor` 是唯一的比例调整：在 EPSG:3857 这类放大水平距离的投影上计算时，按中心纬度取约 1/cos(纬度) 并写进参数，记录会保留。
+
+输出 `slope.tif`、`aspect.tif`、`relief.tif`（及可选 `hillshade.tif`）与 `record.json`。发布前逐像元回读、核对 CRS/变换/单位，并检查来源和实现哈希未变；输出目录必须全新。记录包含来源身份、假设、版本、统计、文件哈希、墙钟和本进程生命周期最大 RSS。正式使用仍需检查真实图像与源数据质量。
 
 算法语义参考 [GDAL DEM 文档](https://gdal.org/en/stable/programs/gdaldem.html)；实现使用 [SciPy correlate](https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.correlate.html) 及 min/max filter，未调用 GDAL DEMProcessing，未宣称跨后端逐位一致。
 

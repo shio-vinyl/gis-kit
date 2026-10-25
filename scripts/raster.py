@@ -15,8 +15,8 @@ import geopandas as gpd
 import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.features import geometry_mask
-from rasterio.warp import reproject, calculate_default_transform
-from rasterio.windows import Window, transform as window_transform
+from rasterio.warp import reproject, calculate_default_transform, transform_bounds
+from rasterio.windows import Window, transform as window_transform, from_bounds as window_from_bounds
 from rasterio.transform import Affine
 from rasterio.merge import merge
 from shapely.geometry import box, mapping
@@ -51,6 +51,20 @@ def inspect(ds):
             'dtypes':list(ds.dtypes),'nodata':str(ds.nodata) if ds.nodata is not None and not np.isfinite(ds.nodata) else ds.nodata,
             'scales':ds.scales,'offsets':ds.offsets,'units':ds.units,'descriptions':ds.descriptions,'mask_flags':[[x.name for x in v] for v in ds.mask_flag_enums],
             'bounds':list(ds.bounds),'block_shapes':ds.block_shapes}
+
+
+def warp_window(ds, bounds):
+    """Source window (whole pixels, inside the raster) covering lon/lat bounds [west, south, east, north]."""
+    if not (isinstance(bounds,list) and len(bounds)==4 and all(isinstance(v,(int,float)) and math.isfinite(v) for v in bounds)
+            and -180<=bounds[0]<bounds[2]<=180 and -90<=bounds[1]<bounds[3]<=90):
+        raise ValueError('bounds must be lon/lat [west, south, east, north]')
+    if ds.transform.b or ds.transform.d: raise ValueError('bounds requires a north-up source; warp the whole raster first')
+    left,bottom,right,top=transform_bounds('EPSG:4326',ds.crs,*bounds,densify_pts=21)
+    win=window_from_bounds(left,bottom,right,top,ds.transform).round_offsets(op='floor').round_lengths(op='ceil')
+    col0,row0=max(0,int(win.col_off)),max(0,int(win.row_off))
+    col1,row1=min(ds.width,int(win.col_off+win.width)+1),min(ds.height,int(win.row_off+win.height)+1)
+    if col1<=col0 or row1<=row0: raise ValueError('bounds do not intersect the raster')
+    return Window(col0,row0,col1-col0,row1-row0)
 
 
 def band_data(ds, band, window=None):
@@ -99,7 +113,10 @@ def process(operation,paths,p,stage):
         ds=datasets[0]; meta=inspect(ds)
         if operation not in ('mosaic', *numeric.OPERATIONS, *cleanup.OPERATIONS) and len(datasets)!=1: raise ValueError('This operation accepts one raster')
         limit=positive_integer(p.get('max_pixels',50000000))
-        if limit<1 or any(x.width*x.height>limit for x in datasets): raise ValueError('Raster exceeds max_pixels memory guard')
+        # warp with lon/lat bounds reads only the covering source window, so the guard applies to it.
+        window=warp_window(ds,p.get('bounds')) if operation=='warp' and p.get('bounds') is not None else None
+        sizes=[(window.width,window.height)] if window is not None else [(x.width,x.height) for x in datasets]
+        if limit<1 or any(w*h>limit for w,h in sizes): raise ValueError('Raster exceeds max_pixels memory guard')
         for other in datasets[1:]: inspect(other)
         if operation not in ('inspect','warp') and any(x.transform.b or x.transform.d or x.transform.a<=0 or x.transform.e>=0 for x in datasets): raise ValueError('Operation requires north-up grid; use warp first')
         if operation in cleanup.OPERATIONS:
@@ -145,14 +162,18 @@ def process(operation,paths,p,stage):
                 if reference.transform.b or reference.transform.d or reference.transform.a<=0 or reference.transform.e>=0: raise ValueError('Reference must be north-up')
                 transform,width,height,crs=reference.transform,reference.width,reference.height,reference.crs
             else:
-                crs=p['crs']; transform,width,height=calculate_default_transform(ds.crs,crs,ds.width,ds.height,*ds.bounds,resolution=p.get('resolution'))
+                crs=p['crs']
+                src_width,src_height=(window.width,window.height) if window is not None else (ds.width,ds.height)
+                src_bounds=rio.windows.bounds(window,ds.transform) if window is not None else ds.bounds
+                transform,width,height=calculate_default_transform(ds.crs,crs,src_width,src_height,*src_bounds,resolution=p.get('resolution'))
             if width*height>limit: raise ValueError('Target exceeds max_pixels memory guard')
+            src_width,src_height=(window.width,window.height) if window is not None else (ds.width,ds.height)
             # Source float64 decode and its NaN-filled copy, plus the target grid.
-            require(raster_bytes(ds.width,ds.height,arrays=2)+raster_bytes(width,height),basis='decoded_pixels',input=ds.name)
+            require(raster_bytes(src_width,src_height,arrays=2)+raster_bytes(width,height),basis='decoded_pixels',input=ds.name)
             profile.update(crs=crs,transform=transform,width=width,height=height)
             output=np.full((height,width),np.nan)
-            reproject(band_data(ds,band).filled(np.nan),output,src_transform=ds.transform,src_crs=ds.crs,src_nodata=np.nan,
-                      dst_transform=transform,dst_crs=crs,dst_nodata=np.nan,resampling=Resampling[method])
+            reproject(band_data(ds,band,window).filled(np.nan),output,src_transform=window_transform(window,ds.transform) if window is not None else ds.transform,
+                      src_crs=ds.crs,src_nodata=np.nan,dst_transform=transform,dst_crs=crs,dst_nodata=np.nan,resampling=Resampling[method])
         elif operation=='mosaic':
             if p.get('overlap') not in ('first','last','min','max'): raise ValueError('Explicit mosaic overlap rule required')
             for other in datasets:

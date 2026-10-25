@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "note": "Tile services snapshot.py may copy into a project. cache 'allowed' means the provider's terms permit storing tiles for offline rendering within the stated license; 'forbidden' entries are listed so a request fails with the reason instead of silently scraping.",
+  "providers": {
+    "aws-terrarium": {
+      "name": "Terrain Tiles (Mapzen, AWS Open Data)",
+      "url": "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+      "kind": "raster-dem", "encoding": "terrarium", "format": "png", "tile_size": 256, "maxzoom": 15,
+      "cache": "allowed",
+      "license": "Open data; component sources keep their own terms (SRTM, GMTED2010, ETOPO1, NED and others)",
+      "attribution": "Terrain Tiles © Mapzen, AWS Open Data; sources include SRTM, GMTED2010, ETOPO1",
+      "terms_url": "https://github.com/tilezen/joerd/blob/master/docs/attribution.md"
+    },
+    "eox-s2cloudless-2016": {
+      "name": "Sentinel-2 cloudless 2016 (EOX)",
+      "url": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/g/{z}/{y}/{x}.jpg",
+      "kind": "raster", "format": "jpg", "tile_size": 256, "maxzoom": 15,
+      "cache": "allowed",
+      "license": "CC BY 4.0 (2016 edition)",
+      "attribution": "Sentinel-2 cloudless – s2maps.eu by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2016)",
+      "terms_url": "https://s2maps.eu"
+    },
+    "osm-standard": {
+      "name": "OpenStreetMap standard tiles", "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+      "kind": "raster", "cache": "forbidden",
+      "reason": "OSMF tile usage policy forbids bulk downloading; snapshot open vector data and style it instead",
+      "terms_url": "https://operations.osmfoundation.org/policies/tiles/"
+    },
+    "esri-world-imagery": {
+      "name": "Esri World Imagery", "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+      "kind": "raster", "cache": "forbidden",
+      "reason": "Esri terms do not permit storing tiles for offline use without a licence",
+      "terms_url": "https://www.esri.com/en-us/legal/terms/full-master-agreement"
+    },
+    "google-satellite": {
+      "name": "Google Maps satellite", "url": "https://mt.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+      "kind": "raster", "cache": "forbidden",
+      "reason": "Google Maps Platform terms prohibit caching or bulk download of tiles",
+      "terms_url": "https://cloud.google.com/maps-platform/terms"
+    }
+  }
+}
