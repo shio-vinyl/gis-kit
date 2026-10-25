@@ -77,7 +77,7 @@ def test_capabilities_no_site_packages_and_version():
     assert all(not f['available'] and f['reason'].startswith('not importable') for f in doc['features'])
     assert cli('capabilities').returncode == 2
     assert doc['contracts'] == {'describe': {'write': [1]}, 'class-scheme': {'write': [1]}, 'display-raster': {'write': [1]},
-                                'memory_budget': {'env': 'GIS_KIT_MEMORY_BUDGET', 'exit_code': 3, 'error': [1]}}
+                                'memory-budget': {'env': 'GIS_KIT_MEMORY_BUDGET', 'exit_code': 3, 'error': [1]}}
     assert 'describe' in doc['commands']
 
 

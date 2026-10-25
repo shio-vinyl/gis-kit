@@ -35,7 +35,7 @@ GIS_KIT_MEMORY_BUDGET=2GiB "$PY" "$GIS_SKILL/scripts/terrain.py" ...
 
 - `tool`：脚本名；`input`：触发检查的绝对路径；`layer`：矢量图层名，栅格为 `null`。
 - 只陈述事实，不给建议。读取方应忽略不认识的字段；不兼容的变更才升 `schema_version`。
-- `gis.py capabilities --json` 的 `contracts.memory_budget` 给出 `env`、`exit_code` 和支持的错误版本 `error`，读取方据此判断当前 gis-kit 是否支持这套契约。
+- `gis.py capabilities --json` 的 `contracts.memory-budget` 给出 `env`、`exit_code` 和支持的错误版本 `error`，读取方据此判断当前 gis-kit 是否支持这套契约。
 
 ## 覆盖范围
 
