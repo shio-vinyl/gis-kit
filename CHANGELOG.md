@@ -2,6 +2,10 @@
 
 ## 未发布
 
+- `terrain.py` 新增可选 `hillshade`：由 Horn 梯度算出 0–1 朗伯光照（`hillshade.tif`，单位 ratio），可设光源方位、高度角与 `z_factor`；只出数值，交给 Composer 时以显示栅格写出、由主题上色（Composer #13）。
+- 修复：受限 macOS 沙箱里 `system_profiler` 返回的字体 plist 缺少 `_items`，matplotlib 3.9 建字体缓存时抛 `KeyError`，且因缓存从未写成而每次复现。`_sandbox` 在缓存缺失时先跳过 `system_profiler` 预建一次（仍扫描 fontconfig 与系统字体目录）。
+- 新脚本 `snapshot.py`：从白名单服务商（`references/snapshot-providers.json`）按范围与缩放级别把 XYZ 瓦片快照到项目 `inputs/`，清单 `tile-snapshot` v1 记录 URL、获取时间、许可、署名与逐瓦片 SHA-256；条款禁止缓存的服务直接拒绝。`capabilities` 声明 `contracts.tile-snapshot`（Composer #13）。
+
 - `gpkg.py rename` 改为用 sqlite3 在单个事务内原地重命名图层：同步更新 GPKG 元数据表、R-tree 空间索引及其触发器，不再整层读写，FID 与字段类型保持不变，也不再残留 `rtree_<旧名>_*` 孤表（#4）。
 - `gis.py describe <path> --json`：输出只读元数据卡片，不读要素或像元；格式见 `references/describe.schema.json`。
 - `gis.py capabilities --json`：输出版本、读写格式与可导入性探测，供外部诊断工具读取，不导入后端。
