@@ -21,4 +21,4 @@ python admin-chain.py --source gadm_410-levels.gpkg --site site.gpkg --levels 0,
 
 - **数据口径**：GADM 不是权威边界。各国下级区划的新旧不一，例如中国的 ADM_3 把广州市区几个区合成了一个单元，名称为 `NA`。要用其他区划时，换成字段相同的 GeoPackage。国界口径由 `--adm0-layer` 显式选择并写进清单；出图时在来源行注明。
 
-Composer 侧把两份 GeoJSON 当普通数据放进 sheet 组合：每级一个面板，范围取 `chain.json` 里该级的 `bounds`，用 `focus` 块突出下一级（按 `key` 过滤）、`context.lines` 画本级轮廓与下级界线（按 `parent` 过滤），再选 `row`、`hero` 等版面结构。示例见 Composer 仓库 `examples/sheets/paris-chain.sheet-composition.json`；颜色由主题决定。
+Composer 侧把两份 GeoJSON 当普通数据交给地图清单：版式选 `row`（链式放大）或 `hero`（定位小图），用分面按 `chain.geojson` 的要素逐级展开面板，各级范围由 `fit` 从同一份 GeoJSON 推导，`focus` 块突出下一级（按 `key` 过滤），`context.lines` 画本级轮廓与下级界线（按 `parent` 过滤）。示例见 Composer 仓库 `examples/europe-atlas/maps/paris-chain.map.json`；颜色由项目主题决定。
