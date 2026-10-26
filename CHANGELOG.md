@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 新脚本 `display-vector.py`：按一张图的视角（中心、缩放、画布，Web 墨卡托 512 像素瓦片，与 Composer `inspect` 一致）概括面数据：删去几平方像素以下的部件、按半像素共边简化、陆上国界只取相邻单元的公共边、海岸取合并后的外轮廓；`--keep` 保留必须出现的小单元，`--cache` 按源标识、参数与视角缓存。发布 `areas.geojson`、`boundaries.geojson`、`coast.geojson` 与清单 `display-vector` v1，`capabilities` 声明 `contracts.display-vector`（Composer #30）。
+- `admin-chain.md` 的 Composer 用法改为地图清单与分面（原 sheet 组合已在 Composer 中移除）。
 - 新脚本 `admin-chain.py`：按场地点或场地面，在 GADM 式分级 GeoPackage 里逐级找出包含场地的行政区，并取每级下一级的单元作内部界线；按各级范围做共边显示简化，发布 `chain.geojson`、`context.geojson` 与清单 `admin-chain` v1，供 Composer 的 sheet 组合做区位逐级放大图。国界口径用 `--adm0-layer` 显式选择。`capabilities` 声明 `contracts.admin-chain`（Composer #8）。
 - `terrain.py` 新增可选 `hillshade`：由 Horn 梯度算出 0–1 朗伯光照（`hillshade.tif`，单位 ratio），可设光源方位、高度角与 `z_factor`；只出数值，交给 Composer 时以显示栅格写出、由主题上色（Composer #13）。
 - 修复：受限 macOS 沙箱里 `system_profiler` 返回的字体 plist 缺少 `_items`，matplotlib 3.9 建字体缓存时抛 `KeyError`，且因缓存从未写成而每次复现。`_sandbox` 在缓存缺失时先跳过 `system_profiler` 预建一次（仍扫描 fontconfig 与系统字体目录）。

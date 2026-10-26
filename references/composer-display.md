@@ -2,7 +2,7 @@
 
 分析原件保留在 gis-kit 一侧。分界原则：**几何、数值和语义归 gis-kit，颜色、纹理和图例归 Composer**，数据只从 gis-kit 流向 Composer。字段、单位、分母、分类边界、NoData 与 `candidate` / `hold` 写在分类方案和 `record.json` 里；这些记录不构成自动审批。
 
-区位逐级放大图所需的各级行政区另走 [admin-chain](admin-chain.md) 约定。交给 Composer 的显示数据有三种：
+区位逐级放大图所需的各级行政区另走 [admin-chain](admin-chain.md) 约定；小比例尺地图的底图与专题面按这张图的视角概括，走 [display-vector](display-vector.md) 约定。交给 Composer 的显示数据有三种：
 
 - 显示 GeoJSON（`convert.py`）。
 - 分类方案 `scheme.json`：约定 `class-scheme` v1，Schema 见 [class-scheme.schema.json](class-scheme.schema.json)。

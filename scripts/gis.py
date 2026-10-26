@@ -54,7 +54,7 @@ def capabilities() -> dict:
         features.append(row)
     return {'contract': 'capabilities', 'schema_version': 1, 'engine': 'gis-kit', 'engine_version': VERSION,
             'commands': ['capabilities', 'describe', 'list'],
-            'contracts': {'describe': {'write': [1]}, 'class-scheme': {'write': [1]}, 'display-raster': {'write': [1]}, 'tile-snapshot': {'write': [1]}, 'admin-chain': {'write': [1]},
+            'contracts': {'describe': {'write': [1]}, 'class-scheme': {'write': [1]}, 'display-raster': {'write': [1]}, 'tile-snapshot': {'write': [1]}, 'admin-chain': {'write': [1]}, 'display-vector': {'write': [1]},
                           'memory-budget': {'env': _budget.ENV, 'exit_code': _budget.EXIT_CODE, 'error': [1]}},
             'features': features}
 
