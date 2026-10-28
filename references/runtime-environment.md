@@ -18,6 +18,7 @@
 | PNG、模板、表格 | Pillow、Matplotlib、PyYAML；Excel 用 openpyxl，表格美化 tabulate 可走已有 fallback |
 | 图像增强及独立骨架实验 | OpenCV；骨架实验另需 scikit-image。依赖安装不授权程序追线，仍需用户明确选择该实验路径 |
 | CAD 图纸（DXF） | ezdxf（可选）：块名与属性、闭合多段线、布局与视口、MTEXT 清洗；未安装时 `cad.py` 退回 GDAL 的 DXF 驱动，并在报告里列出缺少的能力，见 [CAD 图纸清点](cad-intake.md) |
+| DWG 转 DXF | 外部程序，不属于 Python 依赖：ODA File Converter（需接受其许可）或 LibreDWG `dwg2dxf`（`brew install libredwg`）；`cad.py convert` 只调用已安装的程序 |
 | 按需 Spatial SQL | DuckDB 1.5.0、官方 spatial 扩展、PyArrow / PyProj；独立可选 requirements-spatial-sql.txt，不强制进入普通 GIS 路径，见 [规模处理](spatial-sql.md) |
 | Arrow 读写路径 | PyArrow；普通 Pyogrio 路径不默认要求 Arrow |
 | 永久回归与完整文件链 | pytest 及上述被测试路径的依赖；仅覆盖简化的独立测试也可用标准库 unittest |

@@ -11,7 +11,8 @@ the zone prefix are held: they may equally be a local grid, so no EPSG code is l
 --reference, a layer in a known projected CRS, lines up with the drawing's extent.
 CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
 Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
-Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
+Writes cad.json, check.png and record.json to a new directory. DWG is not read: `cad.py convert` runs an
+installed ODA File Converter or LibreDWG on a copy and reads the DXF back; nothing is installed by it.
 
 `cad.py extract` writes model-space entities of chosen layers to raw.gpkg (lines, closed_polygons, texts,
 blocks) with layer and handle on every feature: curves flattened to --arc-tolerance, units scaled to metres
@@ -264,6 +265,72 @@ def compare(core, scale, reference):
     return row
 
 
+def read_gdal(source, encoding=None):
+    """GDAL's DXF features with no per-block feature limit; geometries shapely cannot read (polyhedral surfaces
+    from polyface meshes) become empty and are counted. Returns (frame, unreadable count, GDAL text warnings)."""
+    import warnings as python_warnings
+    import geopandas as gpd
+    import pyogrio
+    import shapely
+    from pyogrio.raw import read
+    options = {'DXF_FEATURE_LIMIT_PER_BLOCK': '-1', 'DXF_ENCODING': encoding}
+    pyogrio.set_gdal_config_options(options)
+    try:
+        with python_warnings.catch_warnings(record=True) as caught:
+            python_warnings.simplefilter('always')
+            meta, _, wkb, fields = read(source)
+    finally:
+        pyogrio.set_gdal_config_options({key: None for key in options})
+    geometry = shapely.from_wkb(wkb, on_invalid='ignore')
+    unreadable = sum(1 for g, raw in zip(geometry, wkb) if g is None and raw is not None)
+    frame = gpd.GeoDataFrame(dict(zip(meta['fields'], fields)), geometry=gpd.GeoSeries(geometry))
+    notes = sorted({str(c.message).split('.')[0] for c in caught if 'converted' in str(c.message)})
+    return frame, unreadable, notes
+
+
+def undecodable(doc):
+    """Layer names and model-space texts holding bytes the encoding could not decode (ezdxf keeps them as surrogates)."""
+    strings = [layer.dxf.name for layer in doc.layers]
+    for entity in doc.modelspace():
+        kind = entity.dxftype()
+        if kind == 'TEXT':
+            strings.append(entity.dxf.text)
+        elif kind == 'MTEXT':
+            strings.append(entity.text)
+        elif kind == 'INSERT':
+            strings += [a.dxf.text for a in entity.attribs]
+    return sum(1 for s in strings if any(0xDC80 <= ord(c) <= 0xDCFF for c in s or ''))
+
+
+def utf8_dxf(header):
+    """DXF R2007 (AC1021) and later is UTF-8 whatever $DWGCODEPAGE says; GDAL follows the code page unless told."""
+    return (header.get('acadver') or '') >= 'AC1021'
+
+
+def choose_encoding(source, names, header, option):
+    """The encoding to read with and how it was chosen: --encoding, the header code page, or an automatic retry
+    with CP936 then GB18030 when names look like GBK read as Latin-1 (fewest undecodable strings wins)."""
+    if option:
+        return option, {'declared': header.get('codepage'), 'used': option, 'source': 'option'}
+    if utf8_dxf(header):
+        return None, {'declared': header.get('codepage'), 'used': 'UTF-8', 'source': 'dxf-version'}
+    if not looks_misdecoded(names):
+        return None, {'declared': header.get('codepage'), 'used': 'header', 'source': 'header'}
+    tried = {}
+    try:
+        import ezdxf
+    except ImportError:
+        ezdxf = None
+    for candidate in ('CP936', 'GB18030'):
+        if ezdxf is None:
+            tried[candidate] = None
+            break
+        tried[candidate] = undecodable(ezdxf.readfile(source, encoding=candidate))
+    counted = {k: v for k, v in tried.items() if v is not None}
+    used = min(counted, key=lambda k: (counted[k], list(tried).index(k))) if counted else 'CP936'
+    return used, {'declared': header.get('codepage'), 'used': used, 'source': 'auto', 'tried': tried}
+
+
 def looks_misdecoded(values):
     """Names that are GBK bytes read as Latin-1, as when $DWGCODEPAGE is missing or says ANSI_1252."""
     for value in values:
@@ -319,17 +386,51 @@ def clean_text(text):
     return ' '.join(folded.split())
 
 
+def strip_bad_xdata(source, target):
+    """Copy a DXF dropping tags below group code 1000 inside XDATA (after a 1001 application tag, before the next
+    entity), which LibreDWG writes into some XRECORDs and ezdxf refuses. Returns the number of tags dropped."""
+    dropped, in_xdata = 0, False
+    with open(source, 'rb') as reader, open(target, 'wb') as writer:
+        while True:
+            code_line, value_line = reader.readline(), reader.readline()
+            if not code_line:
+                break
+            code = code_line.strip()
+            if code == b'0':
+                in_xdata = False
+            elif code == b'1001':
+                in_xdata = True
+            elif in_xdata and code.lstrip(b'-').isdigit() and int(code) < 1000:
+                dropped += 1
+                continue
+            writer.write(code_line + value_line)
+    return dropped
+
+
 def read_drawing(path, encoding):
-    """(ezdxf document, audit counts); (None, None) when ezdxf is not installed."""
+    """(ezdxf document, audit counts); (None, None) when ezdxf is not installed. A drawing with malformed XDATA is
+    read from a copy without the offending tags, and the count is reported as audit['xdata_tags_dropped']."""
+    import tempfile
     try:
         import ezdxf
         from ezdxf import recover
+        from ezdxf.lldxf.const import DXFXDataError
     except ImportError:
         return None, None
-    if encoding:  # recover mode takes the encoding from the header only
-        return ezdxf.readfile(path, encoding=encoding), None
-    doc, auditor = recover.readfile(path)
-    return doc, {'errors': len(auditor.errors), 'fixes': len(auditor.fixes)}
+
+    def load(file):
+        if encoding:  # recover mode takes the encoding from the header only
+            return ezdxf.readfile(file, encoding=encoding), {'errors': 0, 'fixes': 0}
+        doc, auditor = recover.readfile(file)
+        return doc, {'errors': len(auditor.errors), 'fixes': len(auditor.fixes)}
+    try:
+        return load(path)
+    except DXFXDataError:
+        with tempfile.TemporaryDirectory() as folder:
+            copy = Path(folder) / 'clean.dxf'
+            dropped = strip_bad_xdata(path, copy)
+            doc, audit = load(copy)
+        return doc, {**audit, 'xdata_tags_dropped': dropped}
 
 
 def drawing_inventory(doc, bounds):
@@ -342,7 +443,8 @@ def drawing_inventory(doc, bounds):
         if kind == 'LWPOLYLINE':
             kind += ' closed' if entity.closed else ' open'
         elif kind == 'POLYLINE':
-            kind += ' closed' if entity.is_closed else ' open'
+            kind += (' polyface' if entity.is_poly_face_mesh else ' mesh' if entity.is_polygon_mesh
+                     else ' closed' if entity.is_closed else ' open')
         row = layers.setdefault(entity.dxf.layer, {'layer': entity.dxf.layer, 'entities': 0, 'dxf_types': Counter(),
                                                     'blocks': Counter(), 'attributes': {}, 'text': []})
         row['entities'] += 1
@@ -451,20 +553,23 @@ def inspect(args):
     import pyogrio
     source = Path(args.source)
     if source.suffix.lower() == '.dwg':
-        raise ValueError('DWG is not read; save it as DXF first (AutoCAD / ZWCAD "Save As", or ODA File Converter)')
+        raise ValueError('DWG is not read; convert it with cad.py convert, or save it as DXF in AutoCAD / ZWCAD')
     if source.suffix.lower() != '.dxf' or not source.is_file():
         raise ValueError('Source must be an existing .dxf file')
     near = parse_near(args.near) if args.near else None
     header = read_header(source)
     check_vector(source)
-    if args.encoding:
-        pyogrio.set_gdal_config_options({'DXF_ENCODING': args.encoding})
-    frame = pyogrio.read_dataframe(source)
+    frame, unreadable, gdal_notes = read_gdal(source, args.encoding or ('UTF-8' if utf8_dxf(header) else None))
     warnings = []
     names = [*frame['Layer'].dropna().unique()[:200], *(frame['Text'].dropna().unique()[:200] if 'Text' in frame else [])]
-    if not args.encoding and looks_misdecoded(names):
-        warnings.append(f'Layer or text names look like GBK read as Latin-1 ($DWGCODEPAGE = {header.get("codepage")}); '
-                        'rerun with --encoding CP936')
+    encoding, encoding_report = choose_encoding(source, names, header, args.encoding)
+    if encoding_report['source'] == 'auto':
+        frame, unreadable, gdal_notes = read_gdal(source, encoding)
+        warnings.append(f'Layer or text names looked like GBK read as Latin-1 ($DWGCODEPAGE = {header.get("codepage")}); '
+                        f'read again as {encoding} (pass --encoding to choose)')
+    warnings += [f'GDAL: {note}' for note in gdal_notes]
+    if unreadable:
+        warnings.append(f'{unreadable} polyface meshes (GDAL returns them as polyhedral surfaces) are left out of the geometry')
     empty = frame.geometry.isna() | frame.geometry.is_empty
     paper = frame['PaperSpace'].eq(True) if 'PaperSpace' in frame else empty & False
     if paper.any():
@@ -474,7 +579,7 @@ def inspect(args):
         raise ValueError('No model-space geometry in the drawing')
     core, x, y = split_core(model)
     try:
-        doc, audit = read_drawing(source, args.encoding)
+        doc, audit = read_drawing(source, encoding)
     except Exception as error:  # ezdxf's own errors vary by damage; GDAL already read the drawing
         doc, audit = None, None
         warnings.append(f'ezdxf could not read the drawing ({type(error).__name__}: {error}); layer inventory falls back to GDAL')
@@ -483,6 +588,13 @@ def inspect(args):
         bounds = {name: [round(float(v), 3) for v in rows.total_bounds] for name, rows in model.groupby(model['Layer'].fillna(''))}
         layers, unused, layouts = drawing_inventory(doc, bounds)
         reader = {'inventory': f'ezdxf {ezdxf.__version__}', 'missing': []}
+        encoding_report['undecodable_strings'] = undecodable(doc)
+        if encoding_report['undecodable_strings']:
+            warnings.append(f'{encoding_report["undecodable_strings"]} layer names or texts hold bytes that do not decode as '
+                            f'{encoding_report["used"] if encoding_report["used"] != "header" else header.get("codepage")}')
+        if audit and audit.get('xdata_tags_dropped'):
+            warnings.append(f'Read without {audit["xdata_tags_dropped"]} malformed XDATA tags (group codes below 1000 after an '
+                            'application name, as LibreDWG writes them); entities are unaffected')
         if audit and audit['errors']:
             warnings.append(f'ezdxf recovered the drawing with {audit["errors"]} structure errors and {audit["fixes"]} fixes')
     else:
@@ -564,7 +676,7 @@ def inspect(args):
         report = {'report': 'cad-inventory', 'schema_version': 1,
                   'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source),
                              'modified': datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec='seconds')},
-                  'header': header, 'reader': reader,
+                  'header': header, 'reader': reader, 'encoding': encoding_report,
                   'entities': {'model_space': total, 'geometries': int(len(model)), 'paper_space': int(paper.sum()),
                                'empty': int(empty.sum()),
                                'geometry_types': {k: int(v) for k, v in model.geom_type.value_counts().items()}},
@@ -741,6 +853,15 @@ def extract(args):
         raise ValueError('cad.py extract needs ezdxf (pip install ezdxf); GDAL keeps neither handles nor block attributes')
     import ezdxf
     warnings = []
+    names = [layer.dxf.name for layer in doc.layers]
+    encoding, encoding_report = choose_encoding(source, names, header, args.encoding)
+    if encoding_report['source'] == 'auto':
+        doc, audit = read_drawing(source, encoding)
+        warnings.append(f'Layer names looked like GBK read as Latin-1 ($DWGCODEPAGE = {header.get("codepage")}); '
+                        f'read again as {encoding} (pass --encoding to choose)')
+    encoding_report['undecodable_strings'] = undecodable(doc)
+    if audit and audit.get('xdata_tags_dropped'):
+        warnings.append(f'Read without {audit["xdata_tags_dropped"]} malformed XDATA tags; entities are unaffected')
     if header.get('handles') is not True:
         warnings.append('The drawing may carry no entity handles (R12 or no readable header): handle fields can be '
                         'assigned by ezdxf on reading and then cannot be looked up in CAD')
@@ -816,7 +937,7 @@ def extract(args):
             raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
         manifest = {'manifest': 'cad-extract', 'schema_version': 1,
                     'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source)},
-                    'header': header, 'reader': f'ezdxf {ezdxf.__version__}',
+                    'header': header, 'reader': f'ezdxf {ezdxf.__version__}', 'encoding': encoding_report,
                     'parameters': {'layers': wanted, 'units': args.units, 'scale_to_metre': scale, 'units_basis': basis,
                                    'arc_tolerance_m': args.arc_tolerance, 'include_blocks': args.include_blocks,
                                    'drop_z': args.drop_z, 'encoding': args.encoding},
@@ -1241,6 +1362,109 @@ def label(args):
     return manifest
 
 
+# DXF versions the converters write, as cad.py names them -> (LibreDWG --as, ODA output version)
+DXF_VERSIONS = {'r2000': ('r2000', 'ACAD2000'), 'r2004': ('r2004', 'ACAD2004'), 'r2007': ('r2007', 'ACAD2007'),
+                'r2010': ('r2010', 'ACAD2010'), 'r2013': ('r2013', 'ACAD2013'), 'r2018': ('r2018', 'ACAD2018')}
+ODA_PATHS = ('/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter',
+             'C:/Program Files/ODA/ODAFileConverter*/ODAFileConverter.exe', '/usr/bin/ODAFileConverter')
+
+
+def find_converters():
+    """Installed DWG-to-DXF converters: {'oda': path, 'libredwg': path}; nothing is installed here."""
+    import glob
+    import shutil
+    found = {}
+    oda = shutil.which('ODAFileConverter') or next((hit for pattern in ODA_PATHS for hit in sorted(glob.glob(pattern))), None)
+    if oda:
+        found['oda'] = oda
+    if shutil.which('dwg2dxf'):
+        found['libredwg'] = shutil.which('dwg2dxf')
+    return found
+
+
+def dwg_version(path):
+    with open(path, 'rb') as stream:
+        magic = stream.read(6).decode('ascii', 'replace')
+    if not magic.startswith('AC'):
+        raise ValueError(f'{path} does not start like a DWG file (got {magic!r})')
+    return magic
+
+
+def convert(args):
+    """Convert a DWG to DXF with an installed converter and read the result back."""
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+    source = Path(args.source)
+    if source.suffix.lower() != '.dwg' or not source.is_file():
+        raise ValueError('Source must be an existing .dwg file')
+    version = dwg_version(source)
+    found = find_converters()
+    if args.tool == 'auto':
+        tool = 'oda' if 'oda' in found else 'libredwg' if 'libredwg' in found else None
+    else:
+        tool = args.tool if args.tool in found else None
+    if tool is None:
+        wanted = 'ODA File Converter or LibreDWG (dwg2dxf)' if args.tool == 'auto' else args.tool
+        raise ValueError(f'No {wanted} found. Install one (ODA File Converter needs its licence accepted; '
+                         'LibreDWG: brew install libredwg), or save the drawing as DXF 2013/2018 in AutoCAD / ZWCAD')
+    as_libredwg, as_oda = DXF_VERSIONS[args.version]
+    stat = source.stat()
+    with tempfile.TemporaryDirectory() as folder:
+        work = Path(folder)
+        given = work / 'in'
+        given.mkdir()
+        copy = given / source.name  # converters see a copy; the original is never opened for writing
+        shutil.copy2(source, copy)
+        out = work / 'out'
+        out.mkdir()
+        target = out / f'{source.stem}.dxf'
+        if tool == 'libredwg':
+            command = [found[tool], '-y', '--as', as_libredwg, '-o', str(target), str(copy)]
+        else:
+            command = [found[tool], str(given), str(out), as_oda, 'DXF', '0', '1', source.name]
+        started = time.monotonic()
+        run = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=args.timeout)
+        seconds = round(time.monotonic() - started, 2)
+        messages = [line for line in (run.stdout + run.stderr).splitlines() if line.strip()]
+        if run.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
+            raise ValueError(f'{tool} failed (exit {run.returncode}): ' + ' | '.join(messages[-5:]))
+        header = read_header(target)
+        doc, audit = read_drawing(target, None)
+        readback = {'header': header}
+        if doc is not None:
+            model = doc.modelspace()
+            layers = {entity.dxf.layer for entity in model}
+            readback.update(model_space_entities=len(model), layers_with_entities=len(layers), layer_table=len(doc.layers),
+                            paper_space_entities=sum(len(l) for l in doc.layouts if l.name != 'Model'),
+                            extent=header.get('extent'), audit=audit)
+        else:
+            readback['note'] = 'ezdxf not installed: only the header was read back'
+        with bundle(args.output) as stage:
+            shutil.copy2(target, stage / target.name)
+            published = stage / target.name
+            warnings = sorted(set(m for m in messages if 'warning' in m.lower()))
+            manifest = {'manifest': 'cad-convert', 'schema_version': 1,
+                        'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source), 'dwg_version': version,
+                                   'release': VERSIONS.get(version)},
+                        'converter': {'tool': tool, 'path': found[tool], 'command': [Path(command[0]).name, *command[1:]],
+                                      'exit_code': run.returncode, 'seconds': seconds, 'messages': messages[-20:],
+                                      'available': sorted(found)},
+                        'output': {'path': published.name, 'bytes': published.stat().st_size, 'sha256': digest(published),
+                                   'requested_version': args.version},
+                        'readback': readback, 'warnings': warnings[:20]}
+            write_json(stage / 'manifest.json', manifest)
+            write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad convert', 'version': VERSION,
+                                                'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                                'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
+                                                'files': {'manifest.json': digest(stage / 'manifest.json'), published.name: manifest['output']['sha256']},
+                                                'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                                'assumptions': ['The converter reads a copy of the DWG; the original is not modified',
+                                                                'Readback counts come from the DXF; the DWG itself is not parsed here']})
+    return manifest
+
+
 def load_inspection(path):
     path = Path(path)
     path = path / 'cad.json' if path.is_dir() else path
@@ -1373,6 +1597,12 @@ def main():
     tag.add_argument('--texts-layer', default='texts')
     tag.add_argument('--rules', required=True, help='YAML label rules: fields, combined, landuse_major, road')
     tag.add_argument('--output', required=True, help='New directory for parcels.gpkg, check.png, rules.yaml, manifest.json and record.json')
+    dwg = commands.add_parser('convert', help='Convert DWG to DXF with an installed ODA File Converter or LibreDWG')
+    dwg.add_argument('source', help='DWG file')
+    dwg.add_argument('--tool', choices=('auto', 'oda', 'libredwg'), default='auto', help='auto prefers ODA, then LibreDWG')
+    dwg.add_argument('--version', choices=tuple(DXF_VERSIONS), default='r2018', help='DXF version to write (default r2018)')
+    dwg.add_argument('--timeout', type=float, default=600, help='Seconds before the converter is stopped (default 600)')
+    dwg.add_argument('--output', required=True, help='New directory for <source>.dxf, manifest.json and record.json')
     assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
     assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
     assign.add_argument('--layer', help='Layer within source; required when it has several')
@@ -1384,6 +1614,12 @@ def main():
     assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
     args = parser.parse_args()
     try:
+        if args.command == 'convert':
+            manifest = convert(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'tool': manifest['converter']['tool'],
+                              'dwg': manifest['source']['release'] or manifest['source']['dwg_version'],
+                              'readback': {k: v for k, v in manifest['readback'].items() if k != 'header'}}, ensure_ascii=False))
+            return
         if args.command == 'extract':
             manifest = extract(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],

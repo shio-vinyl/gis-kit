@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -121,8 +122,12 @@ def test_outliers_paper_space_and_local_grid(tmp_path):
     entities = site(1200, 800) + line('图框', 0, 0, 0.5, 0.5) + line('图框', 9e5, 9e5, 9e5+1, 9e5+1) \
         + line('布局', 0, 0, 420, 297, paper=True)
     source = dxf(tmp_path/'local.dxf', entities, header=False)  # no $DWGCODEPAGE: GDAL falls back to Latin-1
-    garbled = inspect(source, tmp_path/'garbled')
-    assert any('--encoding CP936' in w for w in garbled['warnings']) and '道路' not in {r['layer'] for r in garbled['layers']}
+    auto = inspect(source, tmp_path/'auto')  # GBK read as Latin-1 is noticed and read again
+    assert auto['encoding']['source'] == 'auto' and auto['encoding']['used'] == 'CP936'
+    assert auto['encoding']['tried'] == {'CP936': 0, 'GB18030': 0} and '道路' in {r['layer'] for r in auto['layers']}
+    assert any('read again as CP936' in w for w in auto['warnings'])
+    garbled = inspect(source, tmp_path/'garbled', '--encoding', 'CP1252')  # an explicit choice is kept, however wrong
+    assert garbled['encoding']['source'] == 'option' and '道路' not in {r['layer'] for r in garbled['layers']}
     report = inspect(source, tmp_path/'out', '--encoding', 'CP936')
     assert report['header']['readable'] is False and report['entities']['paper_space'] == 1
     assert report['extent']['outliers'] == 2 and report['extent']['core'][2] < 2000
@@ -195,6 +200,8 @@ def test_ezdxf_inventory_of_an_r2018_drawing(tmp_path):
     assert layers['用地代码']['text_samples'] == [{'raw': 'Ｒ２＋Ｃ１', 'clean': 'R2+C1'}]
     assert layers['辅助线']['state'] == ['off'] and 'state' not in layers['地块界线']
     assert report['unused_layers'] == ['图框']
+    assert report['encoding'] == {'declared': 'ANSI_1252', 'used': 'UTF-8', 'source': 'dxf-version', 'undecodable_strings': 0}
+    assert layers['地块界线']['bounds'] is not None  # GDAL names match ezdxf names only when GDAL reads UTF-8 too
     assert {row['name']: row['viewports'] for row in report['layouts']}['图则'] == 1
     assert report['header']['release'] == 'R2018' and codes(report)[0] == 'EPSG:4526'
 
@@ -655,3 +662,107 @@ def test_label_rule_validation(tmp_path):
     assert rules.classify('地块编号', None, '01-01') == (True, {'parcel_id': '01-01'})
     assert rules.classify('地块编号', None, '01-01x') == (True, {})          # full match only
     assert rules.classify('道路名称', None, '01-01') == (False, {})
+
+
+def test_inspect_keeps_large_blocks_and_skips_polyface_meshes(tmp_path):
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2000')
+    block = doc.blocks.new('区域位置图')
+    for i in range(10_050):  # GDAL stops at 10000 features per block unless told otherwise
+        block.add_line((i, 0), (i, 1))
+    msp = doc.modelspace()
+    msp.add_blockref('区域位置图', (39_500_000, 3_400_000), dxfattribs={'layer': '图框'})
+    mesh = msp.add_polyface(dxfattribs={'layer': '面'})
+    mesh.append_face([(39_500_000, 3_400_000, 0), (39_500_001, 3_400_000, 0), (39_500_001, 3_400_001, 1)])
+    source = tmp_path/'big.dxf'
+    doc.saveas(source)
+    report = inspect(source, tmp_path/'out')
+    assert report['entities']['geometries'] == 1  # GDAL merges one block reference into one geometry collection
+    import cad
+    frame, unreadable, _ = cad.read_gdal(source)
+    parts = shapely.get_num_geometries(frame.geometry.to_numpy())
+    assert parts.max() == 10_050 and unreadable == 1  # nothing cut at 10000
+    assert any('1 polyface meshes' in w for w in report['warnings'])
+    assert {row['layer']: row['dxf_types'] for row in report['layers']} == {'图框': {'INSERT': 1}, '面': {'POLYLINE polyface': 1}}
+
+
+def test_inspect_reads_libredwg_xdata_in_xrecords(tmp_path):
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    doc.modelspace().add_line((0, 0), (10, 10), dxfattribs={'layer': '地块界线'})
+    doc.objects.add_xrecord(doc.rootdict.dxf.handle)  # empty, like the 湘源 reactor records in the Mawan drawing
+    source = tmp_path/'libredwg.dxf'
+    doc.saveas(source)
+    text = source.read_text(encoding='utf-8')
+    marker = 'AcDbXrecord\n280\n1\n'
+    assert marker in text
+    # LibreDWG writes pointers (330) after an application name inside XRECORDs; ezdxf refuses them.
+    source.write_text(text.replace(marker, marker + '1001\nHYGggl\n330\n2E\n', 1), encoding='utf-8')
+    from ezdxf import recover
+    with pytest.raises(Exception, match='XDATA'):
+        recover.readfile(source)
+    report = inspect(source, tmp_path/'out')
+    assert report['reader']['inventory'].startswith('ezdxf') and report['layers'][0]['dxf_types'] == {'LINE': 1}
+    assert any('1 malformed XDATA tags' in w for w in report['warnings'])
+
+
+def fake_dwg2dxf(folder, body):
+    """A dwg2dxf stand-in, alone on PATH: the converter adapter is tested without LibreDWG or ODA installed."""
+    folder.mkdir()
+    script = folder/'dwg2dxf'
+    script.write_text(f'#!{sys.executable}\nimport shutil, sys\nargs = sys.argv\n' + body, encoding='utf-8')
+    script.chmod(0o755)
+    return folder
+
+
+def run_convert(source, out, *extra, path, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'convert', str(source), '--output', str(out), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PATH': str(path), 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def test_convert_runs_the_converter_on_a_copy_and_reads_back(tmp_path):
+    prepared = dxf(tmp_path/'prepared.dxf', site(39_500_000, 3_400_000))
+    tool = fake_dwg2dxf(tmp_path/'bin', f"print('Warning: Unknown object, skipping eed/reactors/xdic', file=sys.stderr)\n"
+                                        f"shutil.copy({str(prepared)!r}, args[args.index('-o') + 1])\n")
+    source = tmp_path/'plan.dwg'
+    source.write_bytes(b'AC1032' + bytes(200))
+    before = source.read_bytes()
+    manifest = run_convert(source, tmp_path/'out', '--version', 'r2013', path=tool)
+    assert manifest['source']['release'] == 'R2018' and manifest['converter']['tool'] == 'libredwg'
+    command = manifest['converter']['command']
+    assert command[:3] == ['dwg2dxf', '-y', '--as'] and command[3] == 'r2013' and command[-1] != str(source)
+    assert manifest['readback']['model_space_entities'] == 5 and manifest['readback']['layers_with_entities'] == 4
+    assert manifest['readback']['header']['codepage'] == 'ANSI_936'
+    assert manifest['warnings'] == ['Warning: Unknown object, skipping eed/reactors/xdic']
+    assert (tmp_path/'out'/'plan.dxf').read_bytes() == prepared.read_bytes() and source.read_bytes() == before
+
+
+def test_convert_refusals(tmp_path):
+    source = tmp_path/'plan.dwg'
+    source.write_bytes(b'AC1032' + bytes(200))
+    empty = tmp_path/'empty'
+    empty.mkdir()
+    assert 'No ODA File Converter or LibreDWG' in run_convert(source, tmp_path/'a', path=empty, success=False)
+    failing = fake_dwg2dxf(tmp_path/'bin', "print('Error: bad DWG section', file=sys.stderr)\nsys.exit(1)\n")
+    message = run_convert(source, tmp_path/'b', path=failing, success=False)
+    assert 'libredwg failed (exit 1)' in message and 'bad DWG section' in message
+    assert 'No oda found' in run_convert(source, tmp_path/'c', '--tool', 'oda', path=failing, success=False)
+    fake = tmp_path/'fake.dwg'
+    fake.write_bytes(b'not a drawing')
+    assert 'does not start like a DWG' in run_convert(fake, tmp_path/'d', path=failing, success=False)
+    assert not any((tmp_path/name).exists() for name in 'abcd')
+
+
+@pytest.mark.skipif(shutil.which('dwg2dxf') is None or shutil.which('dxf2dwg') is None, reason='LibreDWG not installed')
+def test_convert_with_libredwg(tmp_path):
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2000')
+    doc.modelspace().add_line((0, 0), (10, 10))
+    doc.saveas(tmp_path/'seed.dxf')
+    subprocess.run(['dxf2dwg', '-y', '-o', str(tmp_path/'seed.dwg'), str(tmp_path/'seed.dxf')], capture_output=True, check=True)
+    manifest = run_convert(tmp_path/'seed.dwg', tmp_path/'out', path=os.environ['PATH'])
+    # LibreDWG's dxf2dwg is experimental, so only the conversion itself is checked here, not its content.
+    assert manifest['converter']['tool'] in ('libredwg', 'oda') and manifest['source']['release'] == 'R2000'
+    assert manifest['readback']['header']['acadver'] and (tmp_path/'out'/'seed.dxf').stat().st_size > 0
