@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 新脚本 `vector-georef.py`：用经过检查的四参数（默认）或六参数仿射变换，把局部平面坐标的矢量（城市独立坐标、CAD 成果）转到投影坐标系。`fit` 由显式标注 fit/check 的同名点拟合，按事先给定的检查点 RMSE / 最大误差判定 pass 或 hold，并画残差图；`define` 记录官方或用户给的参数，可用点检查；`apply` 转换全部图层，hold 的变换需 `--allow-hold`，落在拟合点凸包外的要素标为 `extrapolated`。说明见 `references/vector-georeferencing.md`。
 - 新子命令 `cad.py label`：按 YAML 规则（单字段、命名分组拆多字段、块属性标签、用地大类最长前缀、道路面规则）把 CAD 文字挂到 polygonize 的面上，输出 `parcels.gpkg`（`parcels`、`label_conflicts`、`unparsed_text`）、`check.png`、规则副本与 `manifest.json`（`cad-label` v1）。多值、面外、公共边上、重复编号、多箭头和未连接引线都列为冲突，不替人选择；不是道路又无用途的面标 hold。
 - `cad.py extract` 读取引线：被 LEADER 标注的文字放到箭头处，MULTILEADER 的文字写入 `texts`，箭头写入新图层 `leaders`；`texts` 新增 `arrows`、`leader_handle`。`cad.py polygonize` 的面新增 `source_layers`。
 - 新子命令 `cad.py polygonize`：把 `cad.py extract` 的线按显式容差围成候选面。`--snap` 内的端点合并、孤立端点移到线上（插入共享顶点）；打断后用 polygonize 围面。`--max-gap` 内的缺口写入 `qa_gaps`，只有加 `--close-gaps` 才补线并标记；悬挂线、切割边写入 `qa_dangles`；小于 `--min-area` 的面与无效面标 hold、不删除；`--boundary` 按规划范围线裁剪并记录面积比；面另经 `topo.py` 检查。输出 `faces.gpkg`、`check.png`、`manifest.json`（`cad-polygonize` v1）。

@@ -166,6 +166,8 @@ road: {layers: [道路红线], landuse: [S1]}
 
 ## 确认后赋 CRS
 
+图纸是城市或项目独立坐标时，不要赋 CRS，改用 [矢量控制点转换](vector-georeferencing.md)，用同名点或官方参数转到国家坐标。
+
 `cad.py assign-crs` 给由这张图纸提取（`cad.py extract`）或转出（`convert.py`）、还没有 CRS 的图层打上已确认的 CRS。只改坐标系标签，不动坐标。`convert.py --crs` 是重投影，不能用来做这件事。
 
 ```bash
