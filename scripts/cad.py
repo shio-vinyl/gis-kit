@@ -1393,7 +1393,7 @@ def dwg_version(path):
 XIANGYUAN_KEY = '用地代码'   # 湘源控规 writes each parcel attribute as its own XDATA application; this one marks a parcel
 XIANGYUAN_ALIASES = {'parcel_id': '地块编号', 'landuse': '用地代码', 'landuse_name': '用地性质'}
 XIANGYUAN_FIXED = ('parcel_id', 'landuse', 'landuse_name', 'control_type', 'unit_id', 'status', 'reason', 'area_m2', 'area_declared',
-                   'area_diff', 'number_block', 'fills', 'valid', 'layer', 'handle', 'other_xdata')
+                   'area_diff', 'number_block', 'filled_from_block', 'fills', 'valid', 'layer', 'handle', 'other_xdata')
 # Parcel attribute names seen on 湘源控规 drawings: the land-attribute table of 湘源 7.0 and the Shenzhen submission
 # fields some drawings carry instead. Applications outside this list (other vendors' plug-ins) go to other_xdata.
 XIANGYUAN_FIELDS = frozenset((
@@ -1455,7 +1455,209 @@ def hatch_point(hatch):
     return shapely.point_on_surface(best) if best is not None and not best.is_empty else None
 
 
-def plot_xiangyuan(parcels, boundary, path, title, font):
+# OLE ProgID -> extension of the Office file held in its Package stream (Office 2007 and later).
+OLE_PACKAGES = {'Excel.Sheet.12': '.xlsx', 'Excel.SheetMacroEnabled.12': '.xlsm', 'Word.Document.12': '.docx',
+                'PowerPoint.Show.12': '.pptx'}
+CFB_MAGIC = bytes.fromhex('D0CF11E0A1B11AE1')
+OLE_FRAME_FIELDS = ('handle', 'layer', 'owner', 'prog_id', 'user_type', 'file', 'bytes', 'sha256', 'shown_sheet', 'shown_range',
+                    'sheets', 'corners_from')
+TABLE_CELL_FIELDS = ('row', 'col', 'text', 'x', 'y', 'layer', 'handle')
+
+
+def comp_obj(data, encoding):
+    """(user type, ProgID) from an OLE CompObj stream: a 28-byte header, the user type, a clipboard format
+    (a length-prefixed name, or a marker and a format id) and the ProgID."""
+    import struct
+
+    def string(at):
+        size = struct.unpack_from('<I', data, at)[0]
+        return data[at+4:at+4+size].rstrip(b'\0'), at+4+size
+    try:
+        user, at = string(28)
+        marker = struct.unpack_from('<I', data, at)[0]
+        at += 8 if marker in (0xFFFFFFFF, 0xFFFFFFFE) else 4 + marker
+        prog, _ = string(at)
+    except struct.error:
+        return None, None
+    return user.decode(encoding, 'replace') or None, prog.decode('ascii', 'replace') or None
+
+
+def ole_corners(entity, data):
+    """Frame corners as drawn and where they came from. OLE2FRAME binary data starts with an 0x80 0x55 marker and the
+    four corners as 3D doubles; LibreDWG writes placeholders in group codes 10/11, so the header is preferred."""
+    import struct
+    if data[:2] == b'\x80\x55' and len(data) >= 98:
+        values = struct.unpack_from('<12d', data, 2)
+        corners = [values[i:i+2] for i in range(0, 12, 3)]
+        if all(math.isfinite(v) for corner in corners for v in corner):
+            return corners, 'binary header'
+    tags = entity.acdb_ole2frame
+    v10, v11 = (tags.get_first_value(code, None) for code in (10, 11)) if tags is not None else (None, None)
+    if v10 is not None and v11 is not None:
+        return [(v10[0], v10[1]), (v11[0], v10[1]), (v11[0], v11[1]), (v10[0], v11[1])], 'group codes 10/11'
+    return None, None
+
+
+def ole_payload(data, encoding):
+    """(ProgID, user type, extension, file bytes) of the compound file inside OLE2FRAME data; needs olefile.
+    Office 2007+ objects keep their file in a Package stream; others are saved as the compound file itself."""
+    import io
+    import olefile
+    start = data.find(CFB_MAGIC)
+    if start < 0:
+        return None, None, None, None
+    ole = olefile.OleFileIO(io.BytesIO(data[start:]))
+    try:
+        streams = {'/'.join(path).lstrip('\x01\x02\x03'): path for path in ole.listdir()}
+        user, prog = comp_obj(ole.openstream(streams['CompObj']).read(), encoding) if 'CompObj' in streams else (None, None)
+        if 'Package' in streams:
+            payload = ole.openstream(streams['Package']).read()
+            return prog, user, OLE_PACKAGES.get(prog, '.zip' if payload[:2] == b'PK' else '.bin'), payload
+    finally:
+        ole.close()
+    extension = '.xls' if 'Workbook' in streams or 'Book' in streams else '.doc' if 'WordDocument' in streams else '.cfb'
+    return prog, user, extension, data[start:]
+
+
+def workbook_sheets(payload):
+    """(active sheet, [{name, range, digest of its values}]) of an xlsx / xlsm; needs openpyxl."""
+    import hashlib
+    import io
+    import openpyxl
+    book = openpyxl.load_workbook(io.BytesIO(payload), data_only=True)
+    sheets = [{'name': sheet.title, 'range': sheet.dimensions,
+               'digest': hashlib.sha256(json.dumps(list(sheet.iter_rows(values_only=True)), default=str,
+                                                   ensure_ascii=False).encode('utf-8')).hexdigest()[:16]}
+              for sheet in book.worksheets]
+    return book.active.title if book.active is not None else None, sheets
+
+
+def count_entities(path, name):
+    """How many entities of a DXF type the file holds, counted on its group 0 tags (ezdxf drops empty ones)."""
+    count, wanted = 0, name.encode('ascii')
+    with open(path, 'rb') as reader:
+        while True:
+            code_line, value_line = reader.readline(), reader.readline()
+            if not code_line:
+                break
+            count += code_line.strip() == b'0' and value_line.strip() == wanted
+    return count
+
+
+def rank(values, tolerance):
+    """1-based rank of each value among groups of sorted values no more than tolerance apart."""
+    lookup, level, last = {}, 0, None
+    for value in sorted(set(values)):
+        if last is None or value - last > tolerance:
+            level += 1
+        lookup[value], last = level, value
+    return [lookup[value] for value in values]
+
+
+def embedded_objects(doc, source, scale, warnings):
+    """OLE objects and table blocks of a drawing: frame records (geometry for model space only), the embedded files,
+    sheets that differ between workbooks, and table cells as placed in each *T block. Nothing is interpreted."""
+    import hashlib
+    import re
+    from collections import Counter
+    import shapely
+    owners = {block.block_record_handle: block.name for block in doc.blocks}
+    frames, files = [], {}
+    oles = [e for e in doc.entitydb.values() if e.dxftype() == 'OLE2FRAME']
+    try:
+        import olefile  # noqa: F401
+    except ImportError:
+        olefile = None
+        if oles:
+            warnings.append(f'{len(oles)} OLE objects are listed without their contents: olefile is not installed')
+    try:
+        import openpyxl  # noqa: F401
+    except ImportError:
+        openpyxl = None
+    sheet_copies = {}  # sheet name -> {digest: [handles]}
+    for entity in oles:
+        data = entity.binary_data()
+        handle, owner = entity.dxf.handle, owners.get(entity.dxf.owner, entity.dxf.owner)
+        corners, corners_from = ole_corners(entity, data)
+        shape = None
+        if corners and owner == '*Model_Space':
+            shape = shapely.Polygon([(x*scale, y*scale) for x, y in corners])
+            shape = shape if shape.is_valid and shape.area > 0 else None
+        record = {'handle': handle, 'layer': entity.dxf.layer, 'owner': owner, 'corners_from': corners_from, 'geometry': shape}
+        payload = None
+        if olefile is not None:
+            try:
+                prog, user, extension, payload = ole_payload(data, doc.encoding or 'cp1252')
+            except OSError as error:  # olefile raises OSError subclasses on malformed compound files
+                warnings.append(f'OLE object {handle} could not be read: {error}')
+            if payload:
+                name = f'ole/{handle}{extension}'
+                files[name] = payload
+                record.update(prog_id=prog, user_type=user, file=name, bytes=len(payload),
+                              sha256=hashlib.sha256(payload).hexdigest())
+                if extension in ('.xlsx', '.xlsm'):
+                    if openpyxl is None:
+                        warnings.append(f'Sheets of {name} are not listed: openpyxl is not installed')
+                    else:
+                        active, sheets = workbook_sheets(payload)
+                        shown = next((s for s in sheets if s['name'] == active), None)
+                        record.update(shown_sheet=active, shown_range=shown['range'] if shown else None,
+                                      sheets=', '.join(f'{s["name"]} {s["range"]}' for s in sheets))
+                        for sheet in sheets:
+                            sheet_copies.setdefault(sheet['name'], {}).setdefault(sheet['digest'], []).append(
+                                (handle, sheet['name'] == active))
+        frames.append(record)
+    versions = [{'sheet': name, 'versions': [{'frames': [h for h, _ in copies], 'shown_in': [h for h, shown in copies if shown]}
+                                             for copies in by_digest.values()]}
+                for name, by_digest in sorted(sheet_copies.items()) if len(by_digest) > 1]
+    if versions:
+        warnings.append(f'Embedded workbooks hold different versions of {len(versions)} sheets '
+                        f'({", ".join(v["sheet"] for v in versions)}); see embedded.sheet_versions')
+
+    # Tables: AutoCAD draws an ACAD_TABLE as an anonymous *T block of texts and lines, which is where cells are read.
+    referenced = {e.get_block_name(): e for e in doc.entitydb.values()
+                  if e.dxftype() == 'ACAD_TABLE' and hasattr(e, 'get_block_name')}
+    inserted = Counter(e.dxf.name for e in doc.entitydb.values() if e.dxftype() == 'INSERT')
+    empty = count_entities(source, 'ACAD_TABLE') - sum(1 for e in doc.entitydb.values() if e.dxftype() == 'ACAD_TABLE')
+    if empty > 0:
+        warnings.append(f'{empty} ACAD_TABLE entities in the file carry no data (LibreDWG does not convert their contents) and '
+                        'were not read; their cells are read from the *T blocks as drawn, but which table owns which block is '
+                        'lost: convert with ODA File Converter to keep it')
+    tables = []
+    for block in doc.blocks:
+        if not re.fullmatch(r'\*T\d+', block.name):
+            continue
+        cells = []
+        for entity in block:
+            if entity.dxftype() not in ('TEXT', 'MTEXT'):
+                continue
+            mtext = entity.dxftype() == 'MTEXT'
+            text = clean_text(entity.plain_text(split=False) if mtext else entity.plain_text())
+            if text:
+                insert = entity.dxf.insert
+                cells.append({'text': text, 'x': round(insert.x, 3), 'y': round(insert.y, 3), 'layer': entity.dxf.layer,
+                              'handle': entity.dxf.handle,
+                              'height': entity.dxf.get('char_height' if mtext else 'height', 0) or 0})
+        if not cells:
+            continue
+        tolerance = 0.5*sorted(c['height'] for c in cells)[len(cells)//2]
+        for cell, row, col in zip(cells, rank([-c['y'] for c in cells], tolerance), rank([c['x'] for c in cells], tolerance)):
+            cell.update(row=row, col=col)
+        cells.sort(key=lambda c: (c['row'], c['col']))
+        table = referenced.get(block.name)
+        name = f'tables/{block.name.lstrip("*")}.csv'
+        files[name] = ('﻿' + ','.join(TABLE_CELL_FIELDS) + '\n' + ''.join(
+            ','.join('"' + str(c[f]).replace('"', '""') + '"' if f == 'text' else str(c[f]) for f in TABLE_CELL_FIELDS) + '\n'
+            for c in cells)).encode('utf-8')
+        tables.append({'block': block.name, 'file': name, 'cells': len(cells), 'rows': max(c['row'] for c in cells),
+                       'cols': max(c['col'] for c in cells), 'first_row': ' | '.join(c['text'] for c in cells if c['row'] == 1),
+                       'table_entity': table.dxf.handle if table is not None else None,
+                       'table_owner': owners.get(table.dxf.owner, table.dxf.owner) if table is not None else None,
+                       'block_inserts': inserted.get(block.name, 0)})
+    return frames, files, versions, tables
+
+
+def plot_xiangyuan(parcels, boundary, path, title, font, ole_frames=None):
     import re
     import matplotlib
     matplotlib.use('Agg')
@@ -1480,6 +1682,14 @@ def plot_xiangyuan(parcels, boundary, path, title, font):
     if len(held):
         held.boundary.plot(ax=axis, color='#e67e22', linewidth=1.6)
         handles.append(plt.Line2D([], [], color='#e67e22', linewidth=2, label='hold'))
+    shown = ole_frames[ole_frames.geometry.notna()] if ole_frames is not None and len(ole_frames) else []
+    if len(shown):
+        shown.boundary.plot(ax=axis, color='#1f77b4', linewidth=0.8, linestyle=':')
+        for _, row in shown.iterrows():
+            corner = row.geometry.bounds
+            axis.annotate(f'OLE {row["handle"]} {row["shown_sheet"] or ""}', (corner[0], corner[3]), fontsize=5,
+                          color='#1f77b4', va='top')
+        handles.append(plt.Line2D([], [], color='#1f77b4', linestyle=':', label='OLE object'))
     for _, row in land[land['parcel_id'].fillna('') != ''].iterrows():
         point = row.geometry.representative_point()
         axis.annotate(row['parcel_id'], (point.x, point.y), fontsize=5, ha='center', va='center')
@@ -1621,6 +1831,13 @@ def xiangyuan(args):
         same = same or [i for i in hits if (records[i]['parcel_id'] or '') == attributes['地块编号']]
         if same:
             numbered.update(same)
+            if len(same) == 1:  # the outline is authoritative: its block only fills fields the outline leaves empty
+                record = records[same[0]]
+                for tag, value in attributes.items():
+                    if (tag in known and tag not in XIANGYUAN_ALIASES.values() and (value or '').strip()
+                            and not (record.get(tag) or '').strip()):
+                        record[tag] = value
+                        record['filled_from_block'] = ','.join(filter(None, [record.get('filled_from_block'), tag]))
             continue
         checks.append({'kind': 'number-block-mismatch' if hits else 'number-block-outside', 'parcel_id': attributes['地块编号'],
                        'found': ','.join(sorted({records[i]['parcel_id'] or '' for i in hits})) or None,
@@ -1753,6 +1970,9 @@ def xiangyuan(args):
     if boundary is not None:
         frames['boundary'] = (gpd.GeoDataFrame({'layer': [args.boundary_layer]}, geometry=[boundary]), 'MultiPolygon'
                               if boundary.geom_type == 'MultiPolygon' else 'Polygon')
+    ole_frames, embedded_files, sheet_versions, tables = embedded_objects(doc, source, scale, warnings)
+    frames['ole_frames'] = (gpd.GeoDataFrame(pd.DataFrame(ole_frames, columns=[*OLE_FRAME_FIELDS, 'geometry']), geometry='geometry'),
+                            'Polygon')
     land = parcels[parcels['control_type'] == '地块']
     union = shapely.union_all(land.geometry.to_numpy()) if len(land) else None
     area = {'parcels_m2': round(float(land['area_m2'].sum()), 3), 'parcels_union_m2': round(float(union.area), 3) if union else 0.0,
@@ -1776,6 +1996,7 @@ def xiangyuan(args):
                'fills': {'parcels_without_fill': int(sum(1 for i, r in enumerate(records) if r['control_type'] == '地块' and not fills[i])),
                          'fills_without_parcel': len(stray_fills), 'fill_code_mismatches': fill_mismatch[:20]},
                'facility_matches': dict(Counter(f['parcel_match'] for f in facilities)),
+               'filled_from_block': dict(Counter(t for value in parcels['filled_from_block'].dropna() for t in value.split(','))),
                'other_xdata_parcels': int(parcels['other_xdata'].notna().sum()), 'numeric_fields': converted}
     try:
         from _theme import get_chinese_font
@@ -1792,14 +2013,20 @@ def xiangyuan(args):
         back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in frames}
         if back != layer_counts:
             raise ValueError(f'Readback feature counts {back} differ from {layer_counts}; nothing was published')
+        for name, content in embedded_files.items():
+            (stage / name).parent.mkdir(exist_ok=True)
+            (stage / name).write_bytes(content)
         plot_xiangyuan(parcels, boundary if boundary is not None and boundary.geom_type == 'Polygon' else None, stage / 'check.png',
-                       f'{source.name} · {summary["parcels"]} parcels, {summary["control_units"]} control units · {summary["hold"]} hold', font)
+                       f'{source.name} · {summary["parcels"]} parcels, {summary["control_units"]} control units · {summary["hold"]} hold', font,
+                       frames['ole_frames'][0])
         manifest = {'manifest': 'cad-xiangyuan', 'schema_version': 1,
                     'source': {'name': source.name, 'bytes': source.stat().st_size, 'sha256': digest(source)},
                     'header': header, 'encoding': encoding_report, 'audit': audit, 'schema': schema,
                     'custom_entities': {'lzx_land_class_registered': registered, 'lzx_land_instances': unexploded,
                                         'proxy_entities': proxies},
                     'block_copies': copies, 'warnings': warnings,
+                    'embedded': {'ole_frames': [{k: v for k, v in f.items() if k != 'geometry'} for f in ole_frames],
+                                 'sheet_versions': sheet_versions, 'tables': tables},
                     'parameters': {'units': args.units, 'units_basis': units_basis, 'scale_to_metre': scale,
                                    'arc_tolerance_m': args.arc_tolerance,
                                    'max_area_diff': args.max_area_diff, 'boundary_layer': args.boundary_layer,
@@ -1812,10 +2039,14 @@ def xiangyuan(args):
                                             'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
                                             'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
                                             'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
-                                                      'check.png': digest(stage / 'check.png')},
+                                                      'check.png': digest(stage / 'check.png'),
+                                                      **{name: digest(stage / name) for name in embedded_files}},
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                             'assumptions': ['A parcel is a closed polyline with a 用地代码 XDATA application, as 湘源控规 writes them',
                                                             'Attribute values are the XDATA strings as stored; nothing is recalculated except area_m2',
+                                                            'A number block only fills fields its outline leaves empty (filled_from_block)',
+                                                            'An embedded workbook shows its active sheet as last saved (shown_sheet); '
+                                                            'embedded files are saved as stored, table cells as placed in their *T block',
                                                             'No CRS is set; coordinates are only scaled to metres']})
     return manifest
 

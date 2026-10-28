@@ -103,6 +103,7 @@ python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /wor
   - 规划控制单元：`用地代码 = DY`。
   - 编号图块：`12 地块编号` 图层上的 `地块编号` 图块，块属性里重复了地块的属性。
   - 配套设施：`配套设施` 图层上的图块，扩展数据里带设施类别、名称、建设状态、所在地块编号。
+  - 指标表：图框旁的表格多半是嵌入的 Excel（`OLE2FRAME`），不是文字。妈湾有 4 个，分别显示逐地块表、规划控制单元表（单元面积、建筑容积总量、各用途比例）、城镇单元表和用地平衡表；4 个工作簿的同名表互相不一致。CAD 自己的表格（`ACAD_TABLE`）画成匿名块 `*T…` 里的文字和线。
 - **地块（`parcels`）**：每条带 `用地代码` 扩展数据的闭合多段线生成一个面，圆弧按 `--arc-tolerance` 离散。
   - 湘源和深圳字段名单里的扩展数据字段按原名保留（清单 `fields` 列出）；其他插件写的应用（例如 `LHB_YJ`、`HintCAD_*`）合成一个 JSON 字段 `other_xdata`，不丢弃。同一个应用有几个 1000 组码时，按湘源自己的读法取最后一个，并给出警告。
   - 数值字段（`用地面积`、`容积率`、`建筑密度`、`绿地率`、`建筑限高`、各类面积、车位、户数、人数等）中，空串转为空值。整列都能解析成数字时转成数值；只要有一个值解析不了，整列保留原文，并在警告里给出示例值。清单的 `summary.numeric_fields` 列出已转换的字段。
@@ -116,6 +117,15 @@ python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /wor
     - 几何无效；
     - 给了 `--max-area-diff` 时，面积差超过它。
 - **编号图块核对**：编号图块不在任何面里（`number-block-outside`），或者所在面的编号不一致（`number-block-mismatch`）时，写入 `qa_number_blocks`。
+- **编号图块补空**：面是权威。编号图块只对应一个面时，块属性里有值、而面上为空或没有的字段（限湘源和深圳字段名单，`地块编号`、`用地代码`、`用地性质` 除外）补到面上，`filled_from_block` 列出补了哪些字段；面上已有的值不改。清单 `summary.filled_from_block` 按字段计数。妈湾补了 4 个 `规划项目编号`（值为 `—`）和 2 个 `备注`。
+- **嵌入的 OLE 对象（`ole_frames`）**：每个 `OLE2FRAME`（模型空间、图纸空间或块里）一条记录，需要 olefile（可选）。
+  - 位置：取二进制数据头部记的四个角点。LibreDWG 写在组码 10/11 里的是占位值（妈湾 4 个框完全相同），只在头部读不出时才用，`corners_from` 记下来源。只有模型空间的框有几何。
+  - 内容：解开 OLE 复合文档，按 `CompObj` 读出类型名（`user_type`）和 ProgID（`prog_id`）。Office 2007 以后的对象把文件原样存在 `Package` 流里，另存为 `ole/<句柄>.xlsx`（或 `.docx`、`.pptx`）；Excel 97 一类存成 `.xls`，其他存成 `.cfb`。清单记文件大小和 SHA-256。
+  - 工作表（需要 openpyxl）：`sheets` 列出各表及其范围，`shown_sheet`、`shown_range` 是工作簿保存时的活动表，也就是框里显示的那张表。框的画面本身不渲染。
+  - 版本核对：同名工作表在不同工作簿里内容不一样时，清单 `embedded.sheet_versions` 按内容分组，列出各组在哪些框里、在哪个框里显示，并给出警告。不判断哪一份对。
+  - 没装 olefile 时照样列出框和位置，不取内容，并给出警告。
+- **表格（`tables/`）**：每个 `*T…` 匿名块里的 TEXT / MTEXT 按位置排成行列（间距在字高一半以内的算同一行或同一列），写成 `tables/<块名>.csv`（UTF-8 带 BOM）：`row`、`col`、`text`、`x`、`y`、`layer`、`handle`。合并单元格的文字落在几行或几列中间，会单独占一个行号或列号，按坐标看。清单 `embedded.tables` 记单元格数、行列数、第一行文字、引用它的 `ACAD_TABLE` 及其所在块、这个块被插入了几次。
+  - LibreDWG 转出的 `ACAD_TABLE` 只剩一行 `0/ACAD_TABLE`，没有内容（妈湾 `tukuang` 块里那张），ezdxf 读不到。程序按组码计数发现这种情况就给出警告：单元格还能从 `*T` 块读出，但表格和块的对应关系丢了；需要它时用 ODA File Converter 重新转换。妈湾的 `*T58` 是旧版的规划区用地汇总表（居住用地 32.45 公顷），`tukuang` 和 `*T58` 都没有被插入到图里。
 - **填充配对**：`<代码>_T` 上的 HATCH 不带属性，只用来核对。清单的 `summary.fills` 列出三项：没有填充的地块数、不在任何地块里的填充数、填充图层代码和地块用地代码不一致的情况。
 - **块内副本**：图块定义里带 `用地代码` 的实体不当作地块。清单的 `block_copies` 按块列出这类实体的个数，以及这个块在模型空间里被插入了几次。
 - **未炸开的自定义实体**：模型空间里有 `LZX_LAND` 实体时直接报错，提示先在湘源里炸开或输出，再重新转换。CLASSES 段只登记了这个类、却没有实例时照常处理，清单 `custom_entities` 记下这一情况。代理实体只给出警告。
@@ -126,12 +136,14 @@ python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /wor
 - **配套设施（`facilities`）、规划边界（`boundary`）**：分别取 `--facility-layer`（默认 `配套设施`）的图块，和 `--boundary-layer`（默认 `----规划边界`）的闭合面。每个设施按它的 `地块编号` 找对应地块，`parcel_match` 记为以下四种之一：`inside`（落在该地块里）、`elsewhere`（在别处，`parcel_distance_m` 记下离该地块的距离）、`unknown id`（编号对不上任何地块）、`no id`（没有编号）。清单记录地块面积在边界内的部分。图层名不一样时用参数指定，传空值就跳过。
 - **单位**：`--units m|mm|header` 必填。湘源图纸的 `$INSUNITS` 常写成英寸，实际按米画；用 `header` 时，如果 `用地面积` 只有按米算才对得上，就拒绝执行，并提示改用 `--units m`。清单的 `parameters.units_basis` 记下所用单位和 `$INSUNITS` 原值。
 - **输出**：
-  - `parcels.gpkg`：`parcels`、`units`、`facilities`、`qa_number_blocks`、`boundary`，无 CRS；
-  - `check.png`：地块按用地大类着色，单元画虚线，hold 的面描橙边；
-  - `manifest.json`（`manifest: cad-xiangyuan` v1）：统计、hold 原因、面积汇总；
+  - `parcels.gpkg`：`parcels`、`units`、`facilities`、`qa_number_blocks`、`boundary`、`ole_frames`，无 CRS；
+  - `ole/`、`tables/`：嵌入文件原样另存，表格单元格；
+  - `check.png`：地块按用地大类着色，单元画虚线，hold 的面描橙边，OLE 框画蓝色点线并标出显示的工作表；
+  - `manifest.json`（`manifest: cad-xiangyuan` v1）：统计、hold 原因、面积汇总、`embedded`（OLE 框、工作表版本、表格）；
   - `record.json`。
 - **CRS**：不设 CRS，之后接 `assign-crs` 或 [矢量控制点转换](vector-georeferencing.md)。
-- **指标**：图里没填的指标（例如容积率、地块容积）可以从说明书的指标表按编号挂上，见 [按编号挂接指标表](vector-metrics.md#按编号挂接指标表)。
+- **指标**：图里没填的指标（例如容积率、地块容积）先看 `ole/` 里的工作簿，再看说明书；按编号挂接见 [按编号挂接指标表](vector-metrics.md#按编号挂接指标表)。
+- **单元面积口径**：`area.units_m2` 是 `DY` 面（规划控制单元）的几何面积之和，这些面各自沿用了一个地块编号；和 OLE 单元表里的单元面积（公顷）对账时，以表为准，几何和只作核对。
 
 ## 实体提取
 

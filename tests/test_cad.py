@@ -927,3 +927,158 @@ def test_xiangyuan_refusals(tmp_path):
     plain = dxf(tmp_path/'plain.dxf', site(0, 0))
     assert 'does not look like a 湘源控规 drawing' in xiangyuan(plain, tmp_path/'b', '--units', 'm', success=False)
     assert 'convert DWG first' in xiangyuan(tmp_path/'plan.dwg', tmp_path/'c', '--units', 'm', success=False)
+
+
+def compound(streams):
+    """A minimal compound file (CFB v3, 512-byte sectors) holding {name: bytes} streams under its root."""
+    import struct
+    size, cutoff, end, free, fat_sector, none = 512, 4096, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFD, 0xFFFFFFFF
+    sectors, fat = [], []
+
+    def place(data):
+        count = -(-len(data)//size)
+        first = len(sectors)
+        for i in range(count):
+            sectors.append(data[i*size:(i+1)*size].ljust(size, b'\0'))
+            fat.append(first+i+1 if i < count-1 else end)
+        return first if count else end
+    mini, minifat, starts = b'', [], {}
+    for name, data in streams.items():
+        if len(data) < cutoff:
+            count = -(-len(data)//64)
+            starts[name] = len(mini)//64
+            minifat += [starts[name]+i+1 for i in range(count-1)] + [end]
+            mini += data.ljust(count*64, b'\0')
+    first_minifat = place(struct.pack(f'<{len(minifat)}I', *minifat)) if minifat else end
+    mini_start = place(mini) if mini else end
+    for name, data in streams.items():
+        if len(data) >= cutoff:
+            starts[name] = place(data)
+
+    def entry(name, kind, start, length, child=none, right=none):
+        encoded = name.encode('utf-16-le') + b'\0\0'
+        return (encoded.ljust(64, b'\0') + struct.pack('<HBB3I', len(encoded), kind, 1, none, right, child) + b'\0'*36
+                + struct.pack('<IQ', start, length))
+    names = list(streams)
+    directory = entry('Root Entry', 5, mini_start, len(mini), child=1 if names else none)
+    directory += b''.join(entry(n, 2, starts[n], len(streams[n]), right=i+2 if i+1 < len(names) else none) for i, n in enumerate(names))
+    first_directory = place(directory.ljust(-(-len(directory)//size)*size, b'\0'))
+    count = -(-len(sectors)//127)  # FAT sectors needed, each also listed in the FAT
+    fat_ids = list(range(len(sectors), len(sectors)+count))
+    fat += [fat_sector]*count
+    fat_bytes = struct.pack(f'<{len(fat)}I', *fat).ljust(count*size, b'\xff')
+    header = (bytes.fromhex('D0CF11E0A1B11AE1') + b'\0'*16 + struct.pack('<HHHHH', 0x3E, 3, 0xFFFE, 9, 6) + b'\0'*6
+              + struct.pack('<9I', 0, count, first_directory, 0, cutoff, first_minifat, len(minifat)*4//size + bool(len(minifat)*4 % size),
+                            end, 0)
+              + struct.pack('<109I', *(fat_ids + [free]*(109-count))))
+    return header + b''.join(sectors) + fat_bytes
+
+
+def ole_frame(owner, handle, layer, corners, streams):
+    """OLE2FRAME DXF text as LibreDWG writes it: placeholder 10/11 points, the real corners in the binary header."""
+    import struct
+    data = b'\x80\x55' + struct.pack('<12d', *[v for x, y in corners for v in (x, y, 0.0)]) + b'\0'*30 + compound(streams)
+    chunks = ''.join(f'310\n{data[i:i+127].hex().upper()}\n' for i in range(0, len(data), 127))
+    return (f'  0\nOLE2FRAME\n  5\n{handle}\n330\n{owner}\n100\nAcDbEntity\n  8\n{layer}\n100\nAcDbOle2Frame\n 70\n2\n  3\nOLE\n'
+            f' 10\n30.0\n 20\n-18.0\n 30\n0.0\n 11\n35.0\n 21\n-22.0\n 31\n0.0\n 71\n2\n 72\n0\n 73\n2\n 90\n{len(data)}\n{chunks}  1\nOLE\n')
+
+
+def workbook(active, unit_volume):
+    import io
+    openpyxl = pytest.importorskip('openpyxl')
+    book = openpyxl.Workbook()
+    book.active.title = 'Sheet1'
+    book.active.append(['地块编号', '用地面积(平方米)'])
+    book.active.append(['01-01', 9257])
+    units = book.create_sheet('Sheet2')
+    units.append(['规划控制单元编号', '建筑容积总量（万平方米）'])
+    units.append(['DY01', unit_volume])
+    book.active = book.sheetnames.index(active)
+    stream = io.BytesIO()
+    book.save(stream)
+    return stream.getvalue()
+
+
+def comp_obj_stream(user, prog):
+    def string(text, encoding='ascii'):
+        raw = text.encode(encoding) + b'\0'
+        return len(raw).to_bytes(4, 'little') + raw
+    return (bytes.fromhex('0100FEFF030A0000FFFFFFFF') + b'\0'*16 + string(user, 'gbk') + string('ExcelML12') + string(prog)
+            + b'\0'*12)
+
+
+def embedded_drawing(path):
+    """The 湘源 drawing plus two embedded Excel workbooks that disagree on Sheet2, a table block whose ACAD_TABLE
+    came out of LibreDWG empty, and a number block with fields its outline lacks or already has."""
+    ezdxf = pytest.importorskip('ezdxf')
+    pytest.importorskip('olefile')
+    source = xiangyuan_drawing(path)
+    doc = ezdxf.readfile(source)
+    msp = doc.modelspace()
+    number = next(e for e in msp.query('INSERT') if any(a.dxf.text == '01-02' for a in e.attribs))
+    number.add_attrib('备注', '依据政府批件', (150, 40))
+    number.add_attrib('容积率', '9.9', (150, 40))      # the outline says 2.5: not overwritten
+    number.add_attrib('用地代码', 'C1', (150, 40))     # a key field: never filled
+    table = doc.blocks.new_anonymous_block(type_char='T')
+    for x, y, text in ((10, -5, '用地代码'), (40, -5, '用地面积(公顷)'), (10, -15, 'R2'), (40, -15, '2.77'), (25, -10, '合并')):
+        table.add_mtext(text, dxfattribs={'layer': '表格图层', 'insert': (x, y), 'char_height': 2.5})
+    doc.saveas(source)
+    owner = msp.block_record_handle
+    frames = ''.join(ole_frame(owner, handle, '图框_图框', [(400, 100), (500, 100), (500, 50), (400, 50)],
+                               {'\x01CompObj': comp_obj_stream('Microsoft Excel 工作表', 'Excel.Sheet.12'),
+                                'Package': workbook(active, volume)})
+                     for handle, active, volume in (('FFF01', 'Sheet1', 59.59), ('FFF02', 'Sheet2', 61.89)))
+    # The OLE user type is in the embedding system's code page; ezdxf writes ANSI_1252 into every R2018 file.
+    text = source.read_text(encoding='utf-8').replace('$DWGCODEPAGE\n  3\nANSI_1252', '$DWGCODEPAGE\n  3\nANSI_936')
+    entities = text.index('  2\nENTITIES\n') + len('  2\nENTITIES\n')
+    source.write_text(text[:entities] + frames + '  0\nACAD_TABLE\n' + text[entities:], encoding='utf-8')
+    return source, table.name
+
+
+def digest_of(path):
+    import hashlib
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_xiangyuan_reads_embedded_workbooks_tables_and_block_fields(tmp_path):
+    source, block = embedded_drawing(tmp_path/'xy.dxf')
+    manifest = xiangyuan(source, tmp_path/'out', '--units', 'm')
+    out = tmp_path/'out'
+    frames = gpd.read_file(out/'parcels.gpkg', layer='ole_frames').set_index('handle')
+    assert list(frames.index) == ['FFF01', 'FFF02'] and set(frames['corners_from']) == {'binary header'}
+    assert frames.loc['FFF01'].geometry.bounds == (400, 50, 500, 100)
+    assert frames.loc['FFF01', 'prog_id'] == 'Excel.Sheet.12' and frames.loc['FFF01', 'user_type'] == 'Microsoft Excel 工作表'
+    assert dict(frames['shown_sheet']) == {'FFF01': 'Sheet1', 'FFF02': 'Sheet2'}
+    import openpyxl
+    saved = openpyxl.load_workbook(out/frames.loc['FFF02', 'file'])
+    assert saved['Sheet2']['B2'].value == 61.89 and frames.loc['FFF02', 'sha256'] == digest_of(out/frames.loc['FFF02', 'file'])
+    assert manifest['embedded']['sheet_versions'] == [{'sheet': 'Sheet2', 'versions': [{'frames': ['FFF01'], 'shown_in': []},
+                                                                                         {'frames': ['FFF02'], 'shown_in': ['FFF02']}]}]
+    assert any('different versions of 1 sheets (Sheet2)' in w for w in manifest['warnings'])
+    assert any('1 ACAD_TABLE entities in the file carry no data' in w for w in manifest['warnings'])
+    [table] = manifest['embedded']['tables']
+    assert table == {'block': block, 'file': f'tables/{block[1:]}.csv', 'cells': 5, 'rows': 3, 'cols': 3,
+                     'first_row': '用地代码 | 用地面积(公顷)', 'table_entity': None, 'table_owner': None, 'block_inserts': 0}
+    cells = (out/table['file']).read_text(encoding='utf-8-sig').splitlines()
+    assert cells[0] == 'row,col,text,x,y,layer,handle' and cells[3].startswith('2,2,"合并",25.0,-10.0,表格图层,')
+    parcels = gpd.read_file(out/'parcels.gpkg', layer='parcels').set_index('handle')
+    filled = parcels[parcels['filled_from_block'].notna()]
+    assert list(filled['filled_from_block']) == ['备注'] and filled['备注'].tolist() == ['依据政府批件']
+    assert filled['容积率'].tolist() == [2.5] and filled['landuse'].tolist() == ['G1+C1']
+    assert manifest['summary']['filled_from_block'] == {'备注': 1}
+    record = json.loads((out/'record.json').read_text())
+    assert {'ole/FFF01.xlsx', 'ole/FFF02.xlsx', table['file']} <= set(record['files'])
+
+
+def test_xiangyuan_lists_ole_frames_without_olefile(tmp_path):
+    source, _ = embedded_drawing(tmp_path/'xy.dxf')
+    hide = ("import runpy, sys; sys.modules['olefile'] = None; sys.argv = sys.argv[1:]; "
+            "sys.path.insert(0, sys.argv[0].rsplit('/', 1)[0]); runpy.run_path(sys.argv[0], run_name='__main__')")
+    result = subprocess.run([sys.executable, '-c', hide, str(SCRIPTS/'cad.py'), 'xiangyuan', str(source), '--units', 'm',
+                             '--output', str(tmp_path/'out')], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    manifest = json.loads((tmp_path/'out'/'manifest.json').read_text())
+    assert any('2 OLE objects are listed without their contents: olefile is not installed' in w for w in manifest['warnings'])
+    frames = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='ole_frames')
+    assert len(frames) == 2 and frames['file'].isna().all() and frames.geometry.notna().all()
+    assert not (tmp_path/'out'/'ole').exists()

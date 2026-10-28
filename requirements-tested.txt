@@ -21,3 +21,4 @@ opencv-python==4.12.0.88
 scikit-image==0.24.0
 pyarrow==21.0.0
 ezdxf==1.4.5
+olefile==0.47

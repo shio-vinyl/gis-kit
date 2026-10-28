@@ -42,7 +42,7 @@ I will keep adding tools as I need them, including some research-oriented featur
    - DWG goes to DXF through an installed LibreDWG or ODA converter.
    - An inventory lists layers, units and stray title blocks, with candidate CRS from coordinate magnitude or a reference layer.
    - General drawings are extracted, closed into faces with explicit tolerances, and labelled from their texts.
-   - 湘源控规 (Xiangyuan) statutory plans are read straight from the parcels' XDATA attributes.
+   - 湘源控规 (Xiangyuan) statutory plans are read straight from the parcels' XDATA attributes, along with the Excel indicator tables embedded in the drawing and its CAD tables.
    - A confirmed CRS is assigned, or local grids are moved to a national grid by control points.
 
    ArcGIS layer and map packages (.lpk, .mpk) are unpacked safely, with an inventory of their data and layers.
