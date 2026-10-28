@@ -121,6 +121,7 @@ python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /wor
   - `manifest.json`（`manifest: cad-xiangyuan` v1）：统计、hold 原因、面积汇总；
   - `record.json`。
 - **CRS**：不设 CRS，之后接 `assign-crs` 或 [矢量控制点转换](vector-georeferencing.md)。
+- **指标**：图里没填的指标（例如容积率、地块容积）可以从说明书的指标表按编号挂上，见 [按编号挂接指标表](vector-metrics.md#按编号挂接指标表)。
 
 ## 实体提取
 

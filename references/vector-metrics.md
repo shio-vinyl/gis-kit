@@ -23,6 +23,41 @@ python3 gis-kit/scripts/join.py --left buildings.gpkg --right stops.gpkg \
 - `--agg count` 对选择字段分别统计非空值数；`match_count` 单独记录空间匹配关系总数。`sum` 跳过数值 null、全 null 保持 null；`mean` 同理。聚合行同时保存 `matched_source_ids` JSON 列表。
 - Nearest 的 `--max-distance` 和 `distance_m` 均为米。未设上限时查询最近关系而不裁切距离。报告打印左右两侧的匹配、未匹配数、匹配关系数、策略与 analysis CRS，也可用 `--report-json` 保存。
 
+## 按编号挂接指标表
+
+把说明书或 Excel 里的指标（建筑量、容积率、配套）按地块编号挂到地块上。这一步是属性挂接，不看几何，也不需要 CRS。
+
+```bash
+python3 gis-kit/scripts/join.py --left parcels.gpkg --right 指标表.xlsx --right-sheet 指标表 \
+  --on parcel_id=地块编号 --normalize id --fields 建筑量,容积率 --agg first \
+  --output parcels_indicators.gpkg --report-json join_report.json
+```
+
+- **`--on 左字段=右字段`**：两边字段同名时写一个名字即可。只支持 `--how left` 或 `inner`，结果保留左侧的几何和 CRS。`--predicate`、`--max-distance`、`--analysis-crs` 在这里不适用，给了就报错。
+- **右侧输入**：可以是 CSV、Excel 或任意矢量文件。
+  - 表格的单元格一律先按文本读入，编号的前导零不会丢。其他列只有当整列都是数字时才转成数值，因此可以用 `sum` / `mean`。
+  - Excel 用 `--right-sheet`（表名或从 0 开始的序号）选工作表。
+  - 表头不在第一行时（说明书表格常有标题行），用 `--right-header-row`（从 1 开始）指定。
+  - CSV 是 GBK 等编码时用 `--right-encoding`。
+  - 表头里有重名列时报错。
+- **`--normalize id`**：按地块编号的写法规范化后再比对：
+  - 全角转半角（NFKC）；
+  - 各种连字符（`－`、`—`、`–` 等）统一为 `-`；
+  - 去掉空格，字母转大写；
+  - 每段数字去掉前导零（`01-03`、`1-3`、`１－３`、`01—03` 都视为 `1-3`）；
+  - Excel 读成 `103.0` 的编号按 `103` 处理。
+
+  默认 `none`，按原样比对。
+- **聚合**：沿用前面的 `--agg` 规则。右侧有重复编号时，`first` 取第一行，`sum` 加总，`all` 每行输出一条；`match_count` 记录匹配到的行数。
+- **报告（`--report-json`）**：除了匹配数，还有：
+  - `key`：两侧字段和规范化方式；
+  - `left_unmatched_keys` / `right_unmatched_keys`：两侧对不上的编号（原样）；
+  - `left_without_key` / `right_without_key`：编号为空的行数；
+  - `*_duplicate_keys`：同一侧的重复编号，以及对应的原始写法；
+  - `*_collisions`：写法不同、规范化后却变成同一个编号的情况；
+  - `*_normalised`：每一处 `[原写法, 规范化后]` 的对照。
+- **地块与规划控制单元**：两者的编号可能撞号。挂接前先按 `control_type` 筛出需要的一类。
+
 GeoPackage/GeoJSON/FlatGeobuf 文件由安全写入器整文件暂存、重读校验后发布；默认不覆盖任何现有输出，也不允许输出覆盖输入。确需替换时显式使用 `--overwrite`。CSV 使用同目录临时文件原子发布。多文件旧格式保持既有写法，不保证原子性。
 
 ## 建筑与用地指标
