@@ -44,6 +44,7 @@ I will keep adding tools as I need them, including some research-oriented featur
    - General drawings are extracted, closed into faces with explicit tolerances, and labelled from their texts.
    - 湘源控规 (Xiangyuan) statutory plans are read straight from the parcels' XDATA attributes, along with the Excel indicator tables embedded in the drawing and its CAD tables.
    - A confirmed CRS is assigned, or local grids are moved to a national grid by control points.
+   - The parcels are overlaid on reference layers such as supplied land or renewal areas in a check plot, with the intersections measured.
 
    ArcGIS layer and map packages (.lpk, .mpk) are unpacked safely, with an inventory of their data and layers.
 3. Raster and terrain tools support zonal statistics, reprojection and COG output, with windowed processing for large rasters. DEM tools calculate slope, aspect, contours and profiles; hydrology, viewsheds and terrain cost can use the optional GRASS backend.
