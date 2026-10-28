@@ -781,24 +781,34 @@ def xiangyuan_drawing(path):
     doc = ezdxf.new('R2018')
     doc.header['$INSUNITS'] = 1  # 湘源 drawings often say inches while drawn in metres
     msp = doc.modelspace()
-    fields = ('地块编号', '用地代码', '用地性质', '用地面积', '容积率', '删除标记', '设施小类名称', '地块')
+    fields = ('地块编号', '用地代码', '用地性质', '用地面积', '容积率', '建筑限高', '单位规模', '删除标记', '设施小类名称', '地块', 'LHB_YJ')
     for name in fields:
         doc.appids.new(name)
-    def parcel(layer, number, code, name, box_, declared=None, deleted='', bulge=False):
+    def parcel(layer, number, code, name, box_, declared=None, deleted='', bulge=False, height='24'):
         x0, y0, x1, y1 = box_
         points = [(x0, y0, 0, 0, 0), (x1, y0, 0, 0, 1 if bulge else 0), (x1, y1, 0, 0, 0), (x0, y1, 0, 0, 0)]
         outline = msp.add_lwpolyline(points, format='xyseb', close=True, dxfattribs={'layer': layer})
         area = (x1-x0)*(y1-y0) + (math.pi*((y1-y0)/2)**2/2 if bulge else 0)
         for key, value in (('地块编号', number), ('用地代码', code), ('用地性质', name),
-                           ('用地面积', str(round(declared if declared is not None else area))), ('容积率', '2.5'), ('删除标记', deleted)):
+                           ('用地面积', str(round(declared if declared is not None else area))), ('容积率', '2.5'),
+                           ('建筑限高', height), ('单位规模', '120'), ('删除标记', deleted)):
             outline.set_xdata(key, [(1000, value)])
         return outline
+    def fill(layer, box_):
+        hatch = msp.add_hatch(color=1, dxfattribs={'layer': layer})
+        x0, y0, x1, y1 = box_
+        hatch.paths.add_polyline_path([(x0, y0), (x1, y0), (x1, y1), (x0, y1)], is_closed=True)
     parcel('C1_K', '01-01', 'C1', '商业用地', (0, 0, 100, 80), bulge=True)
-    parcel('G1+C1', '01-02', 'G1+C1', '公园绿地', (100, 0, 200, 80))           # suffix dropped: still consistent
+    second = parcel('G1+C1', '01-02', 'G1+C1', '公园绿地', (100, 0, 200, 80))  # suffix dropped: still consistent
+    second.set_xdata('LHB_YJ', [(1000, 'another plug-in')])                    # not a 湘源 field
+    second.set_xdata('用地性质', [(1000, '旧值'), (1000, '公园绿地')])             # several values: the last wins
     parcel('R2_K', '01-03', 'R3', '三类居住用地', (0, 80, 100, 160))           # layer says R2, XDATA says R3
     parcel('C1_K', '01-01', 'C1', '商业用地', (100, 80, 200, 160))            # duplicate number
     parcel('C1_K', '01-05', 'C1', '商业用地', (200, 0, 300, 80), deleted='1')
-    parcel('G1_K', '01-06', 'G1', '公园绿地', (200, 80, 300, 160), declared=5000)  # 8000 m² drawn
+    parcel('G1_K', '01-06', 'G1', '公园绿地', (200, 80, 300, 160), declared=5000, height='N/A')  # 8000 m² drawn
+    fill('C1_T', (10, 10, 90, 70))       # 01-01
+    fill('G1_T', (110, 10, 190, 70))     # 01-02 is G1+C1: wrong layer code
+    fill('R2_T', (600, 600, 610, 610))   # under no parcel
     parcel('DY_K', '02-01', 'DY', '规划控制单元', (0, 200, 300, 300))
     block = doc.blocks.new('地块编号')
     for tag in ('地块编号', '用地代码'):
@@ -808,6 +818,13 @@ def xiangyuan_drawing(path):
     facility = msp.add_blockref('地块编号', (250, 250), dxfattribs={'layer': '配套设施'})
     facility.set_xdata('设施小类名称', [(1000, '通信机房')])
     facility.set_xdata('地块编号', [(1000, '02-01')])
+    for point, number in (((250, 260), '99-99'), ((50, 40), '01-05')):   # unknown number; number of another parcel
+        msp.add_blockref('地块编号', point, dxfattribs={'layer': '配套设施'}).set_xdata('地块编号', [(1000, number)])
+    roads = doc.blocks.new('luwang')
+    copy = roads.add_line((0, 0), (300, 0), dxfattribs={'layer': '0-道路红线'})
+    copy.set_xdata('地块编号', [(1000, '01-01')])
+    copy.set_xdata('用地代码', [(1000, 'C1')])
+    msp.add_blockref('luwang', (0, 0), dxfattribs={'layer': '----道路中心线'})
     msp.add_lwpolyline([(-10, -10), (310, -10), (310, 310), (-10, 310)], close=True, dxfattribs={'layer': '----规划边界'})
     msp.add_lwpolyline([(0, 0), (300, 0), (300, 160), (0, 160)], close=True, dxfattribs={'layer': 'DY范围'})
     msp.add_lwpolyline([(0, 160), (300, 160), (300, 0), (0, 0)], close=True, dxfattribs={'layer': 'DY范围'})  # same, reversed
@@ -831,7 +848,7 @@ def test_xiangyuan_parcels_from_xdata(tmp_path):
     parcels = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='parcels')
     by = {(row['parcel_id'], row['layer']): row for _, row in parcels.iterrows()}
     first, second = parcels[parcels['parcel_id'] == '01-01'].sort_values('area_m2', ascending=False).itertuples()
-    assert first.landuse == 'C1' and first.landuse_name == '商业用地' and first.容积率 == '2.5'
+    assert first.landuse == 'C1' and first.landuse_name == '商业用地' and first.容积率 == 2.5 and first.fills == 1
     assert first.area_m2 == pytest.approx(8000 + math.pi*40**2/2, rel=1e-3) and abs(first.area_diff) < 1e-3
     assert 'duplicate 地块编号' in first.reason and 'duplicate 地块编号' in second.reason
     g = by[('01-02', 'G1+C1')]
@@ -850,10 +867,57 @@ def test_xiangyuan_parcels_from_xdata(tmp_path):
     assert list(units['reason'].fillna('')) == ['', 'duplicate outline', 'no unit label inside']
     assert manifest['area']['units_by_id_m2'] == {'DY01': 48000.0}
     facilities = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='facilities')
-    assert facilities['设施小类名称'].tolist() == ['通信机房'] and facilities['地块编号'].tolist() == ['02-01']
+    telecom = facilities[facilities['设施小类名称'].notna()]
+    assert telecom['设施小类名称'].tolist() == ['通信机房'] and telecom['地块编号'].tolist() == ['02-01']
     assert manifest['summary']['parcels'] == 6 and manifest['summary']['control_units'] == 1
     assert manifest['area']['boundary_m2'] == pytest.approx(320*320)
     assert manifest['summary']['number_block_problems'] == 2 and (tmp_path/'out'/'check.png').stat().st_size > 10_000
+
+
+
+def test_xiangyuan_fields_fills_facilities_and_copies(tmp_path):
+    source = xiangyuan_drawing(tmp_path/'xy.dxf')
+    manifest = xiangyuan(source, tmp_path/'out', '--units', 'm')
+    parcels = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='parcels')
+    g = parcels.set_index('parcel_id').loc['01-02']
+    assert json.loads(g['other_xdata']) == {'LHB_YJ': 'another plug-in'} and 'LHB_YJ' not in parcels.columns
+    assert g['landuse_name'] == '公园绿地' and g['fills'] == 1  # the last of two values; its fill sits on G1_T
+    assert parcels['单位规模'].tolist()[0] == '120' and parcels['建筑限高'].dtype == object
+    assert {'容积率', '用地面积'} <= set(manifest['summary']['numeric_fields']) and '建筑限高' not in manifest['summary']['numeric_fields']
+    warnings = manifest['warnings']
+    assert any("建筑限高 kept as text: 1 values are not numbers ('N/A')" in w for w in warnings)
+    assert any('1 XDATA applications held several values' in w for w in warnings)
+    assert manifest['block_copies'] == [{'block': 'luwang', 'entities': 1, 'inserts_in_model_space': 1}]
+    assert manifest['summary']['parcels'] == 6  # the copy on the road line is not a parcel
+    fills = manifest['summary']['fills']
+    assert fills['parcels_without_fill'] == 4 and fills['fills_without_parcel'] == 1
+    assert fills['fill_code_mismatches'] == [{'parcel_id': '01-02', 'fill_layer': 'G1_T', 'landuse': 'G1+C1'}]
+    assert manifest['summary']['facility_matches'] == {'inside': 1, 'unknown id': 1, 'elsewhere': 1}
+    facilities = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='facilities').set_index('parcel_match')
+    assert facilities.loc['elsewhere', 'parcel_distance_m'] == 150.0  # (50, 40) to the 01-05 box starting at x = 200
+    assert manifest['parameters']['units_basis'] == '--units m (header $INSUNITS = inches)'
+    assert manifest['custom_entities'] == {'lzx_land_class_registered': False, 'lzx_land_instances': 0, 'proxy_entities': 0}
+    schema = tmp_path/'schema.json'
+    schema.write_text(json.dumps({'land_attribute_fields_order': ['单位规模'], 'numeric_like': ['单位规模']}, ensure_ascii=False),
+                      encoding='utf-8')
+    typed = xiangyuan(source, tmp_path/'schema', '--units', 'm', '--schema', schema)
+    assert gpd.read_file(tmp_path/'schema'/'parcels.gpkg', layer='parcels')['单位规模'].tolist()[0] == 120.0
+    assert typed['schema']['numeric'] == 1 and '单位规模' in typed['summary']['numeric_fields']
+
+
+def test_xiangyuan_refuses_unexploded_parcels(tmp_path):
+    ezdxf = pytest.importorskip('ezdxf')
+    source = xiangyuan_drawing(tmp_path/'xy.dxf')
+    owner = ezdxf.readfile(source).modelspace().block_record_handle
+    text = source.read_text(encoding='utf-8')
+    classes = text.index('  2\nCLASSES\n') + len('  2\nCLASSES\n')
+    entities = text.index('  2\nENTITIES\n') + len('  2\nENTITIES\n')
+    # The DXF form of a 湘源 parcel that was never exploded: a class record and an entity with only its marker.
+    record = '  0\nCLASS\n  1\nLZX_LAND\n  2\nAcdbLzxLand\n  3\nLZXOBJ\n 90\n0\n 91\n1\n280\n0\n281\n1\n'
+    entity = f'  0\nLZX_LAND\n  5\nFFFF0\n330\n{owner}\n100\nAcDbEntity\n  8\nC1_K\n100\nAcdbLzxLand\n 70\n4\n'
+    source.write_text(text[:classes] + record + text[classes:entities] + entity + text[entities:], encoding='utf-8')
+    message = xiangyuan(source, tmp_path/'out', '--units', 'm', success=False)
+    assert 'unexploded LZX_LAND' in message and 'explode or export them in 湘源控规' in message
 
 
 def test_xiangyuan_refusals(tmp_path):

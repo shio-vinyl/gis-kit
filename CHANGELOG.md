@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `cad.py xiangyuan` 细化：数值字段转成数值（解析不了的整列保留文本并警告），可用 `--schema` 补充字段与数值清单；其他插件的 XDATA 归入 `other_xdata`；同一应用有多个 1000 组码时取最后一个（只统计地块）；`_T` 填充与地块配对核对；配套设施按 `地块编号` 核对是否落在对应地块（含距离）；模型空间有未炸开的 `LZX_LAND` 时报错；报告块定义里的地块属性副本；清单记下单位依据与警告。
 - `cad.py assign-crs` 默认给输入文件的全部图层赋 CRS，图层名不变（`--layer` 只处理一个）；每层都核对范围、回读 WKB、属性与 CRS。清单 `input.layers` 为图层列表，`checks` 按图层给出。
 - 新脚本 `package.py unpack`：安全解开 ArcGIS 图层包 / 地图包（`.lpk`、`.lpkx`、`.mpk`、`.mpkx`；7z 经 bsdtar 或 7-Zip，zip 经 zipfile）。解压前拒绝越界路径、链接和超过 `--max-bytes` 的包，解压后核对大小。读出包信息，为 `commondata/` 下每个数据集写 describe 卡片，把图层文件对应到数据：`.lyrx` 读渲染字段、分类、标注与定义查询，`.lyr` 只取数据源路径、名称与标注表达式；包里缺数据的图层单独报告。符号化不还原。说明见 `references/esri-package.md`。
 - `join.py --on 左字段=右字段`：按属性挂接，右侧可以是 CSV / Excel 表（`--right-sheet`、`--right-header-row`、`--right-encoding`；单元格按文本读入，前导零不丢，全数字的列转为数值）。`--normalize id` 按地块编号规范化（全角转半角、连字符统一、去空格、去每段数字的前导零）。报告列出两侧对不上的编号、空编号、重复编号、规范化后撞到一起的编号，以及每一处规范化的对照。原有的空间挂接行为不变。
