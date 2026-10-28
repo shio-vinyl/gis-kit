@@ -48,8 +48,14 @@ def site(x0, y0, step=1.0):
             (0, 'INSERT'), (8, '绿化'), (2, 'TREE'), (10, x0+50*s), (20, y0+5*s), (30, 0)]
 
 
-def inspect(source, out, *extra, success=True):
-    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'inspect', str(source), '--output', str(out), *map(str, extra)],
+# Runs cad.py as __main__ with ezdxf made unimportable, to exercise the GDAL-only inventory.
+WITHOUT_EZDXF = ("import runpy, sys; sys.modules['ezdxf'] = None; sys.path.insert(0, sys.argv[1]); "
+                 "sys.argv = sys.argv[1:]; sys.argv[0] = sys.argv[0] + '/cad.py'; runpy.run_path(sys.argv[0], run_name='__main__')")
+
+
+def inspect(source, out, *extra, success=True, ezdxf=True):
+    command = [sys.executable, str(SCRIPTS/'cad.py')] if ezdxf else [sys.executable, '-c', WITHOUT_EZDXF, str(SCRIPTS)]
+    result = subprocess.run([*command, 'inspect', str(source), '--output', str(out), *map(str, extra)],
                             capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
     assert (result.returncode == 0) == success, result.stdout+result.stderr
     return (json.loads((out/'cad.json').read_text()) if success else result.stderr)
@@ -66,7 +72,10 @@ def test_zone_prefixed_grid_inventory_and_outputs(tmp_path):
                                 'codepage': 'ANSI_936', 'extent': None}
     layers = {row['layer']: row for row in report['layers']}
     assert set(layers) == {'道路', '建筑', '注记', '绿化'} and layers['道路']['entities'] == 2
-    assert layers['注记']['text_samples'] == ['人民路'] and 'texts' not in layers['道路']
+    assert layers['注记']['text_samples'] == [{'raw': '人民路', 'clean': '人民路'}] and 'texts' not in layers['道路']
+    assert layers['道路']['dxf_types'] == {'LINE': 2} and layers['建筑']['dxf_types'] == {'POLYLINE closed': 1}
+    assert layers['绿化']['blocks'] == {'TREE': 1} and report['reader']['missing'] == []
+    assert report['entities']['model_space'] == 5 and report['reader']['inventory'].startswith('ezdxf')
     assert report['crs']['status'] == 'candidate' and report['crs']['assigned'] is None
     assert codes(report) == ['EPSG:4527', 'EPSG:4775', 'EPSG:2363', 'EPSG:2415']  # CGCS2000 first, all four datums
     lon, lat = report['crs']['readings'][0]['matches'][0]['candidates'][0]['lonlat']
@@ -129,10 +138,60 @@ def test_r2000_entity_types_and_hatch_is_not_text(tmp_path):
     source = tmp_path/'r2000.dxf'
     with pytest.warns(UserWarning):
         pyogrio.write_dataframe(frame, source, driver='DXF')
-    report = inspect(source, tmp_path/'out')
+    report = inspect(source, tmp_path/'out', ezdxf=False)
     layers = {row['layer']: row for row in report['layers']}
     assert layers['C']['entity_types'] == {'AcDbHatch': 1} and 'texts' not in layers['C']
     assert report['header']['release'] == 'R2004'
+    full = {row['layer']: row for row in inspect(source, tmp_path/'ezdxf')['layers']}
+    assert full['C']['dxf_types'] == {'HATCH': 1} and 'texts' not in full['C']
+
+
+def test_gdal_fallback_lists_what_is_missing(tmp_path):
+    source = dxf(tmp_path/'site.dxf', site(39_500_000, 3_400_000))
+    report = inspect(source, tmp_path/'out', ezdxf=False)
+    assert report['reader']['inventory'] == 'gdal' and 'block names and attribute tags' in report['reader']['missing']
+    layers = {row['layer']: row for row in report['layers']}
+    assert layers['注记']['text_samples'] == [{'raw': '人民路'}] and 'dxf_types' not in layers['注记']
+    assert report['layouts'] is None and report['unused_layers'] is None
+    assert codes(report)[0] == 'EPSG:4527'  # geometry, extent and CRS do not depend on ezdxf
+
+
+def test_ezdxf_inventory_of_an_r2018_drawing(tmp_path):
+    import ezdxf
+    doc = ezdxf.new('R2018', setup=True)
+    doc.header['$INSUNITS'] = 6
+    for name in ('地块界线', '地块编号', '用地代码', '图框', '辅助线'):
+        doc.layers.add(name)
+    doc.layers.get('辅助线').off()
+    doc.layers.get('图框').freeze()
+    msp = doc.modelspace()
+    x0, y0 = 38_500_000, 2_490_000
+    msp.add_lwpolyline([(x0, y0), (x0+100, y0), (x0+100, y0+80), (x0, y0+80)], close=True, dxfattribs={'layer': '地块界线'})
+    msp.add_lwpolyline([(x0+100, y0), (x0+180, y0), (x0+180, y0+80)], dxfattribs={'layer': '地块界线'})
+    msp.add_mtext(r'{\fSimSun|b0;03-03-02}\P', dxfattribs={'layer': '地块编号', 'insert': (x0+50, y0+40)})
+    msp.add_text('Ｒ２＋Ｃ１', dxfattribs={'layer': '用地代码', 'insert': (x0+50, y0+30)})
+    msp.add_line((x0, y0), (x0+180, y0+80), dxfattribs={'layer': '辅助线'})
+    block = doc.blocks.new('地块标签')
+    block.add_attdef('BH', (0, 0))
+    block.add_circle((0, 0), 1)
+    for point, value in (((x0+20, y0+20), '03-01'), ((x0+140, y0+20), '03-02')):
+        msp.add_blockref('地块标签', point, dxfattribs={'layer': '地块编号'}).add_attrib('BH', value, point)
+    layout = doc.layouts.new('图则')
+    layout.add_viewport((150, 100), (200, 150), (x0+90, y0+40), 100)
+    source = tmp_path/'r2018.dxf'
+    doc.saveas(source)
+
+    report = inspect(source, tmp_path/'out')
+    layers = {row['layer']: row for row in report['layers']}
+    assert layers['地块界线']['dxf_types'] == {'LWPOLYLINE closed': 1, 'LWPOLYLINE open': 1}
+    assert layers['地块编号']['dxf_types'] == {'INSERT': 2, 'MTEXT': 1}
+    assert layers['地块编号']['blocks'] == {'地块标签': 2} and layers['地块编号']['attributes'] == {'BH': ['03-01', '03-02']}
+    assert layers['地块编号']['text_samples'] == [{'raw': r'{\fSimSun|b0;03-03-02}\P', 'clean': '03-03-02'}]
+    assert layers['用地代码']['text_samples'] == [{'raw': 'Ｒ２＋Ｃ１', 'clean': 'R2+C1'}]
+    assert layers['辅助线']['state'] == ['off'] and 'state' not in layers['地块界线']
+    assert report['unused_layers'] == ['图框']
+    assert {row['name']: row['viewports'] for row in report['layouts']}['图则'] == 1
+    assert report['header']['release'] == 'R2018' and codes(report)[0] == 'EPSG:4526'
 
 
 def test_refuses_dwg_and_other_inputs(tmp_path):

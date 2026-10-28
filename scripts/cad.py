@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Inspect a DXF drawing before using it as GIS data: layers, entities, units, extent, candidate CRS and a check plot.
 
-`cad.py inspect` reads model-space entities through GDAL (block references are expanded into their
-geometry), reads $ACADVER / $INSUNITS / $DWGCODEPAGE from the header itself, and lists projected CRS
+`cad.py inspect` reads model-space geometry through GDAL (block references expanded) and, when the optional
+ezdxf is installed, inventories layers as CAD counts them: DXF entity types, closed and open polylines,
+block names and attributes, raw and cleaned text, layer state, layouts and viewports. Without ezdxf the
+inventory comes from GDAL and cad.json lists what is missing. It reads $ACADVER / $INSUNITS /
+$DWGCODEPAGE from the header itself, and lists projected CRS
 whose grid the coordinates fit, mainly zone-prefixed Chinese Gauss-Kruger grids. Coordinates without
 the zone prefix are held: they may equally be a local grid, so no EPSG code is listed for them.
 CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
@@ -37,6 +40,9 @@ DATUMS = ('CGCS2000', 'New Beijing', 'Xian 1980', 'Beijing 1954')
 TEXT_SAMPLES = 5
 PLOT_LAYERS = 12
 OUTLIER_SPREAD = 20
+# What the GDAL fallback cannot report; listed in cad.json when ezdxf is not installed.
+EZDXF_ONLY = ['DXF entity types for R12', 'closed and open polylines', 'block names and attribute tags',
+              'raw and cleaned text', 'layer off and frozen state', 'unused layers', 'layouts and viewports']
 
 
 def read_header(path):
@@ -193,10 +199,80 @@ def inventory(frame):
         if mask.any():
             values = text.loc[index][mask].astype(str).str.strip()
             row['texts'] = int(mask.sum())
-            row['text_samples'] = [v[:60] for v in dict.fromkeys(values)][:TEXT_SAMPLES]
+            row['text_samples'] = [{'raw': v[:80]} for v in dict.fromkeys(values)][:TEXT_SAMPLES]
         row['bounds'] = [round(float(v), 3) for v in rows.total_bounds]
         layers.append(row)
     return sorted(layers, key=lambda row: -row['entities'])
+
+
+def clean_text(text):
+    """Text with full-width ASCII folded to half-width and whitespace (MTEXT \\P included) collapsed."""
+    folded = ''.join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else ' ' if c == '　' else c for c in text)
+    return ' '.join(folded.split())
+
+
+def read_drawing(path, encoding):
+    """(ezdxf document, audit counts); (None, None) when ezdxf is not installed."""
+    try:
+        import ezdxf
+        from ezdxf import recover
+    except ImportError:
+        return None, None
+    if encoding:  # recover mode takes the encoding from the header only
+        return ezdxf.readfile(path, encoding=encoding), None
+    doc, auditor = recover.readfile(path)
+    return doc, {'errors': len(auditor.errors), 'fixes': len(auditor.fixes)}
+
+
+def drawing_inventory(doc, bounds):
+    """Per-layer DXF entity types counted as CAD counts them (one INSERT per block reference), block names,
+    attribute tags, raw and cleaned text, and layer state; bounds come from the expanded GDAL geometry."""
+    from collections import Counter
+    layers = {}
+    for entity in doc.modelspace():
+        kind = entity.dxftype()
+        if kind == 'LWPOLYLINE':
+            kind += ' closed' if entity.closed else ' open'
+        elif kind == 'POLYLINE':
+            kind += ' closed' if entity.is_closed else ' open'
+        row = layers.setdefault(entity.dxf.layer, {'layer': entity.dxf.layer, 'entities': 0, 'dxf_types': Counter(),
+                                                    'blocks': Counter(), 'attributes': {}, 'text': []})
+        row['entities'] += 1
+        row['dxf_types'][kind] += 1
+        if kind == 'INSERT':
+            row['blocks'][entity.dxf.name] += 1
+            for attrib in entity.attribs:
+                samples = row['attributes'].setdefault(attrib.dxf.tag, [])
+                value = clean_text(attrib.dxf.text)
+                if value not in samples and len(samples) < TEXT_SAMPLES:
+                    samples.append(value)
+        elif kind == 'TEXT':
+            row['text'].append((entity.dxf.text, clean_text(entity.plain_text())))
+        elif kind == 'MTEXT':
+            row['text'].append((entity.text, clean_text(entity.plain_text(split=False))))
+    table = {layer.dxf.name: layer for layer in doc.layers}
+    result = []
+    for name, row in layers.items():
+        out = {'layer': name, 'entities': row['entities'], 'dxf_types': dict(row['dxf_types'].most_common())}
+        if row['blocks']:
+            out['blocks'] = dict(row['blocks'].most_common())
+        if row['attributes']:
+            out['attributes'] = row['attributes']
+        if row['text']:
+            out['texts'] = len(row['text'])
+            out['text_samples'] = [{'raw': raw[:80], 'clean': clean[:80]}
+                                   for raw, clean in dict(row['text']).items()][:TEXT_SAMPLES]
+        layer = table.get(name)
+        state = [flag for flag, on in (('off', layer and layer.is_off()), ('frozen', layer and layer.is_frozen())) if on]
+        if state:
+            out['state'] = state
+        out['bounds'] = bounds.get(name)
+        result.append(out)
+    unused = sorted(set(table) - set(layers) - {'0', 'Defpoints'})
+    layouts = [{'name': layout.name, 'entities': len(layout),
+                'viewports': sum(1 for v in layout.query('VIEWPORT') if v.dxf.get('id', 0) != 1)}
+               for layout in doc.layouts if layout.name != 'Model']
+    return sorted(result, key=lambda row: -row['entities']), unused, layouts
 
 
 def split_core(frame):
@@ -289,7 +365,22 @@ def inspect(args):
     if model.empty:
         raise ValueError('No model-space geometry in the drawing')
     core, x, y = split_core(model)
-    layers = inventory(model)
+    try:
+        doc, audit = read_drawing(source, args.encoding)
+    except Exception as error:  # ezdxf's own errors vary by damage; GDAL already read the drawing
+        doc, audit = None, None
+        warnings.append(f'ezdxf could not read the drawing ({type(error).__name__}: {error}); layer inventory falls back to GDAL')
+    if doc is not None:
+        import ezdxf
+        bounds = {name: [round(float(v), 3) for v in rows.total_bounds] for name, rows in model.groupby(model['Layer'].fillna(''))}
+        layers, unused, layouts = drawing_inventory(doc, bounds)
+        reader = {'inventory': f'ezdxf {ezdxf.__version__}', 'missing': []}
+        if audit and audit['errors']:
+            warnings.append(f'ezdxf recovered the drawing with {audit["errors"]} structure errors and {audit["fixes"]} fixes')
+    else:
+        layers, unused, layouts = inventory(model), None, None
+        reader = {'inventory': 'gdal', 'missing': EZDXF_ONLY}
+    reader['geometry'] = f'gdal {pyogrio.__gdal_version_string__}'
     stray = model[~core]
     if len(stray):
         counts = stray['Layer'].fillna('').value_counts()
@@ -331,17 +422,21 @@ def inspect(args):
     except ImportError:
         font = 'DejaVu Sans'
     stat = source.stat()
+    total = sum(row['entities'] for row in layers)
     with bundle(args.output) as stage:
         plot(model, core, layers, stage / 'check.png',
-             f'{source.name} · {len(model)} entities · {len(layers)} layers · {summary}', font)
+             f'{source.name} · {total} entities · {len(layers)} layers · {summary}', font)
         report = {'report': 'cad-inventory', 'schema_version': 1,
                   'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source),
                              'modified': datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec='seconds')},
-                  'header': header,
-                  'entities': {'model_space': int(len(model)), 'paper_space': int(paper.sum()), 'empty': int(empty.sum()),
+                  'header': header, 'reader': reader,
+                  'entities': {'model_space': total, 'geometries': int(len(model)), 'paper_space': int(paper.sum()),
+                               'empty': int(empty.sum()),
                                'geometry_types': {k: int(v) for k, v in model.geom_type.value_counts().items()}},
-                  'blocks': 'expanded into their geometry; block names are not reported',
-                  'layers': layers, 'extent': extent, 'crs': crs, 'warnings': warnings,
+                  'blocks': ('each reference counts once per layer; geometry, extent and the plot expand references'
+                             if doc is not None else 'expanded into their geometry; block names are not reported'),
+                  'layers': layers, 'unused_layers': unused, 'layouts': layouts,
+                  'extent': extent, 'crs': crs, 'warnings': warnings,
                   'files': {'plot': 'check.png', 'record': 'record.json'}}
         write_json(stage / 'cad.json', report)
         write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad', 'version': VERSION,
@@ -350,7 +445,7 @@ def inspect(args):
                                             'files': {'cad.json': digest(stage / 'cad.json'), 'check.png': digest(stage / 'check.png')},
                                             'warnings': warnings,
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                                            'assumptions': ['Block references are expanded by GDAL',
+                                            'assumptions': ['Geometry comes from GDAL with block references expanded',
                                                             'CRS candidates come from coordinate magnitude and EPSG areas of use only',
                                                             'No CRS is assigned and no geometry is written']})
     return report

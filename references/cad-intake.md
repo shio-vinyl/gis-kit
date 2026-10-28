@@ -10,8 +10,10 @@ python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 
 
 - **输入**：只读 ASCII 或二进制 DXF。DWG 直接拒绝，先在 AutoCAD / 中望 CAD 里另存为 DXF，或用 ODA File Converter 转换。读模型空间实体，图纸空间（布局）实体单独计数，不参与范围和 CRS 判断。
 - **文件头**：自行解析 `$ACADVER`（换算成 R12、R2000 等版本）、`$INSUNITS`（图纸单位）、`$DWGCODEPAGE`（代码页）和 `$EXTMIN/$EXTMAX`；二进制 DXF 不解析文件头。文件头里的范围常常过时，只照原样记下，不用于判断。
-- **文字编码**：GDAL 按 `$DWGCODEPAGE` 转码，`ANSI_936` 的中文能正确读出。缺代码页或写成 `ANSI_1252` 时，GBK 中文会被当成 Latin-1 读成乱码；检测到这种情况会给出警告，用 `--encoding CP936` 重跑。
-- **清点**：按图层统计实体数、几何类型；R2000 及以上版本还统计实体类型（如 `AcDbPolyline`、`AcDbHatch`，R12 没有这一信息）。文字实体（TEXT / MTEXT，以及 R12 中带文字的点）记录数量和至多 5 条样例，填充图案名不算文字。图块引用由 GDAL 展开成几何，不报告块名。
+- **文字编码**：GDAL 和 ezdxf 都按 `$DWGCODEPAGE` 转码，`ANSI_936` 的中文能正确读出。缺代码页或写成 `ANSI_1252` 时，GBK 中文会被当成 Latin-1 读成乱码；检测到这种情况会给出警告，用 `--encoding CP936` 重跑。
+- **两个读取器**：几何、范围、检查图和 CRS 判断始终来自 GDAL（图块引用展开成几何）。图层清点在装了可选依赖 ezdxf 时由 ezdxf 完成，按 CAD 的口径计数：一个图块引用算一个实体。没装 ezdxf 时清点退回 GDAL，`reader.missing` 列出缺少的能力。ezdxf 读不了而 GDAL 能读时，同样退回 GDAL 并给出警告；ezdxf 修复过文件结构时，警告里记下错误和修复的条数。
+- **清点（ezdxf）**：按图层统计 DXF 实体类型（`LINE`、`ARC`、`TEXT`、`MTEXT`、`INSERT`、`HATCH`、`DIMENSION` 等），多段线分成 `LWPOLYLINE closed` / `open`（`POLYLINE` 同样）。图块引用记下块名和次数，块属性记下标签和至多 5 个取值。TEXT / MTEXT 记录数量和至多 5 条样例，每条同时给原文和清洗后的文字：清洗去掉 MTEXT 格式码、把换行并成空格、全角字母数字转半角。另外记录图层的关闭 / 冻结状态、图层表里有但模型空间没有实体的图层（`unused_layers`，不含 `0` 和 `Defpoints`），以及各布局的实体数和视口数。
+- **清点（GDAL 退回）**：按图层统计实体数、几何类型；R2000 及以上版本还统计 SubClasses 实体类型（如 `AcDbPolyline`、`AcDbHatch`，R12 没有这一信息）。文字样例只有原文。图块已展开，不报告块名；块属性、闭合状态、图层状态和布局都没有。
 - **离群实体**：实体中心距中位中心超过中位距离 20 倍的算离群，常见于放在原点的图框或误画的零星对象。按图层列出数量，检查图用红叉标出；范围分别记 `full`（全部）与 `core`（去掉离群），CRS 判断用 `core` 的中位中心。
 
 ## 候选 CRS
@@ -30,7 +32,7 @@ python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 
 
 ## 输出
 
-- `cad.json`（`report: cad-inventory`，`schema_version` 1）：`source`（文件名、大小、SHA-256、修改时间），`header`，`entities`（模型空间、图纸空间、空几何的数量，以及几何类型统计），`layers[]`（按实体数降序；`entities`、`geometry_types`、`entity_types`、`texts`、`text_samples`、`bounds`），`extent`，`crs`（`status`、`representative_point`、`near`、`readings[]`，每个 reading 含 `scale_to_metre`、`basis` 和 `matches[]` 的 `grid` 与 `candidates[]`；`rejected`、`notes`、`assigned`），以及 `warnings`。
+- `cad.json`（`report: cad-inventory`，`schema_version` 1）：`source`（文件名、大小、SHA-256、修改时间），`header`，`reader`（`inventory` 为 `ezdxf <版本>` 或 `gdal`，`geometry` 为 GDAL 版本，`missing` 为退回时缺少的能力），`entities`（`model_space` 为清点口径的实体数，`geometries` 为展开图块后的几何数，以及图纸空间、空几何的数量和几何类型统计），`layers[]`（按实体数降序；ezdxf 时为 `entities`、`dxf_types`、`blocks`、`attributes`、`texts`、`text_samples[{raw, clean}]`、`state`、`bounds`，GDAL 退回时为 `entities`、`geometry_types`、`entity_types`、`texts`、`text_samples[{raw}]`、`bounds`），`unused_layers`，`layouts[]`（`name`、`entities`、`viewports`；GDAL 退回时这两项为 `null`），`extent`，`crs`（`status`、`representative_point`、`near`、`readings[]`，每个 reading 含 `scale_to_metre`、`basis` 和 `matches[]` 的 `grid` 与 `candidates[]`；`rejected`、`notes`、`assigned`），以及 `warnings`。
 - `check.png`：按图层着色（前 12 层，其余为灰色），有离群实体时左侧加一幅全图，用虚线框标出主体范围。坐标轴为图纸单位。
 - `record.json`：参数、输入 SHA-256、输出文件摘要与假设。
 
