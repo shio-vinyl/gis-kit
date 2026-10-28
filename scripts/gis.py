@@ -44,6 +44,10 @@ def catalog(scripts: Path = SCRIPTS) -> list[dict]:
     return result
 
 
+# Run records written by the CAD, package and vector-transform tools, by their manifest / report name.
+MANIFESTS = ('cad-inventory', 'cad-convert', 'cad-extract', 'cad-polygonize', 'cad-label', 'cad-xiangyuan', 'crs-assignment', 'vector-transform', 'vector-georef-apply', 'esri-package')
+
+
 def capabilities() -> dict:
     """Capabilities document (schema_version 1) for external diagnostics such as gis-plugin; probes without importing backends."""
     features = []
@@ -56,6 +60,7 @@ def capabilities() -> dict:
     return {'contract': 'capabilities', 'schema_version': 1, 'engine': 'gis-kit', 'engine_version': VERSION,
             'commands': ['capabilities', 'describe', 'list'],
             'contracts': {'describe': {'write': [1]}, 'class-scheme': {'write': [1]}, 'display-raster': {'write': [1]}, 'tile-snapshot': {'write': [1]}, 'admin-chain': {'write': [1]}, 'display-vector': {'write': [1]},
+                          **{name: {'write': [1]} for name in MANIFESTS},
                           'memory-budget': {'env': _budget.ENV, 'exit_code': _budget.EXIT_CODE, 'error': [1]}},
             'features': features}
 

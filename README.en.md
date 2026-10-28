@@ -19,7 +19,7 @@ A skill for Claude Code, Codex and other agents.
 
 ## About
 
-This is the GIS toolbox I use myself. I have written more than 40 scripts for operations I find useful in everyday work.
+This is the GIS toolbox I use myself. I have written more than 50 scripts for operations I find useful in everyday work.
 
 A single entry point lets an agent list and search the tools, read their parameters through `--help`, and combine them for a task.
 
@@ -37,11 +37,19 @@ I will keep adding tools as I need them, including some research-oriented featur
 
 ## Tools
 
-1. Vector tools cover clipping, dissolving, merging, spatial joins and buffers, along with field and topology checks and repairs, area calculations and urban metrics. Everyday results can be saved as versioned bundles. CAD (DXF) drawings can be inventoried first: layers, units, stray title blocks and candidate CRS from coordinate magnitude.
-2. Raster and terrain tools support zonal statistics, reprojection and COG output, with windowed processing for large rasters. DEM tools calculate slope, aspect, contours and profiles; hydrology, viewsheds and terrain cost can use the optional GRASS backend.
-3. Network tools handle directed road networks, OD and facility coverage scenarios, including demand-weighted coverage. They do not report population coverage without demand weights.
-4. Semantic raster vectorization uses a model to read an image and draw points, lines and polygons. Scripts handle coordinate conversion, version records, geometry checks and export. I mainly use historical maps for this research and currently recommend GPT-6 Astra and GPT-6.1; the workflow and tests are described below.
-5. For repeated tasks, `--trace` records the steps actually run. These can be turned into a recipe for the next batch of data. `semantic-check` checks whether specified semantic fields were lost or changed between steps.
+1. Vector tools cover clipping, dissolving, merging, spatial joins and buffers, along with field and topology checks and repairs, area calculations and urban metrics. Everyday results can be saved as versioned bundles. Indicator tables (Excel or CSV) can be joined to parcels by parcel number, with differences in character width, dashes and leading zeros evened out.
+2. CAD planning drawings can be turned into GIS parcels:
+   - DWG goes to DXF through an installed LibreDWG or ODA converter.
+   - An inventory lists layers, units and stray title blocks, with candidate CRS from coordinate magnitude or a reference layer.
+   - General drawings are extracted, closed into faces with explicit tolerances, and labelled from their texts.
+   - 湘源控规 (Xiangyuan) statutory plans are read straight from the parcels' XDATA attributes.
+   - A confirmed CRS is assigned, or local grids are moved to a national grid by control points.
+
+   ArcGIS layer and map packages (.lpk, .mpk) are unpacked safely, with an inventory of their data and layers.
+3. Raster and terrain tools support zonal statistics, reprojection and COG output, with windowed processing for large rasters. DEM tools calculate slope, aspect, contours and profiles; hydrology, viewsheds and terrain cost can use the optional GRASS backend.
+4. Network tools handle directed road networks, OD and facility coverage scenarios, including demand-weighted coverage. They do not report population coverage without demand weights.
+5. Semantic raster vectorization uses a model to read an image and draw points, lines and polygons. Scripts handle coordinate conversion, version records, geometry checks and export. I mainly use historical maps for this research and currently recommend GPT-6 Astra and GPT-6.1; the workflow and tests are described below.
+6. For repeated tasks, `--trace` records the steps actually run. These can be turned into a recipe for the next batch of data. `semantic-check` checks whether specified semantic fields were lost or changed between steps.
 
 ## Semantic raster vectorization
 
