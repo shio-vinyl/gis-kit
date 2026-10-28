@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `convert.py` 目录批处理新增识别 `.kmz`、`.gpx`、`.gml`、`.tab`、`.mif`、`.dxf`、`.fgb`、`.geojsonl`（驱动已在 Pyogrio 自带的 GDAL 中，不新增依赖）。行为变化：多图层输入未给 `--layer` 时报错并列出图层，不再静默读取第一层；多个输入映射到同名输出时整批在写出前拒绝。删除未被调用的 `infer_driver`。
 - 新脚本 `cad.py inspect`：清点 DXF 的图层、实体类型、文字样例、图纸单位、离群实体与图纸空间，按坐标量级与 EPSG 适用范围列出候选 CRS（带带号的中国高斯-克吕格 3/6 度带与经纬度；四种基准并列；`--near` 剔除过远的候选）。无带号坐标与城市独立坐标分不开，一律 `hold`、不列 EPSG；不赋 CRS。`--encoding` 处理缺代码页的中文图纸。输出 `cad.json`、`check.png`、`record.json`；DWG 拒绝并提示先转 DXF。说明见 `references/cad-intake.md`。
 - `cad.py inspect` 接入可选依赖 ezdxf（`requirements-full.txt`、`environment.yml`；测试版本 1.4.5）：图层清点按 CAD 口径计数，给出 DXF 实体类型、闭合与不闭合多段线、块名与块属性、原文与清洗后的文字、图层关闭 / 冻结状态、未使用图层、布局与视口；几何、范围与 CRS 仍来自 GDAL。未安装时退回 GDAL，并在 `reader.missing` 列出缺少的能力。`capabilities` 新增 `cad` 一项。
 - 新子命令 `cad.py extract`（需要 ezdxf）：把选定图层的模型空间实体写成 `raw.gpkg` 的 `lines`、`closed_polygons`、`texts`、`blocks` 四个图层，每个要素带 `layer` 与 `handle`；曲线与凸度按 `--arc-tolerance`（弦高，米）离散；`--units m|mm|header` 必填，`header` 在无单位或与坐标矛盾时拒绝；非零 Z 需 `--drop-z`；文字含原文与清洗文字、对齐点与块属性；`--include-blocks` 炸开图块（0 层随引用图层）。不设 CRS，清单为 `manifest.json`（`cad-extract` v1），读取计数与 inspect 一致。
