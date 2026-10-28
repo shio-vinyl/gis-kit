@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -71,7 +72,7 @@ def test_zone_prefixed_grid_inventory_and_outputs(tmp_path):
     source = dxf(tmp_path/'site.dxf', site(39_500_000, 3_400_000))
     report = inspect(source, tmp_path/'out')
     assert report['header'] == {'readable': True, 'acadver': 'AC1009', 'release': 'R12', 'insunits': 6, 'units': 'meters',
-                                'codepage': 'ANSI_936', 'extent': None}
+                                'codepage': 'ANSI_936', 'extent': None, 'handles': False}
     layers = {row['layer']: row for row in report['layers']}
     assert set(layers) == {'道路', '建筑', '注记', '绿化'} and layers['道路']['entities'] == 2
     assert layers['注记']['text_samples'] == [{'raw': '人民路', 'clean': '人民路'}] and 'texts' not in layers['道路']
@@ -312,3 +313,122 @@ def test_assign_crs_refuses_a_candidate_that_needs_unit_scaling(tmp_path):
     gpkg, inspection = converted(tmp_path, site(39_500_000_000, 3_400_000_000, step=1000), name='mm', units=4)
     message = assign(gpkg, tmp_path/'out', '--inspection', inspection, '--crs', 'EPSG:4527', *CONFIRM, '--outside-candidates', success=False)
     assert 'only after unit scaling' in message and not (tmp_path/'out').exists()
+
+
+def extract(source, out, *extra, success=True, ezdxf=True):
+    command = [sys.executable, str(SCRIPTS/'cad.py')] if ezdxf else [sys.executable, '-c', WITHOUT_EZDXF, str(SCRIPTS)]
+    result = subprocess.run([*command, 'extract', str(source), '--output', str(out), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def layer(out, name):
+    return gpd.read_file(out/'raw.gpkg', layer=name)
+
+
+def plan_drawing(path, units=6, scale=1.0, z=0.0):
+    """R2018 parcels: a bulged boundary, an MTEXT number, a full-width code, an aligned TEXT and attributed blocks."""
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    doc.header['$INSUNITS'] = units
+    msp = doc.modelspace()
+    x0, y0, s = 38_500_000*scale, 2_490_000*scale, scale
+    # Two straight sides and a semicircular side of radius 50: bulge 1 between (x0+100, y0) and (x0+100, y0+100).
+    msp.add_lwpolyline([(x0, y0, 0, 0, 0), (x0+100*s, y0, 0, 0, 1), (x0+100*s, y0+100*s, 0, 0, 0), (x0, y0+100*s, 0, 0, 0)],
+                       format='xyseb', close=True, dxfattribs={'layer': '地块界线', 'elevation': z})
+    msp.add_line((x0, y0+100*s), (x0+300*s, y0+100*s), dxfattribs={'layer': '道路'})
+    msp.add_mtext(r'{\fSimSun|b0;03-03-02}\P', dxfattribs={'layer': '地块编号', 'insert': (x0+50*s, y0+50*s), 'char_height': 2.5*s})
+    msp.add_text('Ｒ２＋Ｃ１', dxfattribs={'layer': '用地代码', 'insert': (x0+50*s, y0+40*s), 'height': 2*s})
+    aligned = msp.add_text('C1', dxfattribs={'layer': '用地代码', 'height': 2*s})
+    aligned.set_placement((x0+60*s, y0+40*s), align=ezdxf.enums.TextEntityAlignment.MIDDLE_CENTER)
+    block = doc.blocks.new('地块标签')
+    block.add_attdef('BH', (0, 0))
+    block.add_circle((0, 0), 1*s)
+    for point, value in (((x0+20*s, y0+20*s), '03-01'), ((x0+80*s, y0+20*s), '03-02')):
+        msp.add_blockref('地块标签', point, dxfattribs={'layer': '地块编号'}).add_attrib('BH', value, point)
+    doc.saveas(path)
+    return path
+
+
+def test_extract_layers_fields_and_counts_match_inspect(tmp_path):
+    source = plan_drawing(tmp_path/'plan.dxf')
+    report = inspect(source, tmp_path/'inspect')
+    manifest = extract(source, tmp_path/'out', '--units', 'header')
+    counts = {row['layer']: row['entities'] for row in report['layers']}
+    assert {k: sum(v.values()) for k, v in manifest['read'].items()} == counts  # same entities as the inspection
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2} and manifest['crs'] is None
+    lines, polygons, texts, blocks = (layer(tmp_path/'out', n) for n in ('lines', 'closed_polygons', 'texts', 'blocks'))
+    assert lines.crs is None and set(lines['layer']) == {'地块界线', '道路'} and lines['handle'].notna().all()
+    assert polygons['valid'].all() and polygons['handle'].iloc[0] == lines.set_index('dxf_type').loc['LWPOLYLINE', 'handle']
+    by_raw = texts.set_index('text_raw')
+    assert by_raw.loc[r'{\fSimSun|b0;03-03-02}\P', 'text_clean'] == '03-03-02'
+    assert by_raw.loc['Ｒ２＋Ｃ１', 'text_clean'] == 'R2+C1' and by_raw.loc['C1', 'anchor'] == 'align'
+    assert by_raw.loc['C1'].geometry.x == pytest.approx(38_500_060)
+    attribs = texts[texts['dxf_type'] == 'ATTRIB']
+    assert sorted(attribs['text_clean']) == ['03-01', '03-02'] and set(attribs['tag']) == {'BH'}
+    assert set(attribs['block']) == {'地块标签'} and attribs['source_handle'].notna().all()
+    assert sorted(json.loads(a)['BH'] for a in blocks['attributes']) == ['03-01', '03-02']
+    assert manifest['warnings'] == []  # R2018 carries real handles
+
+
+def test_extract_flattens_arcs_within_tolerance(tmp_path):
+    source = plan_drawing(tmp_path/'plan.dxf')
+    for tolerance in (0.05, 0.5):
+        extract(source, tmp_path/f'out{tolerance}', '--units', 'm', '--layers', '地块界线', '--arc-tolerance', tolerance)
+        ring = layer(tmp_path/f'out{tolerance}', 'closed_polygons').geometry.iloc[0].exterior
+        centre = (38_500_100, 2_490_050)
+        arc = [p for p in ring.coords if p[0] > 38_500_100 + 1e-6]
+        assert arc, 'the bulge side bows outwards'
+        mids = [((a[0]+b[0])/2, (a[1]+b[1])/2) for a, b in zip(arc, arc[1:])]
+        assert max(50 - math.hypot(x-centre[0], y-centre[1]) for x, y in mids) <= tolerance + 1e-9
+    assert len(layer(tmp_path/'out0.05', 'lines').geometry.iloc[0].coords) > len(layer(tmp_path/'out0.5', 'lines').geometry.iloc[0].coords)
+
+
+def test_extract_explodes_blocks_on_request(tmp_path):
+    source = plan_drawing(tmp_path/'plan.dxf')
+    manifest = extract(source, tmp_path/'out', '--units', 'm', '--layers', '地块编号', '--include-blocks')
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 0, 'texts': 3, 'blocks': 0}
+    circles = layer(tmp_path/'out', 'lines')
+    assert set(circles['dxf_type']) == {'CIRCLE'} and set(circles['layer']) == {'地块编号'}  # layer 0 takes the reference's
+    assert circles['handle'].isna().all() and circles['source_handle'].notna().all() and set(circles['block']) == {'地块标签'}
+
+
+def test_extract_units(tmp_path):
+    mm = plan_drawing(tmp_path/'mm.dxf', units=4, scale=1000)
+    manifest = extract(mm, tmp_path/'mm', '--units', 'header', '--layers', '道路')
+    assert manifest['parameters']['scale_to_metre'] == 0.001
+    assert layer(tmp_path/'mm', 'lines').total_bounds[0] == pytest.approx(38_500_000)
+    lying = plan_drawing(tmp_path/'lying.dxf', units=4)  # says millimetres, drawn in metres
+    assert 'pass --units m' in extract(lying, tmp_path/'lying', '--units', 'header', success=False)
+    assert extract(lying, tmp_path/'forced', '--units', 'm')['parameters']['units_basis'] == '--units m'
+    unitless = plan_drawing(tmp_path/'none.dxf', units=0)
+    assert 'unitless' in extract(unitless, tmp_path/'none', '--units', 'header', success=False)
+
+
+def test_extract_refuses_z_unless_dropped(tmp_path):
+    source = plan_drawing(tmp_path/'z.dxf', z=12.5)
+    assert 'non-zero Z' in extract(source, tmp_path/'a', '--units', 'm', success=False)
+    manifest = extract(source, tmp_path/'b', '--units', 'm', '--drop-z')
+    assert manifest['z']['features'] == 2 and manifest['z']['dropped'] and manifest['z']['max'] == 12.5
+    assert not layer(tmp_path/'b', 'lines').has_z.any()
+
+
+def test_extract_refusals_and_r12_handles(tmp_path):
+    source = dxf(tmp_path/'site.dxf', site(39_500_000, 3_400_000))
+    message = extract(source, tmp_path/'a', '--units', 'm', '--layers', '不存在', success=False)
+    assert 'No model-space entities on layers 不存在' in message and '道路' in message
+    assert 'needs ezdxf' in extract(source, tmp_path/'b', '--units', 'm', success=False, ezdxf=False)
+    manifest = extract(source, tmp_path/'c', '--units', 'm')
+    assert any('handles' in w for w in manifest['warnings'])
+    assert 'new directory' in extract(source, tmp_path/'c', '--units', 'm', success=False)
+    assert not (tmp_path/'a').exists() and not (tmp_path/'b').exists()
+
+
+def test_extract_then_assign_crs(tmp_path):
+    source = plan_drawing(tmp_path/'plan.dxf')
+    inspect(source, tmp_path/'inspect')
+    extract(source, tmp_path/'raw', '--units', 'header')
+    manifest = assign(tmp_path/'raw'/'raw.gpkg', tmp_path/'crs', '--layer', 'closed_polygons', '--inspection', tmp_path/'inspect',
+                      '--crs', 'EPSG:4526', *CONFIRM)
+    assert manifest['crs']['id'] == 'EPSG:4526' and manifest['input']['layer'] == 'closed_polygons'

@@ -1,4 +1,4 @@
-# CAD 图纸清点、候选 CRS 与赋值
+# CAD 图纸：清点、提取与赋 CRS
 
 `cad.py inspect` 在把 DXF 当 GIS 数据用之前先看清楚它：有哪些图层、各层是什么实体、文字写了什么、图纸单位、范围里有没有离群的图框，以及坐标量级对得上哪些投影坐标系。结果发布到一个新目录。这里只清点，不写几何，也不给数据赋 CRS。
 
@@ -52,13 +52,38 @@ python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad
 
 输出目录必须是新的。
 
-## 确认后赋 CRS
+## 实体提取
 
-`cad.py assign-crs` 给由这张图纸转出、还没有 CRS 的图层打上已确认的 CRS。只改坐标系标签，不动坐标。`convert.py --crs` 是重投影，不能用来做这件事。
+`cad.py extract` 把选定图层的模型空间实体写成 `raw.gpkg`，每个要素都带 `layer` 和 `handle`，后续步骤可以追溯到原图实体。需要 ezdxf。
 
 ```bash
-python convert.py 法图.dxf --output /work/cad/fatu.gpkg
-python cad.py assign-crs /work/cad/fatu.gpkg --inspection /work/cad/fatu-inspect --crs EPSG:4547 \
+python cad.py extract 法图.dxf --layers 地块界线,地块编号,用地代码 --units header --output /work/cad/fatu-raw
+python cad.py extract 建筑.dxf --units mm --arc-tolerance 0.02 --include-blocks --output /work/cad/building-raw
+```
+
+- **图层**：`--layers` 逗号分隔；不给时取所有有模型空间实体的图层。所列图层在模型空间里没有实体时报错，并列出有实体的图层。图纸空间实体不提取，数量写进清单。
+- **单位**：`--units` 必填。
+  - `m`、`mm`：按所给单位处理。
+  - `header`：按 `$INSUNITS` 换算成米。`$INSUNITS` 为无单位或缺失时拒绝；声明为毫米等、坐标却已符合米制坐标网时也拒绝，提示改用 `--units m`。
+  - 换算系数和依据写进清单。只做缩放，不移动坐标，也不设 CRS。
+- **曲线**：`LINE`、`LWPOLYLINE`、`POLYLINE`、`ARC`、`CIRCLE`、`ELLIPSE`、`SPLINE` 以及多段线的凸度，按 `--arc-tolerance`（弦到曲线的最大距离，单位米，默认 0.05）离散。
+- **图层 `lines`**：上述所有曲线，字段 `layer`、`dxf_type`、`handle`、`closed`、`block`、`source_handle`。
+- **图层 `closed_polygons`**：闭合的 `LWPOLYLINE` / `POLYLINE` 同时生成面，字段同上，另加 `valid`。无效的面照原样保留、标为 `valid = false`，不修复；不足 3 个顶点的计入 `skipped`。
+- **图层 `texts`**：`TEXT`、`MTEXT`、块属性 `ATTRIB` 生成点，字段 `text_raw`、`text_clean`（清洗规则同 inspect）、`layer`、`dxf_type`、`tag`（块属性的标签）、`height`（米）、`rotation`（度）、`anchor`、`handle`、`block`、`source_handle`。设了对齐方式的 TEXT 取对齐点（`anchor = align`），其余取插入点。
+- **图块**：
+  - 默认不炸开：图块引用写入 `blocks` 图层（插入点、块名、旋转、缩放，`attributes` 为标签到取值的 JSON），块属性另写入 `texts`。
+  - `--include-blocks` 炸开图块（含嵌套，最多 16 层）：块内实体按类型写入各图层，`handle` 为空，`source_handle` 为最外层图块引用的句柄，`block` 记录块名路径；块内 0 层的实体沿用图块引用的图层，与 CAD 的显示规则一致。
+- **Z 值**：任何坐标的 Z 不为 0 时拒绝；加 `--drop-z` 才压平成二维，清单记录受影响的要素数和 Z 值范围。
+- **句柄**：R12 图纸可能不带实体句柄，此时句柄是 ezdxf 读取时分配的，在 CAD 里查不到，清单会给出警告。
+- **其他实体**：`HATCH`、`POINT`、`DIMENSION`、`LEADER` 等不提取，按类型计入 `skipped`。
+- **输出**：新目录，含 `raw.gpkg`（四个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
+
+## 确认后赋 CRS
+
+`cad.py assign-crs` 给由这张图纸提取（`cad.py extract`）或转出（`convert.py`）、还没有 CRS 的图层打上已确认的 CRS。只改坐标系标签，不动坐标。`convert.py --crs` 是重投影，不能用来做这件事。
+
+```bash
+python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --inspection /work/cad/fatu-inspect --crs EPSG:4547 \
   --confirmed-by 张三 --basis "与前海范围图层比对重叠，叠加道路中线核对无系统偏移" --output /work/cad/fatu-crs
 ```
 
