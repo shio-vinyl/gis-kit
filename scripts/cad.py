@@ -12,6 +12,10 @@ the zone prefix are held: they may equally be a local grid, so no EPSG code is l
 CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
 Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
 Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
+
+`cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
+confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
+(or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
 """
 from __future__ import annotations
 
@@ -570,6 +574,100 @@ def inspect(args):
     return report
 
 
+def load_inspection(path):
+    path = Path(path)
+    path = path / 'cad.json' if path.is_dir() else path
+    report = json.loads(path.read_text(encoding='utf-8'))
+    if report.get('report') != 'cad-inventory' or report.get('schema_version') != 1:
+        raise ValueError(f'--inspection is not a cad.py inspect report (cad.json v1): {path}')
+    return path, report
+
+
+def assign_crs(args):
+    """Label a CRS-less layer converted from an inspected drawing with a confirmed CRS; coordinates are not touched."""
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    from _safe_io import write_vector_atomic
+    for flag, value in (('--confirmed-by', args.confirmed_by), ('--basis', args.basis)):
+        if not value or not value.strip():
+            raise ValueError(f'{flag} is required and must not be blank')
+    crs = CRS.from_user_input(args.crs)
+    unit = crs.axis_info[0].unit_name if crs.axis_info else None
+    if not crs.is_projected or unit != 'metre':
+        raise ValueError(f'--crs must be a projected CRS in metres; got {crs.name}')
+    authority = crs.to_authority(min_confidence=70)
+    code = ':'.join(authority) if authority else None
+    inspection_path, inspection = load_inspection(args.inspection)
+
+    source = Path(args.source)
+    layers = [name for name, _ in pyogrio.list_layers(source)]
+    layer = args.layer or (layers[0] if len(layers) == 1 else None)
+    if layer is None:
+        raise ValueError(f'{source} has {len(layers)} layers ({", ".join(layers)}); pass --layer')
+    info = pyogrio.read_info(source, layer=layer, force_total_bounds=True)
+    if info.get('crs') is not None:
+        raise ValueError(f'{source} already has a CRS ({info["crs"]}); assigning would relabel it, reproject instead')
+    bounds = [float(v) for v in info['total_bounds']]
+    full = inspection['extent']['full']
+    slack = 1e-9*max(abs(v) for v in full) + 1e-6
+    if not (full[0]-slack <= bounds[0] and full[1]-slack <= bounds[1] and bounds[2] <= full[2]+slack and bounds[3] <= full[3]+slack):
+        raise ValueError(f'{source} extent {bounds} lies outside the inspected drawing\'s model-space extent {full}; '
+                         'it is not this drawing as drawn (paper-space features, scaled or moved coordinates?)')
+
+    readings = inspection['crs']['readings']
+    as_drawn = {c['crs'] for r in readings if r['scale_to_metre'] == 1.0 for m in r['matches'] for c in m['candidates']}
+    scaled = {c['crs'] for r in readings if r['scale_to_metre'] != 1.0 for m in r['matches'] for c in m['candidates']}
+    if code in scaled and code not in as_drawn:
+        raise ValueError(f'{code} fits the drawing only after unit scaling; convert the units before assigning')
+    outside = code not in as_drawn
+    if outside and not args.outside_candidates:
+        raise ValueError(f'{code or crs.name} is not among the inspection candidates as drawn '
+                         f'({", ".join(sorted(as_drawn)) or "none"}); pass --outside-candidates to assign it anyway')
+
+    check_vector(source, layer)
+    frame = pyogrio.read_dataframe(source, layer=layer)
+    labelled = frame.set_crs(crs)
+    stat = source.stat()
+    with bundle(args.output) as stage:
+        target = stage / f'{source.stem}.gpkg'
+        evidence = write_vector_atomic(labelled, target)
+        back = pyogrio.read_dataframe(target)
+        same_geometry = bool(len(back) == len(frame) and
+                             (shapely.to_wkb(back.geometry.to_numpy()) == shapely.to_wkb(frame.geometry.to_numpy())).all())
+        if not same_geometry:
+            raise ValueError('Readback geometry differs from the input; nothing was published')
+        try:
+            pd.testing.assert_frame_equal(back.drop(columns=back.geometry.name).reset_index(drop=True),
+                                          frame.drop(columns=frame.geometry.name).reset_index(drop=True), check_dtype=False)
+        except AssertionError as error:
+            raise ValueError(f'Readback attributes differ from the input; nothing was published ({error})') from error
+        if not CRS.from_user_input(back.crs).equals(crs):
+            raise ValueError('Readback CRS differs from --crs; nothing was published')
+        manifest = {'manifest': 'crs-assignment', 'schema_version': 1,
+                    'input': {'name': source.name, 'layer': layer, 'sha256': digest(source) if source.is_file() else None,
+                              'bytes': stat.st_size, 'features': len(frame), 'bounds': [round(v, 3) for v in bounds]},
+                    'crs': {'id': code, 'name': crs.name, 'datum': crs.datum.name if crs.datum else None},
+                    'confirmed_by': args.confirmed_by.strip(), 'basis': args.basis.strip(),
+                    'confirmed_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'inspection': {'path': str(inspection_path.absolute()), 'sha256': digest(inspection_path),
+                                   'drawing': inspection['source']['name'], 'drawing_sha256': inspection['source']['sha256'],
+                                   'crs_status': inspection['crs']['status'], 'candidates_as_drawn': sorted(as_drawn)},
+                    'outside_candidates': outside,
+                    'checks': {'features': evidence['features'], 'geometry_wkb_identical': True, 'attributes_identical': True,
+                               'crs_readback': code or crs.name},
+                    'output': {'path': target.name, 'sha256': digest(target)}}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad assign-crs', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256']},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Only the CRS label changes; geometry WKB and attributes are compared on readback',
+                                                            'The confirmation and its basis are the user\'s; the tool does not verify them']})
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -581,8 +679,23 @@ def main():
     sub.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936 for Chinese drawings without one')
     sub.add_argument('--reference', help='Layer in a known projected CRS (metres) covering the same area; extents are compared')
     sub.add_argument('--reference-layer', help='Layer name within --reference')
+    assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
+    assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
+    assign.add_argument('--layer', help='Layer within source; required when it has several')
+    assign.add_argument('--inspection', required=True, help='cad.json (or its directory) from cad.py inspect of the drawing')
+    assign.add_argument('--crs', required=True, help='Projected CRS in metres, e.g. EPSG:4547')
+    assign.add_argument('--confirmed-by', required=True, help='Who confirmed the CRS')
+    assign.add_argument('--basis', required=True, help='What the confirmation rests on, e.g. provider statement, control-point check')
+    assign.add_argument('--outside-candidates', action='store_true', help='Allow a CRS the inspection did not list; recorded')
+    assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
     args = parser.parse_args()
     try:
+        if args.command == 'assign-crs':
+            manifest = assign_crs(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'crs': manifest['crs']['id'],
+                              'features': manifest['checks']['features'], 'outside_candidates': manifest['outside_candidates']},
+                             ensure_ascii=False))
+            return
         if args.near_km <= 0:
             raise ValueError('--near-km must be positive')
         report = inspect(args)

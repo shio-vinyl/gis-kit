@@ -1,4 +1,4 @@
-# CAD 图纸清点与候选 CRS
+# CAD 图纸清点、候选 CRS 与赋值
 
 `cad.py inspect` 在把 DXF 当 GIS 数据用之前先看清楚它：有哪些图层、各层是什么实体、文字写了什么、图纸单位、范围里有没有离群的图框，以及坐标量级对得上哪些投影坐标系。结果发布到一个新目录。这里只清点，不写几何，也不给数据赋 CRS。
 
@@ -50,4 +50,24 @@ python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad
 - `check.png`：按图层着色（前 12 层，其余为灰色），有离群实体时左侧加一幅全图，用虚线框标出主体范围。坐标轴为图纸单位。
 - `record.json`：参数、输入 SHA-256、输出文件摘要与假设。
 
-输出目录必须是新的。确认 CRS 后，用 `convert.py` 转成 GPKG 时坐标系仍为空；赋 CRS 另行处理，不能用 `--crs` 代替，`--crs` 是重投影。
+输出目录必须是新的。
+
+## 确认后赋 CRS
+
+`cad.py assign-crs` 给由这张图纸转出、还没有 CRS 的图层打上已确认的 CRS。只改坐标系标签，不动坐标。`convert.py --crs` 是重投影，不能用来做这件事。
+
+```bash
+python convert.py 法图.dxf --output /work/cad/fatu.gpkg
+python cad.py assign-crs /work/cad/fatu.gpkg --inspection /work/cad/fatu-inspect --crs EPSG:4547 \
+  --confirmed-by 张三 --basis "与前海范围图层比对重叠，叠加道路中线核对无系统偏移" --output /work/cad/fatu-crs
+```
+
+- **确认**：`--confirmed-by`（谁确认的）和 `--basis`（依据什么确认的）必填，不能为空。程序只照实记录，不核实依据本身。
+- **前置体检**：`--inspection` 指向这张图纸的 `cad.json`（或其所在目录）。
+  - 输入图层的范围必须落在体检时的模型空间范围内；带图纸空间要素、或者坐标被缩放过、平移过的图层会被拒绝。
+  - `--crs` 必须在体检时按原坐标（`scale_to_metre` 为 1）列出的候选里。不在时报错，加 `--outside-candidates` 才执行，并在清单里记下 `outside_candidates: true`。
+  - 只在按 `$INSUNITS` 换算后才对得上的坐标系（例如毫米图纸），加了 `--outside-candidates` 也拒绝：坐标要先换算成米，这一步还不能代劳。
+- **输入**：单个矢量图层，多图层时用 `--layer` 指定。已有 CRS 的图层拒绝，要换坐标系应当重投影。
+- **CRS**：必须是以米为单位的投影坐标系。
+- **回读核对**：写出 `<输入名>.gpkg` 后重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一项不一致都不发布。输入文件不改动。
+- **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、图层、SHA-256、要素数与范围，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`，`checks`，输出的 SHA-256）和 `record.json`。

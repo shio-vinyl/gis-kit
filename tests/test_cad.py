@@ -10,6 +10,7 @@ import sys
 import geopandas as gpd
 import pyogrio
 import pytest
+import shapely
 from shapely.geometry import LineString, Point, Polygon, box
 
 SCRIPTS = Path(__file__).resolve().parents[1]/'scripts'
@@ -252,3 +253,62 @@ def test_reference_must_be_projected_in_metres(tmp_path):
     ref = reference(tmp_path/'lonlat.gpkg', 'EPSG:4326', (113.8, 22.4, 114.0, 22.6))
     assert 'projected CRS in metres' in inspect(source, tmp_path/'out', '--reference', ref, success=False)
     assert not (tmp_path/'out').exists()
+
+
+def assign(source, out, *extra, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'assign-crs', str(source), '--output', str(out), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def converted(tmp_path, entities, name='drawing', **options):
+    """A drawing, its inspection and its CRS-less GPKG made by convert.py."""
+    source = dxf(tmp_path/f'{name}.dxf', entities, **options)
+    inspect(source, tmp_path/f'{name}-inspect')
+    gpkg = tmp_path/f'{name}.gpkg'
+    run = subprocess.run([sys.executable, str(SCRIPTS/'convert.py'), str(source), '--output', str(gpkg)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout+run.stderr
+    return gpkg, tmp_path/f'{name}-inspect'
+
+
+CONFIRM = ('--confirmed-by', '张三', '--basis', '数据提供方书面说明为 CGCS2000 3 度带 39 带')
+
+
+def test_assign_crs_labels_without_touching_coordinates(tmp_path):
+    gpkg, inspection = converted(tmp_path, site(39_500_000, 3_400_000))
+    before = gpd.read_file(gpkg)
+    assert before.crs is None
+    manifest = assign(gpkg, tmp_path/'out', '--inspection', inspection, '--crs', 'EPSG:4527', *CONFIRM)
+    after = gpd.read_file(tmp_path/'out'/'drawing.gpkg')
+    assert after.crs.to_epsg() == 4527 and len(after) == len(before)
+    assert list(shapely.to_wkb(after.geometry.to_numpy())) == list(shapely.to_wkb(before.geometry.to_numpy()))
+    assert manifest['confirmed_by'] == '张三' and manifest['basis'].startswith('数据提供方')
+    assert manifest['crs'] == {'id': 'EPSG:4527', 'name': 'CGCS2000 / 3-degree Gauss-Kruger zone 39', 'datum': 'China 2000'}
+    assert manifest['outside_candidates'] is False and manifest['checks']['geometry_wkb_identical'] is True
+    assert manifest['inspection']['drawing'] == 'drawing.dxf' and manifest['input']['sha256']
+    assert gpd.read_file(gpkg).crs is None  # the input is not modified
+
+
+def test_assign_crs_refusals(tmp_path):
+    gpkg, inspection = converted(tmp_path, site(39_500_000, 3_400_000))
+    base = ('--inspection', inspection)
+    assert 'must not be blank' in assign(gpkg, tmp_path/'a', *base, '--crs', 'EPSG:4527', '--confirmed-by', ' ', '--basis', 'x', success=False)
+    assert 'not among the inspection candidates' in assign(gpkg, tmp_path/'b', *base, '--crs', 'EPSG:4547', *CONFIRM, success=False)
+    assert 'projected CRS in metres' in assign(gpkg, tmp_path/'c', *base, '--crs', 'EPSG:4490', *CONFIRM, success=False)
+    outside = assign(gpkg, tmp_path/'d', *base, '--crs', 'EPSG:4547', *CONFIRM, '--outside-candidates')
+    assert outside['outside_candidates'] is True and outside['inspection']['candidates_as_drawn'][0] == 'EPSG:2363'
+    labelled = tmp_path/'d'/'drawing.gpkg'
+    assert 'already has a CRS' in assign(labelled, tmp_path/'e', *base, '--crs', 'EPSG:4527', *CONFIRM, success=False)
+    moved = tmp_path/'moved.gpkg'
+    frame = gpd.read_file(gpkg)
+    frame.set_geometry(frame.translate(5000, 0)).to_file(moved)
+    assert 'outside the inspected drawing' in assign(moved, tmp_path/'f', *base, '--crs', 'EPSG:4527', *CONFIRM, success=False)
+    assert 'new directory' in assign(gpkg, tmp_path/'d', *base, '--crs', 'EPSG:4527', *CONFIRM, success=False)
+    assert not any((tmp_path/name).exists() for name in 'abcef')
+
+
+def test_assign_crs_refuses_a_candidate_that_needs_unit_scaling(tmp_path):
+    gpkg, inspection = converted(tmp_path, site(39_500_000_000, 3_400_000_000, step=1000), name='mm', units=4)
+    message = assign(gpkg, tmp_path/'out', '--inspection', inspection, '--crs', 'EPSG:4527', *CONFIRM, '--outside-candidates', success=False)
+    assert 'only after unit scaling' in message and not (tmp_path/'out').exists()
