@@ -1,4 +1,4 @@
-# CAD 图纸：转换、清点、提取、围面、挂接与赋 CRS
+# CAD 图纸：转换、清点、提取、围面、挂接、赋 CRS 与叠图质检
 
 ## DWG 转 DXF
 
@@ -265,3 +265,20 @@ python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --i
 - **CRS**：必须是以米为单位的投影坐标系。
 - **回读核对**：写出 `<输入名>.gpkg` 后逐层重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一层有一项不一致，整个结果都不发布。输入文件不会被改动。
 - **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、SHA-256 与图层列表，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`，`checks`（逐层的要素数、范围和回读核对结果），输出的 SHA-256）和 `record.json`。
+
+## 叠图质检
+
+`cad.py overlay` 把已有 CRS 的地块（`xiangyuan`、`label` 的 `parcels`，或 `polygonize` 的 `faces`）和参考图层（已供地、更新范围、旧规划、行政边界等）叠在一张检查图里，并量出地块和每个参考面的交集。
+
+```bash
+python cad.py overlay /work/cad/fatu-crs/parcels.gpkg --exclude-hold \
+  --reference /work/data/前海.gdb:国有已供用地 --reference /work/data/更新范围.shp \
+  --reference /work/cad/fatu-crs/parcels.gpkg:units --output /work/cad/fatu-overlay
+```
+
+- **地块**：`--parcels-layer`（默认 `parcels`）必须是面，必须有以米为单位的投影 CRS；没有 CRS 时报错，先用 `assign-crs` 或[矢量控制点转换](vector-georeferencing.md)。
+- **参考**：`--reference PATH[:LAYER]` 可重复；文件只有一个图层时可以不写图层名。参考必须有 CRS，和地块不同时先换算范围、读进来后重投影到地块的 CRS；带 Z 的去掉 Z。只读地块范围向外扩 10%（以长边计）以内的要素。图例名用图层名，没写图层时用文件名，重名加 `#2`。
+- **交集**：只算面参考。每一对相交的地块和参考面写进 `overlay.gpkg` 的 `intersections` 层：`parcel_fid`、地块的 `parcel_id` / `landuse` / `control_type` / `status`（有则带上）、`reference`、`reference_fid`、`area_m2`、`parcel_share`（占地块面积的比例）、`reference_share`（占参考面的比例），几何为交集面。面积在地块 CRS 的平面上计算。线、点参考只出图并计数。
+- **不修复**：无效的地块和参考面照样出图，在清单里列出 fid，但不参与计算；不做 `make_valid`。
+- **hold 与 QA**：`status` 为 `hold` 的地块用橙色粗边标出，不填色。默认计入统计；图框之类被标成 hold 的大面会撑大视图、歪曲比例，这时加 `--exclude-hold`，hold 地块照画、照列，但不参与交集和视图范围。同一文件里名字以 `qa_` 开头的层和 `label_conflicts` 默认画成红色（点为叉）；`--qa-layers a,b` 指定别的层，传空字符串不画。
+- **输出**：新目录，含 `overlay.gpkg`、`check.png`、`manifest.json`（`manifest: cad-overlay` v1：输入名称、图层、SHA-256、要素数、参与计算的数量和面积、无效 fid，`crs`，视图范围与外扩比例，逐个参考的路径、图层、读入要素数、几何类型、CRS、是否重投影、是否去掉 Z、无效 fid、碰到的地块数、交集面积（同一参考内按并集计，不重复计）和占参与计算地块面积的比例，hold 的数量、fid 与编号，QA 层要素数，交集条数，输出的 SHA-256）和 `record.json`。

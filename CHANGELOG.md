@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 新子命令 `cad.py overlay`（需求 R10）：把有投影 CRS 的地块和参考图层叠在一张检查图里，hold 地块橙色描边、`qa_*` 与 `label_conflicts` 层红色标出；参考按地块范围外扩 10% 读入并重投影，地块与每个参考面的交集写进 `overlay.gpkg`（面积、占地块比例、占参考比例），清单 `cad-overlay` v1 按参考汇总碰到的地块数与交集面积。无效面只列出不修复；`--exclude-hold` 让 hold 地块不参与统计和视图范围。`gis.py capabilities` 的 `contracts` 一并声明 `cad-overlay`。说明见 `references/cad-intake.md`。
 - `gis.py capabilities` 的 `contracts` 声明新增的运行清单（`cad-inventory`、`cad-convert`、`cad-extract`、`cad-polygonize`、`cad-label`、`cad-xiangyuan`、`crs-assignment`、`vector-transform`、`vector-georef-apply`、`esri-package`，均为 v1）。README 补充 CAD 规划图纸、ArcGIS 包与按编号挂接的介绍。
 - `cad.py xiangyuan` 细化：数值字段转成数值（解析不了的整列保留文本并警告），可用 `--schema` 补充字段与数值清单；其他插件的 XDATA 归入 `other_xdata`；同一应用有多个 1000 组码时取最后一个（只统计地块）；`_T` 填充与地块配对核对；配套设施按 `地块编号` 核对是否落在对应地块（含距离）；模型空间有未炸开的 `LZX_LAND` 时报错；报告块定义里的地块属性副本；清单记下单位依据与警告。
 - `cad.py assign-crs` 默认给输入文件的全部图层赋 CRS，图层名不变（`--layer` 只处理一个）；每层都核对范围、回读 WKB、属性与 CRS。清单 `input.layers` 为图层列表，`checks` 按图层给出。

@@ -927,3 +927,92 @@ def test_xiangyuan_refusals(tmp_path):
     plain = dxf(tmp_path/'plain.dxf', site(0, 0))
     assert 'does not look like a 湘源控规 drawing' in xiangyuan(plain, tmp_path/'b', '--units', 'm', success=False)
     assert 'convert DWG first' in xiangyuan(tmp_path/'plan.dwg', tmp_path/'c', '--units', 'm', success=False)
+
+
+def overlay(source, out, *extra, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'overlay', str(source), '--output', str(out), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+X, Y = 500_000, 2_500_000
+
+
+def overlay_inputs(tmp_path):
+    """Parcels in EPSG:4547 (one hold, one self-crossing) with QA layers, and four references."""
+    parcels = tmp_path/'parcels.gpkg'
+    bowtie = Polygon([(X+200, Y), (X+300, Y+100), (X+300, Y), (X+200, Y+100)])
+    gpd.GeoDataFrame({'parcel_id': ['01-01', '01-02', '01-03'], 'landuse': ['R2', 'C1', 'G1'], 'status': ['pass', 'hold', 'pass']},
+                     geometry=[box(X, Y, X+100, Y+100), box(X+100, Y, X+200, Y+100), bowtie], crs='EPSG:4547').to_file(parcels, layer='parcels')
+    gpd.GeoDataFrame({'kind': ['gap']}, geometry=[LineString([(X+10, Y+10), (X+12, Y+10)])], crs='EPSG:4547').to_file(parcels, layer='qa_gaps')
+    gpd.GeoDataFrame({'kind': ['number-block-outside', 'number-block-outside']}, geometry=[Point(X+50, Y+50), Point(X+150, Y+50)],
+                     crs='EPSG:4547').to_file(parcels, layer='qa_number_blocks')
+    gpd.GeoDataFrame({'name': ['设施']}, geometry=[Point(X+5, Y+5)], crs='EPSG:4547').to_file(parcels, layer='facilities')
+    supplied = tmp_path/'supplied.gpkg'
+    gpd.GeoDataFrame({'宗地号': ['T1']}, geometry=[box(X+50, Y, X+150, Y+100)], crs='EPSG:4547').to_crs('EPSG:4490').to_file(supplied, layer='已供地')
+    renewal = tmp_path/'renewal.shp'
+    gpd.GeoDataFrame({'name': ['更新']}, geometry=[Polygon([(X, Y, 10), (X+50, Y, 10), (X+50, Y+50, 10), (X, Y+50, 10)])],
+                     crs='EPSG:4547').to_file(renewal)
+    broken = tmp_path/'broken.gpkg'
+    gpd.GeoDataFrame({'n': [1, 2, 3]}, geometry=[Polygon([(X, Y), (X+100, Y+100), (X+100, Y), (X, Y+100)]), box(X+60, Y+60, X+80, Y+80),
+                                                  box(X+5000, Y+5000, X+5100, Y+5100)], crs='EPSG:4547').to_file(broken, layer='plan')
+    roads = tmp_path/'roads.gpkg'
+    gpd.GeoDataFrame({'n': [1]}, geometry=[LineString([(X-20, Y+100), (X+320, Y+100)])], crs='EPSG:4547').to_file(roads, layer='roads')
+    gpd.GeoDataFrame({'n': [1]}, geometry=[Point(X, Y)], crs='EPSG:4547').to_file(roads, layer='points')
+    return parcels, ['--reference', f'{supplied}:已供地', '--reference', renewal, '--reference', f'{broken}:plan',
+                     '--reference', f'{roads}:roads']
+
+
+def test_overlay_measures_intersections_and_plots(tmp_path):
+    parcels, references = overlay_inputs(tmp_path)
+    manifest = overlay(parcels, tmp_path/'out', *references)
+    assert manifest['crs'] == 'EPSG:4547' and manifest['input']['invalid_fids'] == [3]
+    assert manifest['input']['measured_area_m2'] == pytest.approx(20000)
+    assert manifest['hold'] == {'count': 1, 'measured': True, 'parcel_fids': [2], 'parcel_ids': ['01-02']}
+    assert manifest['qa'] == {'qa_gaps': 1, 'qa_number_blocks': 2}
+    refs = {r['label']: r for r in manifest['references']}
+    assert list(refs) == ['已供地', 'renewal', 'plan', 'roads']
+    supplied = refs['已供地']
+    assert supplied['reprojected'] and supplied['crs'] == 'EPSG:4490' and not supplied['dropped_z']
+    assert supplied['parcels_touched'] == 2 and supplied['intersection_area_m2'] == pytest.approx(10000, rel=1e-6)
+    assert supplied['share_of_parcels'] == pytest.approx(0.5, rel=1e-6)
+    assert refs['renewal']['dropped_z'] and not refs['renewal']['reprojected'] and refs['renewal']['intersection_area_m2'] == pytest.approx(2500)
+    plan = refs['plan']
+    assert plan['features'] == 2 and plan['invalid_fids'] == [1] and plan['intersection_area_m2'] == pytest.approx(400)  # third is outside the view
+    assert refs['roads']['geometry_types'] == ['LineString'] and refs['roads']['parcels_touched'] == 0
+    pieces = gpd.read_file(tmp_path/'out'/'overlay.gpkg', layer='intersections')
+    assert len(pieces) == manifest['intersections'] == 4 and pieces.crs.to_epsg() == 4547
+    row = pieces[(pieces['reference'] == '已供地') & (pieces['parcel_id'] == '01-01')].iloc[0]
+    assert row['parcel_fid'] == 1 and row['reference_fid'] == 1 and row['landuse'] == 'R2' and row['status'] == 'pass'
+    assert row['area_m2'] == pytest.approx(5000, rel=1e-6) and row['parcel_share'] == pytest.approx(0.5, rel=1e-6)
+    assert row['reference_share'] == pytest.approx(0.5, rel=1e-6) and row.geometry.geom_type == 'MultiPolygon'
+    assert (tmp_path/'out'/'check.png').stat().st_size > 0
+    record = json.loads((tmp_path/'out'/'record.json').read_text())
+    assert record['tool'] == 'cad overlay' and set(record['files']) == {'manifest.json', 'overlay.gpkg', 'check.png'}
+
+
+def test_overlay_exclude_hold_and_qa_layers(tmp_path):
+    parcels, references = overlay_inputs(tmp_path)
+    manifest = overlay(parcels, tmp_path/'out', *references[:2], '--exclude-hold', '--qa-layers', 'qa_gaps,facilities')
+    assert manifest['input']['measured'] == 2 and manifest['input']['measured_area_m2'] == pytest.approx(10000)
+    assert manifest['hold']['measured'] is False and manifest['qa'] == {'qa_gaps': 1, 'facilities': 1}
+    assert manifest['references'][0]['parcels_touched'] == 1 and manifest['references'][0]['share_of_parcels'] == pytest.approx(0.5, rel=1e-6)
+    assert manifest['view'] == pytest.approx([X-30, Y-30, X+330, Y+130])  # the hold parcel still sits inside the measured extent
+    assert overlay(parcels, tmp_path/'none', *references[:2], '--qa-layers', '')['qa'] == {}
+    assert 'no QA layer missing' in overlay(parcels, tmp_path/'x', *references[:2], '--qa-layers', 'missing', success=False)
+
+
+def test_overlay_refusals(tmp_path):
+    parcels, references = overlay_inputs(tmp_path)
+    loose = tmp_path/'loose.gpkg'
+    gpd.GeoDataFrame({'n': [1]}, geometry=[box(X, Y, X+10, Y+10)]).to_file(loose, layer='parcels')
+    assert 'has no CRS; run cad.py assign-crs' in overlay(loose, tmp_path/'a', *references, success=False)
+    geographic = tmp_path/'geographic.gpkg'
+    gpd.read_file(parcels, layer='parcels').to_crs('EPSG:4490').to_file(geographic, layer='parcels')
+    assert 'projected CRS in metres' in overlay(geographic, tmp_path/'b', *references, success=False)
+    assert 'has no layer faces' in overlay(parcels, tmp_path/'c', '--parcels-layer', 'faces', *references, success=False)
+    assert 'name one as' in overlay(parcels, tmp_path/'d', '--reference', tmp_path/'roads.gpkg', success=False)
+    assert 'a reference must carry one' in overlay(parcels, tmp_path/'e', '--reference', f'{loose}:parcels', success=False)
+    (tmp_path/'exists').mkdir()
+    assert 'Output must be a new directory' in overlay(parcels, tmp_path/'exists', *references, success=False)
