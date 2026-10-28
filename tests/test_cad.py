@@ -78,18 +78,22 @@ def test_zone_prefixed_grid_inventory_and_outputs(tmp_path):
     assert not list(tmp_path.glob('.delivery-*'))
 
 
-def test_unprefixed_grid_needs_near(tmp_path):
-    source = dxf(tmp_path/'hefei.dxf', site(518_900, 3_520_000))
-    held = inspect(source, tmp_path/'held')
-    assert held['crs']['status'] == 'hold' and codes(held) == []
-    assert any('--near' in note for note in held['crs']['notes'])
-    report = inspect(source, tmp_path/'near', '--near', '117.2,31.8')
-    grids = [match['grid'] for match in report['crs']['readings'][0]['matches']]
-    assert grids == ['gauss-kruger 3-degree CM 117E (no zone prefix)', 'gauss-kruger 6-degree CM 117E (no zone prefix)', 'UTM zone 50']
-    assert codes(report)[0] == 'EPSG:4548' and 'EPSG:32650' in codes(report)
-    assert all(row['distance_km'] <= 50 for match in report['crs']['readings'][0]['matches'] for row in match['candidates'])
-    far = inspect(source, tmp_path/'far', '--near', '87.6,43.8')  # Urumqi: wrong central meridian for these coordinates
-    assert codes(far) == [] and far['crs']['rejected']
+def test_unprefixed_grid_is_held_even_with_near(tmp_path):
+    source = dxf(tmp_path/'hefei.dxf', site(518_900, 3_520_000))  # CGCS2000 CM 117E without prefix, or a local grid
+    for name, extra in (('held', ()), ('near', ('--near', '117.2,31.8'))):
+        report = inspect(source, tmp_path/name, *extra)
+        assert report['crs']['status'] == 'hold' and codes(report) == [] and report['crs']['rejected'] == []
+        assert any('local grid' in note and 'no EPSG code' in note for note in report['crs']['notes'])
+
+
+def test_near_rejects_distant_candidates(tmp_path):
+    source = dxf(tmp_path/'site.dxf', site(39_500_000, 3_400_000))
+    kept = inspect(source, tmp_path/'kept', '--near', '117.2,31.0')
+    assert codes(kept)[0] == 'EPSG:4527'
+    assert all(row['distance_km'] <= 50 for match in kept['crs']['readings'][0]['matches'] for row in match['candidates'])
+    far = inspect(source, tmp_path/'far', '--near', '87.6,43.8')  # Urumqi
+    assert codes(far) == [] and far['crs']['status'] == 'hold'
+    assert {row['crs'] for row in far['crs']['rejected']} == {'EPSG:4527', 'EPSG:4775', 'EPSG:2363', 'EPSG:2415'}
 
 
 def test_millimetre_drawing_uses_header_units(tmp_path):

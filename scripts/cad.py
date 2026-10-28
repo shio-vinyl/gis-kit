@@ -3,7 +3,8 @@
 
 `cad.py inspect` reads model-space entities through GDAL (block references are expanded into their
 geometry), reads $ACADVER / $INSUNITS / $DWGCODEPAGE from the header itself, and lists projected CRS
-whose grid the coordinates fit, mainly Chinese Gauss-Kruger grids with or without the zone prefix.
+whose grid the coordinates fit, mainly zone-prefixed Chinese Gauss-Kruger grids. Coordinates without
+the zone prefix are held: they may equally be a local grid, so no EPSG code is listed for them.
 CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
 Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
 Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
@@ -77,14 +78,14 @@ def read_header(path):
 
 @lru_cache(maxsize=None)
 def gauss_kruger():
-    """EPSG Gauss-Kruger grids keyed by (width, 'zone'|'cm', number), datums in DATUMS order."""
+    """EPSG zone-prefixed Gauss-Kruger grids keyed by (width, zone), datums in DATUMS order."""
     from pyproj.database import query_crs_info
-    pattern = re.compile(r'(%s) / (3-degree )?Gauss-Kruger (?:zone (\d+)|CM (\d+)E)' % '|'.join(DATUMS))
+    pattern = re.compile(r'(%s) / (3-degree )?Gauss-Kruger zone (\d+)' % '|'.join(DATUMS))
     grids = {}
     for info in query_crs_info(auth_name='EPSG', pj_types='PROJECTED_CRS'):
         match = pattern.fullmatch(info.name)
         if match and not info.deprecated:
-            key = (3 if match[2] else 6, 'zone' if match[3] else 'cm', int(match[3] or match[4]))
+            key = (3 if match[2] else 6, int(match[3]))
             grids.setdefault(key, []).append((match[1], f'EPSG:{info.code}', info.name, info.area_of_use))
     return {key: sorted(rows, key=lambda row: DATUMS.index(row[0])) for key, rows in grids.items()}
 
@@ -134,24 +135,19 @@ def readings(x, y, scale, near, near_km):
         if kept:
             found.append({'grid': grid, 'candidates': kept})
 
-    grids = gauss_kruger()
     if scale == 1 and -180 <= x <= 180 and -90 <= y <= 90:
         consider('geographic', [(CRS(code).name, code, CRS(code).name, CRS(code).area_of_use)
                                 for code in ('EPSG:4490', 'EPSG:4326')])
-    zone, offset = divmod(e, 1e6)
-    if 0 < n < 6.5e6:
-        if 13 <= zone <= 23 or 25 <= zone <= 45:
-            width = 6 if zone <= 23 else 3
-            consider(f'gauss-kruger {width}-degree zone {int(zone)} (zone prefix)', grids.get((width, 'zone', int(zone)), []))
-        elif 0 < e < 1e6 and near is not None:
-            for width, cm in ((3, 3*round(near[0]/3)), (6, 6*math.floor(near[0]/6)+3)):
-                consider(f'gauss-kruger {width}-degree CM {cm}E (no zone prefix)', grids.get((width, 'cm', cm), []))
-            utm = math.floor((near[0]+180)/6)+1
-            code = f'EPSG:{32600+utm if near[1] >= 0 else 32700+utm}'
-            consider(f'UTM zone {utm}', [('WGS 84', code, CRS(code).name, CRS(code).area_of_use)])
-    if not found and near is not None and abs(e) <= 20037508.35 and abs(n) <= 20037508.35:
+    zone = e // 1e6
+    if 0 < n < 6.5e6 and (13 <= zone <= 23 or 25 <= zone <= 45):
+        width = 6 if zone <= 23 else 3
+        consider(f'gauss-kruger {width}-degree zone {int(zone)} (zone prefix)', gauss_kruger().get((width, int(zone)), []))
+    # Without the zone prefix a Gauss-Kruger grid, a UTM zone and a city or project local grid (Shenzhen's,
+    # for one) look alike, so no EPSG code is listed for them, --near or not.
+    bare = 0 < e < 1e6 and 0 < n < 6.5e6
+    if not found and not bare and near is not None and abs(e) <= 20037508.35 and abs(n) <= 20037508.35:
         consider('web mercator', [('WGS 84', 'EPSG:3857', 'WGS 84 / Pseudo-Mercator', None)])
-    return found, rejected, (0 < e < 1e6 and 0 < n < 6.5e6)
+    return found, rejected, bare
 
 
 def looks_misdecoded(values):
@@ -313,11 +309,10 @@ def inspect(args):
     candidates = [row for reading in tried for match in reading['matches'] for row in match['candidates']]
     notes = ['Coordinates cannot distinguish CGCS2000, New Beijing, Xian 1980 and Beijing 1954 grids; '
              'confirm the datum with the data provider or known control points']
-    if unprefixed and near is None:
-        notes.append('Coordinates fit a Gauss-Kruger grid without zone prefix (or UTM); the central meridian is unknown. '
-                     'Pass --near LON,LAT of the area the drawing covers to list candidates')
     if unprefixed:
-        notes.append('City and project local grids also look like this; check against control points before use')
+        notes.append('Coordinates look like a Gauss-Kruger grid without zone prefix, a UTM zone or a city or project '
+                     'local grid, which coordinates alone cannot tell apart; no EPSG code is listed. Compare with a '
+                     'layer in a known CRS or fit control points')
     if not candidates and not unprefixed:
         notes.append('No national grid fits; treat as a local or engineering coordinate system that needs control points')
     if declared and declared != 1.0 and any(r['matches'] for r in tried[:1]):
@@ -367,7 +362,7 @@ def main():
     sub = commands.add_parser('inspect', help='Inventory a DXF and list candidate CRS')
     sub.add_argument('source', help='DXF file')
     sub.add_argument('--output', required=True, help='New directory for cad.json, check.png and record.json')
-    sub.add_argument('--near', help='Approximate LON,LAT of the area the drawing covers; resolves grids without zone prefix')
+    sub.add_argument('--near', help='Approximate LON,LAT of the area the drawing covers; candidates farther than --near-km are rejected')
     sub.add_argument('--near-km', type=float, default=50.0, help='Keep candidates within this distance of --near (default 50)')
     sub.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936 for Chinese drawings without one')
     args = parser.parse_args()

@@ -2,7 +2,7 @@
 
 ## 未发布
 
-- 新脚本 `cad.py inspect`：清点 DXF 的图层、实体类型、文字样例、图纸单位、离群实体与图纸空间，按坐标量级与 EPSG 适用范围列出候选 CRS（中国高斯-克吕格 3/6 度带，带或不带带号；四种基准并列；无带号时用 `--near` 定中央经线），不赋 CRS。`--encoding` 处理缺代码页的中文图纸。输出 `cad.json`、`check.png`、`record.json`；DWG 拒绝并提示先转 DXF。说明见 `references/cad-intake.md`。
+- 新脚本 `cad.py inspect`：清点 DXF 的图层、实体类型、文字样例、图纸单位、离群实体与图纸空间，按坐标量级与 EPSG 适用范围列出候选 CRS（带带号的中国高斯-克吕格 3/6 度带与经纬度；四种基准并列；`--near` 剔除过远的候选）。无带号坐标与城市独立坐标分不开，一律 `hold`、不列 EPSG；不赋 CRS。`--encoding` 处理缺代码页的中文图纸。输出 `cad.json`、`check.png`、`record.json`；DWG 拒绝并提示先转 DXF。说明见 `references/cad-intake.md`。
 - `buffer.py --distances 400,800,1200`：同心圈，每个要素按距离各出一个圆面，带 `buffer_m` 与 `ring`（1 为最内圈）；`--dissolve` 时逐圈合并。供 Composer 的 `rings` 编码块画缓冲圈 / 服务范围图（Composer #8）。
 - 修复：原子写出的 GeoJSON 把随机临时文件名（`.<名>.<随机>.tmp`）写成了图层名，同样的输入每次产出不同字节；现在图层名取输出文件名，重复运行逐字节一致。
 - 新脚本 `display-vector.py`：按一张图的视角（中心、缩放、画布，Web 墨卡托 512 像素瓦片，与 Composer `inspect` 一致）概括面数据：删去几平方像素以下的部件、按半像素共边简化、陆上国界只取相邻单元的公共边、海岸取合并后的外轮廓；`--keep` 保留必须出现的小单元，`--cache` 按源标识、参数与视角缓存。发布 `areas.geojson`、`boundaries.geojson`、`coast.geojson` 与清单 `display-vector` v1，`capabilities` 声明 `contracts.display-vector`（Composer #30）。
