@@ -13,6 +13,10 @@ CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Bei
 Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
 Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
 
+`cad.py extract` writes model-space entities of chosen layers to raw.gpkg (lines, closed_polygons, texts,
+blocks) with layer and handle on every feature: curves flattened to --arc-tolerance, units scaled to metres
+by an explicit --units, non-zero Z refused unless --drop-z, no CRS. It needs ezdxf.
+
 `cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
 confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
 (or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
@@ -85,7 +89,9 @@ def read_header(path):
         extent = None
     return {'readable': bool(values), 'acadver': version, 'release': VERSIONS.get(version),
             'insunits': units, 'units': UNITS.get(units, ('unknown', None))[0] if units is not None else None,
-            'codepage': values.get('$DWGCODEPAGE', {}).get('3'), 'extent': extent}
+            'codepage': values.get('$DWGCODEPAGE', {}).get('3'), 'extent': extent,
+            # R12 may carry no entity handles ($HANDLING 0 or missing); R13 and later always do.
+            'handles': (version != 'AC1009' or values.get('$HANDLING', {}).get('70') == '1') if version else None}
 
 
 @lru_cache(maxsize=None)
@@ -574,6 +580,204 @@ def inspect(args):
     return report
 
 
+CURVES = {'LINE', 'LWPOLYLINE', 'POLYLINE', 'ARC', 'CIRCLE', 'ELLIPSE', 'SPLINE'}
+MAX_BLOCK_DEPTH = 16
+# Output layers of raw.gpkg: name -> (geometry type, fields and dtypes)
+EXTRACT_LAYERS = {
+    'lines': ('LineString', {'layer': str, 'dxf_type': str, 'handle': str, 'closed': bool, 'block': str, 'source_handle': str}),
+    'closed_polygons': ('Polygon', {'layer': str, 'dxf_type': str, 'handle': str, 'valid': bool, 'block': str, 'source_handle': str}),
+    'texts': ('Point', {'text_raw': str, 'text_clean': str, 'layer': str, 'dxf_type': str, 'tag': str, 'height': float,
+                        'rotation': float, 'anchor': str, 'handle': str, 'block': str, 'source_handle': str}),
+    'blocks': ('Point', {'layer': str, 'block': str, 'handle': str, 'rotation': float, 'xscale': float, 'yscale': float,
+                         'attributes': str}),
+}
+
+
+class Extraction:
+    """Rows per output layer, walked from model-space entities; block references are kept or exploded."""
+
+    def __init__(self, tolerance, explode):
+        from collections import Counter
+        self.tolerance, self.explode = tolerance, explode
+        self.rows = {name: [] for name in EXTRACT_LAYERS}
+        self.read, self.skipped = {}, Counter()
+
+    def text(self, entity, layer, block, source):
+        kind = entity.dxftype()
+        if kind == 'MTEXT':
+            raw, clean = entity.text, clean_text(entity.plain_text(split=False))
+            point, height, rotation, anchor = entity.dxf.insert, entity.dxf.char_height, entity.get_rotation(), 'insert'
+        else:  # TEXT and ATTRIB: aligned text is placed by its alignment point
+            raw, clean = entity.dxf.text, clean_text(entity.plain_text())
+            aligned = (entity.dxf.get('halign', 0) or entity.dxf.get('valign', 0)) and entity.dxf.hasattr('align_point')
+            point = entity.dxf.align_point if aligned else entity.dxf.insert
+            height, rotation, anchor = entity.dxf.height, entity.dxf.get('rotation', 0.0), 'align' if aligned else 'insert'
+            point = entity.ocs().to_wcs(point)
+        self.rows['texts'].append({'text_raw': raw, 'text_clean': clean, 'layer': layer, 'dxf_type': kind,
+                                   'tag': entity.dxf.tag if kind == 'ATTRIB' else None, 'height': float(height),
+                                   'rotation': float(rotation), 'anchor': anchor, 'handle': entity.dxf.get('handle'),
+                                   'block': block, 'source_handle': source, 'coords': [tuple(point)]})
+
+    def walk(self, entity, layer, block=None, source=None, depth=0):
+        from ezdxf import path
+        kind = entity.dxftype()
+        handle = entity.dxf.get('handle')
+        if kind in CURVES:
+            try:
+                points = [tuple(p) for p in path.make_path(entity).flattening(distance=self.tolerance)]
+            except (TypeError, ValueError):  # polyface meshes and degenerate curves have no 2D path
+                self.skipped[f'{kind} (no path)'] += 1
+                return
+            if len(points) < 2:
+                self.skipped[f'{kind} (degenerate)'] += 1
+                return
+            closed = (entity.closed if kind == 'LWPOLYLINE' else entity.is_closed if kind == 'POLYLINE' else False)
+            self.rows['lines'].append({'layer': layer, 'dxf_type': kind, 'handle': handle, 'closed': bool(closed),
+                                       'block': block, 'source_handle': source, 'coords': points})
+            if closed:
+                if len({p[:2] for p in points}) < 3:
+                    self.skipped[f'{kind} closed (fewer than 3 vertices)'] += 1
+                else:
+                    self.rows['closed_polygons'].append({'layer': layer, 'dxf_type': kind, 'handle': handle,
+                                                         'block': block, 'source_handle': source, 'coords': points})
+        elif kind in ('TEXT', 'MTEXT'):
+            self.text(entity, layer, block, source)
+        elif kind == 'INSERT':
+            name = entity.dxf.name
+            for attrib in entity.attribs:
+                self.text(attrib, layer, name, source or handle)
+            if not self.explode:
+                self.rows['blocks'].append({'layer': layer, 'block': name, 'handle': handle,
+                                            'rotation': float(entity.dxf.get('rotation', 0.0)),
+                                            'xscale': float(entity.dxf.get('xscale', 1.0)), 'yscale': float(entity.dxf.get('yscale', 1.0)),
+                                            'attributes': json.dumps({a.dxf.tag: a.dxf.text for a in entity.attribs}, ensure_ascii=False),
+                                            'coords': [tuple(entity.ocs().to_wcs(entity.dxf.insert))]})
+                return
+            if depth >= MAX_BLOCK_DEPTH:
+                raise ValueError(f'Block nesting deeper than {MAX_BLOCK_DEPTH} at {name}')
+            for part in entity.virtual_entities():
+                # Entities on layer 0 inside a block take the reference's layer, as in CAD.
+                own = part.dxf.get('layer', '0')
+                self.walk(part, layer if own == '0' else own, f'{block}/{name}' if block else name, source or handle, depth+1)
+        else:
+            self.skipped[kind] += 1
+
+
+def extract(args):
+    """Model-space entities of chosen layers to raw.gpkg (lines, closed_polygons, texts, blocks), in metres, no CRS."""
+    import warnings as python_warnings
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from collections import Counter
+    source = Path(args.source)
+    if source.suffix.lower() != '.dxf' or not source.is_file():
+        raise ValueError('Source must be an existing .dxf file')
+    if args.arc_tolerance <= 0:
+        raise ValueError('--arc-tolerance must be positive')
+    header = read_header(source)
+    doc, audit = read_drawing(source, args.encoding)
+    if doc is None:
+        raise ValueError('cad.py extract needs ezdxf (pip install ezdxf); GDAL keeps neither handles nor block attributes')
+    import ezdxf
+    warnings = []
+    if header.get('handles') is not True:
+        warnings.append('The drawing may carry no entity handles (R12 or no readable header): handle fields can be '
+                        'assigned by ezdxf on reading and then cannot be looked up in CAD')
+    if audit and audit['errors']:
+        warnings.append(f'ezdxf recovered the drawing with {audit["errors"]} structure errors and {audit["fixes"]} fixes')
+
+    if args.units == 'header':
+        name, scale = UNITS.get(header.get('insunits'), (header.get('units') or 'missing', None))
+        if not scale:
+            raise ValueError(f'Header $INSUNITS is {name}; pass --units m or --units mm')
+        basis = f'header $INSUNITS = {name}'
+    else:
+        scale, basis = {'m': 1.0, 'mm': 0.001}[args.units], f'--units {args.units}'
+
+    model = doc.modelspace()
+    present = Counter(entity.dxf.layer for entity in model)
+    wanted = [name.strip() for name in args.layers.split(',')] if args.layers else sorted(present)
+    unknown = [name for name in wanted if name not in present]
+    if unknown:
+        raise ValueError(f'No model-space entities on layers {", ".join(unknown)}; layers with entities: {", ".join(sorted(present))}')
+    run = Extraction(args.arc_tolerance/scale, args.include_blocks)
+    for entity in model:
+        layer = entity.dxf.layer
+        if layer in wanted:
+            run.read.setdefault(layer, Counter())[entity.dxftype()] += 1
+            run.walk(entity, layer)
+
+    coords = [p for rows in run.rows.values() for row in rows for p in row['coords']]
+    if not coords:
+        raise ValueError('Nothing to extract from the chosen layers')
+    xs, ys, zs = (np.array(axis, dtype=float) for axis in zip(*coords))
+    if scale != 1.0 and args.units == 'header':
+        x, y = float(np.median(xs)), float(np.median(ys))
+        if readings(x, y, 1.0, None, 50.0)[0] and not readings(x, y, scale, None, 50.0)[0]:
+            raise ValueError(f'Header says {header["units"]}, but coordinates as drawn fit a metre grid; pass --units m')
+    lifted = {name: sum(1 for row in rows if any(abs(p[2]) > 1e-9 for p in row['coords'])) for name, rows in run.rows.items()}
+    z = {'features': sum(lifted.values()), 'by_layer': {k: v for k, v in lifted.items() if v},
+         'min': float(zs.min())*scale, 'max': float(zs.max())*scale, 'dropped': bool(args.drop_z and any(lifted.values()))}
+    if z['features'] and not args.drop_z:
+        raise ValueError(f'{z["features"]} features have non-zero Z ({z["min"]:g} to {z["max"]:g} m); pass --drop-z to flatten them')
+
+    frames = {}
+    for name, (geometry_type, fields) in EXTRACT_LAYERS.items():
+        rows = run.rows[name]
+        points = [[(p[0]*scale, p[1]*scale) for p in row['coords']] for row in rows]
+        maker = {'LineString': shapely.linestrings, 'Polygon': shapely.polygons, 'Point': shapely.points}[geometry_type]
+        geometry = [maker(p[0] if geometry_type == 'Point' else p) for p in points]
+        table = pd.DataFrame({field: pd.Series([row.get(field) for row in rows], dtype=object if kind is str else kind)
+                              for field, kind in fields.items() if field != 'valid'})
+        if name == 'closed_polygons':
+            table['valid'] = pd.Series(shapely.is_valid(np.array(geometry, dtype=object)) if rows else [], dtype=bool)
+        if name == 'texts':
+            table['height'] = table['height']*scale
+        frames[name] = gpd.GeoDataFrame(table, geometry=gpd.GeoSeries(geometry, dtype='geometry'))
+    paper = sum(len(layout) for layout in doc.layouts if layout.name != 'Model')
+    if paper:
+        warnings.append(f'{paper} paper-space entities not extracted')
+    invalid = int((~frames['closed_polygons']['valid']).sum()) if len(frames['closed_polygons']) else 0
+    if invalid:
+        warnings.append(f'{invalid} closed polygons are invalid (valid = false); kept as drawn, not repaired')
+
+    stat = source.stat()
+    with bundle(args.output) as stage:
+        target = stage / 'raw.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, frame in frames.items():
+                pyogrio.write_dataframe(frame, target, layer=name, driver='GPKG', geometry_type=EXTRACT_LAYERS[name][0])
+        counts = {name: len(frame) for name, frame in frames.items()}
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in frames}
+        if back != counts:
+            raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
+        manifest = {'manifest': 'cad-extract', 'schema_version': 1,
+                    'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source)},
+                    'header': header, 'reader': f'ezdxf {ezdxf.__version__}',
+                    'parameters': {'layers': wanted, 'units': args.units, 'scale_to_metre': scale, 'units_basis': basis,
+                                   'arc_tolerance_m': args.arc_tolerance, 'include_blocks': args.include_blocks,
+                                   'drop_z': args.drop_z, 'encoding': args.encoding},
+                    'read': {layer: dict(types.most_common()) for layer, types in sorted(run.read.items())},
+                    'layers': counts, 'skipped': dict(run.skipped.most_common()), 'paper_space': paper, 'z': z,
+                    'crs': None, 'warnings': warnings,
+                    'output': {'path': target.name, 'sha256': digest(target)}}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad extract', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256']},
+                                            'warnings': warnings,
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Coordinates are only scaled to metres; no CRS is set and nothing is moved',
+                                                            'Curves are flattened so no chord is farther than --arc-tolerance from the curve',
+                                                            'Closed polygons are taken as drawn; invalid ones are flagged, not repaired']})
+    return manifest
+
+
 def load_inspection(path):
     path = Path(path)
     path = path / 'cad.json' if path.is_dir() else path
@@ -679,6 +883,16 @@ def main():
     sub.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936 for Chinese drawings without one')
     sub.add_argument('--reference', help='Layer in a known projected CRS (metres) covering the same area; extents are compared')
     sub.add_argument('--reference-layer', help='Layer name within --reference')
+    pull = commands.add_parser('extract', help='Extract model-space entities of chosen layers to raw.gpkg, in metres')
+    pull.add_argument('source', help='DXF file')
+    pull.add_argument('--layers', help='Comma-separated CAD layers (default: every layer with model-space entities)')
+    pull.add_argument('--units', required=True, choices=('m', 'mm', 'header'),
+                      help='Drawing unit: m, mm, or header ($INSUNITS; refused when unitless or contradicted by the coordinates)')
+    pull.add_argument('--arc-tolerance', type=float, default=0.05, help='Largest chord-to-curve distance in metres (default 0.05)')
+    pull.add_argument('--include-blocks', action='store_true', help='Explode block references instead of keeping insertion points')
+    pull.add_argument('--drop-z', action='store_true', help='Flatten non-zero Z; without it such features are refused')
+    pull.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936')
+    pull.add_argument('--output', required=True, help='New directory for raw.gpkg, manifest.json and record.json')
     assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
     assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
     assign.add_argument('--layer', help='Layer within source; required when it has several')
@@ -690,6 +904,11 @@ def main():
     assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
     args = parser.parse_args()
     try:
+        if args.command == 'extract':
+            manifest = extract(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
+                              'skipped': manifest['skipped'], 'warnings': manifest['warnings']}, ensure_ascii=False))
+            return
         if args.command == 'assign-crs':
             manifest = assign_crs(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'crs': manifest['crs']['id'],
