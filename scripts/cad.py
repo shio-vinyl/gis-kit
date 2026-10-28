@@ -1393,18 +1393,66 @@ def dwg_version(path):
 XIANGYUAN_KEY = '用地代码'   # 湘源控规 writes each parcel attribute as its own XDATA application; this one marks a parcel
 XIANGYUAN_ALIASES = {'parcel_id': '地块编号', 'landuse': '用地代码', 'landuse_name': '用地性质'}
 XIANGYUAN_FIXED = ('parcel_id', 'landuse', 'landuse_name', 'control_type', 'unit_id', 'status', 'reason', 'area_m2', 'area_declared',
-                   'area_diff', 'number_block', 'valid', 'layer', 'handle')
+                   'area_diff', 'number_block', 'fills', 'valid', 'layer', 'handle', 'other_xdata')
+# Parcel attribute names seen on 湘源控规 drawings: the land-attribute table of 湘源 7.0 and the Shenzhen submission
+# fields some drawings carry instead. Applications outside this list (other vendors' plug-ins) go to other_xdata.
+XIANGYUAN_FIELDS = frozenset((
+    '地块编号 用地代码 用地名称 用地类型 用地性质 第一位比例 第二位比例 第三位比例 第四位比例 用地主代码 第二位代码 第三位代码 '
+    '第四位代码 混合代码 单位名称 单位类别 单位规模 一类兼容 二类兼容 非机车位 机动车位 配套公建 地块标高 总面积 用地面积 道路面积 '
+    '绿地面积 建筑面积 容积率 建筑密度 绿地率 建筑限高 建筑限低 最小容积率 最小建筑密度 最大绿地率 主出入口 东面退后 南面退后 '
+    '西面退后 北面退后 范围参数 等级参数 地区类型 控制信息 用电容量 开闭所号 电信容量 用水容量 总户数 总人数 人口密度 地价参数 '
+    '总地价 备注 用水指标 用电指标 用电系数 电信指标 非机车位指标 机动车位指标 户均面积 户均人数 现状用地 用气指标 用气容量 '
+    '交通指标 交通流量 公建配套要求 道路交通要求 景观色彩要求 其它特殊要求 消防防灾要求 绿化控制要求 给水排水要求 电力电信要求 '
+    '燃气热力要求 文物保护要求 '
+    '规划项目编号 图则名称 图则编号 标准单元编号 子单元编号 地块容积 地块容积描述 配套设施名称 规划要求 管控类型 主要功能代码 区位 '
+    '图则编号-地块编号 图则编号&地块编号 汇交阶段 删除标记 要素代码').split())
+# Attributes that hold numbers (as strings, like every 湘源 XDATA value); --schema can name more.
+XIANGYUAN_NUMERIC = frozenset((
+    '用地面积 总面积 道路面积 绿地面积 建筑面积 地块容积 容积率 建筑密度 绿地率 建筑限高 建筑限低 最小容积率 最小建筑密度 最大绿地率 '
+    '机动车位 非机车位 总户数 总人数 人口密度 户均面积 户均人数 地块标高 东面退后 南面退后 西面退后 北面退后 '
+    '第一位比例 第二位比例 第三位比例 第四位比例').split())
 UNIT_FIELDS = ('unit_id', 'labels', 'status', 'reason', 'area_m2', 'duplicate_of', 'layer', 'handle')
 
 
-def xdata_values(entity):
-    """{application: first 1000-group string} of an entity's XDATA, the way 湘源 stores attributes."""
+def xdata_values(entity, multi=None):
+    """{application: 1000-group string} of an entity's XDATA, the way 湘源 stores attributes. An empty string is a
+    value, not a missing field. With several 1000 groups the last one wins, as 湘源 itself reads them; `multi`
+    (a Counter) counts the applications where that happened."""
     values = {}
     for app, tags in (entity.xdata.data.items() if entity.xdata else ()):
         strings = [tag.value for tag in tags if tag.code == 1000]
         if strings:
-            values[app] = strings[0] if len(strings) == 1 else ' | '.join(strings)
+            values[app] = strings[-1]
+            if multi is not None and len(strings) > 1:
+                multi[app] += 1
     return values
+
+
+def load_schema(path):
+    """Extra field knowledge from a user's JSON: numeric_like and field lists extend the built-in ones."""
+    data = json.loads(Path(path).read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError(f'--schema {path} must be a JSON object')
+    names = set(data.get('land_attribute_fields_order') or []) | set(data.get('gis_field_mapping') or {})
+    names |= set((data.get('observed_on_mawan') or {}).get('entity_apps') or [])
+    numeric = set(data.get('numeric_like') or [])
+    if not names and not numeric:
+        raise ValueError(f'--schema {path} has no land_attribute_fields_order, gis_field_mapping or numeric_like')
+    return names, numeric
+
+
+def hatch_point(hatch):
+    """A point inside a HATCH's largest boundary path, or None."""
+    import shapely
+    from ezdxf import path as dxfpath
+    best = None
+    for item in dxfpath.from_hatch(hatch):
+        points = [(p.x, p.y) for p in item.flattening(distance=0.01)]
+        if len(points) >= 4:
+            shape = shapely.Polygon(points)
+            if shape.is_valid and (best is None or shape.area > best.area):
+                best = shape
+    return shapely.point_on_surface(best) if best is not None and not best.is_empty else None
 
 
 def plot_xiangyuan(parcels, boundary, path, title, font):
@@ -1469,19 +1517,41 @@ def xiangyuan(args):
         scale = UNITS.get(header.get('insunits'), (None, None))[1]
         if not scale:
             raise ValueError(f'Header $INSUNITS is {header.get("units") or "missing"}; pass --units m or --units mm')
+        units_basis = f'header $INSUNITS = {header.get("units")}'
     else:
         scale = {'m': 1.0, 'mm': 0.001}[args.units]
+        units_basis = f'--units {args.units} (header $INSUNITS = {header.get("units")})'
+    known, numeric = set(XIANGYUAN_FIELDS), set(XIANGYUAN_NUMERIC)
+    schema = None
+    if args.schema:
+        extra_names, extra_numeric = load_schema(args.schema)
+        known |= extra_names | extra_numeric
+        numeric |= extra_numeric
+        schema = {'path': str(Path(args.schema).absolute()), 'sha256': digest(args.schema),
+                  'fields': len(extra_names), 'numeric': len(extra_numeric)}
+    warnings = []
+    model = doc.modelspace()
+    # An unexploded 湘源 parcel is a custom LZX_LAND entity whose DXF form keeps only its class marker.
+    registered = any(str(key[0]).upper() == 'LZX_LAND' for key in getattr(doc.classes, 'classes', {}))
+    unexploded = sum(1 for e in model if e.dxftype() == 'LZX_LAND')
+    proxies = sum(1 for e in model if e.dxftype() == 'ACAD_PROXY_ENTITY')
+    if unexploded:
+        raise ValueError(f'{unexploded} 湘源 parcels are unexploded LZX_LAND custom entities, whose attributes are not in DXF; '
+                         'explode or export them in 湘源控规 and convert the drawing again')
+    if proxies:
+        warnings.append(f'{proxies} proxy entities from a plug-in that was not loaded; their contents are not read')
 
     def polygon(entity):
         points = [(p.x*scale, p.y*scale) for p in dxfpath.make_path(entity).flattening(distance=args.arc_tolerance/scale)]
         return shapely.Polygon(points) if len({pt for pt in points}) >= 3 else None
 
-    model = doc.modelspace()
-    records, skipped, open_marked = [], Counter(), 0
+    records, skipped, open_marked, multi = [], Counter(), 0, Counter()
     for entity in model:
-        values = xdata_values(entity)
+        several = Counter()
+        values = xdata_values(entity, several)
         if XIANGYUAN_KEY not in values:
             continue
+        multi.update(several)  # only parcels count: AutoCAD's own ACAD application often repeats 1000 groups
         kind = entity.dxftype()
         if kind not in ('LWPOLYLINE', 'POLYLINE'):
             skipped[kind] += 1
@@ -1494,7 +1564,9 @@ def xiangyuan(args):
         layer = entity.dxf.layer
         code = values.get(XIANGYUAN_KEY, '')
         record = {field: values.get(source_field) for field, source_field in XIANGYUAN_ALIASES.items()}
-        record.update(values)
+        other = {app: value for app, value in values.items() if app not in known}
+        record.update({app: value for app, value in values.items() if app in known})
+        record['other_xdata'] = json.dumps(other, ensure_ascii=False) if other else None
         reasons = []
         if layer not in (code, f'{code}_K'):  # 湘源 puts parcel outlines on <code>_K; some drawings drop the suffix
             reasons.append(f'layer {layer} does not match 用地代码 {code}')
@@ -1584,9 +1656,32 @@ def xiangyuan(args):
                           'handle': entity.dxf.handle, 'geometry': shape})
             if not twin:
                 kept.append((shape, entity.dxf.handle))
+    # Fills: 湘源 puts one HATCH per parcel on <code>_T. They carry no attributes; pair them with the outlines.
+    fills, stray_fills, fill_mismatch = Counter(), [], []
+    for hatch in model.query('HATCH'):
+        layer = hatch.dxf.layer
+        if not layer.endswith('_T'):
+            continue
+        try:
+            point = hatch_point(hatch)
+        except (TypeError, ValueError):
+            point = None
+        if point is None:
+            continue
+        point = shapely.Point(point.x*scale, point.y*scale)
+        hits = [int(i) for i in tree.query(point, predicate='intersects')]
+        hits = [i for i in hits if records[i]['control_type'] == '地块'] or hits
+        if not hits:
+            stray_fills.append(hatch.dxf.handle)
+            continue
+        for i in hits:
+            fills[i] += 1
+            if layer[:-2] != (records[i]['landuse'] or ''):
+                fill_mismatch.append({'parcel_id': records[i]['parcel_id'], 'fill_layer': layer, 'landuse': records[i]['landuse']})
     named = [u for u in units if u['unit_id'] and not u['duplicate_of']]
     for i, record in enumerate(records):
         record['number_block'] = i in numbered
+        record['fills'] = fills[i]
         if named and record['control_type'] == '地块':
             point = shapely.point_on_surface(record['geometry'])
             ids = sorted({u['unit_id'] for u in named if u['geometry'].covers(point)})
@@ -1601,10 +1696,17 @@ def xiangyuan(args):
         for entity in model.query('INSERT'):
             if entity.dxf.layer != args.facility_layer:
                 continue
-            values = {**{a.dxf.tag: a.dxf.text for a in entity.attribs}, **xdata_values(entity)}
+            values = {**{a.dxf.tag: a.dxf.text for a in entity.attribs}, **xdata_values(entity, multi)}
             insert = entity.dxf.insert
+            point = shapely.Point(insert.x*scale, insert.y*scale)
+            number = (values.get('地块编号') or '').strip()
+            named_parcels = [r for r in records if (r['parcel_id'] or '').strip() == number] if number else []
+            match = ('no id' if not number else 'unknown id' if not named_parcels
+                     else 'inside' if any(r['geometry'].covers(point) for r in named_parcels) else 'elsewhere')
+            distance = (round(min(float(r['geometry'].distance(point)) for r in named_parcels), 1)
+                        if match == 'elsewhere' else None)
             facilities.append({'block': entity.dxf.name, 'layer': entity.dxf.layer, 'handle': entity.dxf.handle, **values,
-                               'geometry': shapely.Point(insert.x*scale, insert.y*scale)})
+                               'parcel_match': match, 'parcel_distance_m': distance, 'geometry': point})
     boundary = None
     if args.boundary_layer:
         rings = [polygon(e) for e in model if e.dxf.layer == args.boundary_layer and e.dxftype() in ('LWPOLYLINE', 'POLYLINE')
@@ -1612,8 +1714,35 @@ def xiangyuan(args):
         rings = [r for r in rings if r is not None]
         boundary = shapely.union_all(rings) if rings else None
 
+    # Parcel attributes copied into block definitions (road red lines, inset maps): reported, never taken as parcels.
+    inserted = Counter(e.dxf.name for e in model.query('INSERT'))
+    copies = []
+    for block in doc.blocks:
+        if block.name.startswith('*'):
+            continue
+        carrying = sum(1 for e in block if XIANGYUAN_KEY in xdata_values(e))
+        if carrying:
+            copies.append({'block': block.name, 'entities': carrying, 'inserts_in_model_space': inserted.get(block.name, 0)})
+    if copies:
+        warnings.append(f'{sum(c["entities"] for c in copies)} entities inside {len(copies)} block definitions carry parcel '
+                        'attributes (copies on road lines and insets); they are not read as parcels')
+    if multi:
+        warnings.append(f'{sum(multi.values())} XDATA applications held several values; the last was kept, as 湘源 reads them')
+
     extra = sorted({k for r in records for k in r} - set(XIANGYUAN_FIXED) - {'geometry'})
     parcels = gpd.GeoDataFrame(pd.DataFrame(records, columns=[*XIANGYUAN_FIXED, *extra, 'geometry']), geometry='geometry')
+    converted = []
+    for field in sorted(numeric & set(extra)):
+        text = parcels[field].astype(object)
+        present = text.notna() & (text.astype(str).str.strip() != '')
+        numbers = pd.to_numeric(text.where(present), errors='coerce')
+        bad = text[present & numbers.isna()]
+        if len(bad):
+            samples = ', '.join(repr(v) for v in list(dict.fromkeys(bad))[:3])
+            warnings.append(f'{field} kept as text: {len(bad)} values are not numbers ({samples})')
+            continue
+        parcels[field] = numbers.astype(float)
+        converted.append(field)
     facility_fields = sorted({k for f in facilities for k in f} - {'geometry'})
     frames = {'parcels': (parcels, 'Polygon'),
               'facilities': (gpd.GeoDataFrame(pd.DataFrame(facilities, columns=[*facility_fields, 'geometry']), geometry='geometry'), 'Point'),
@@ -1643,7 +1772,11 @@ def xiangyuan(args):
                'number_blocks_checked': len(numbered) + len(checks), 'number_block_problems': len(checks),
                'area_diff_median': round(float(diffs.median()), 8) if len(diffs) else None,
                'area_diff_max': round(float(diffs.max()), 6) if len(diffs) else None,
-               'skipped_non_polylines': dict(skipped), 'open_polylines_with_code': open_marked}
+               'skipped_non_polylines': dict(skipped), 'open_polylines_with_code': open_marked,
+               'fills': {'parcels_without_fill': int(sum(1 for i, r in enumerate(records) if r['control_type'] == '地块' and not fills[i])),
+                         'fills_without_parcel': len(stray_fills), 'fill_code_mismatches': fill_mismatch[:20]},
+               'facility_matches': dict(Counter(f['parcel_match'] for f in facilities)),
+               'other_xdata_parcels': int(parcels['other_xdata'].notna().sum()), 'numeric_fields': converted}
     try:
         from _theme import get_chinese_font
         font = get_chinese_font()
@@ -1663,8 +1796,12 @@ def xiangyuan(args):
                        f'{source.name} · {summary["parcels"]} parcels, {summary["control_units"]} control units · {summary["hold"]} hold', font)
         manifest = {'manifest': 'cad-xiangyuan', 'schema_version': 1,
                     'source': {'name': source.name, 'bytes': source.stat().st_size, 'sha256': digest(source)},
-                    'header': header, 'encoding': encoding_report, 'audit': audit,
-                    'parameters': {'units': args.units, 'scale_to_metre': scale, 'arc_tolerance_m': args.arc_tolerance,
+                    'header': header, 'encoding': encoding_report, 'audit': audit, 'schema': schema,
+                    'custom_entities': {'lzx_land_class_registered': registered, 'lzx_land_instances': unexploded,
+                                        'proxy_entities': proxies},
+                    'block_copies': copies, 'warnings': warnings,
+                    'parameters': {'units': args.units, 'units_basis': units_basis, 'scale_to_metre': scale,
+                                   'arc_tolerance_m': args.arc_tolerance,
                                    'max_area_diff': args.max_area_diff, 'boundary_layer': args.boundary_layer,
                                    'unit_layer': args.unit_layer, 'unit_label_layer': args.unit_label_layer,
                                    'facility_layer': args.facility_layer},
@@ -1911,6 +2048,8 @@ def main():
     xy.add_argument('--unit-layer', default='DY范围', help='Layer of unit outlines (default DY范围; empty to skip)')
     xy.add_argument('--unit-label-layer', default='DY编号', help='Layer of the unit labels inside them (default DY编号)')
     xy.add_argument('--facility-layer', default='配套设施', help='Layer of facility blocks (default 配套设施; empty to skip)')
+    xy.add_argument('--schema', help='Optional JSON naming more 湘源 fields (land_attribute_fields_order, gis_field_mapping) '
+                                     'and numeric ones (numeric_like)')
     xy.add_argument('--encoding', help='Text encoding overriding the drawing')
     xy.add_argument('--output', required=True, help='New directory for parcels.gpkg, check.png, manifest.json and record.json')
     dwg = commands.add_parser('convert', help='Convert DWG to DXF with an installed ODA File Converter or LibreDWG')
@@ -1933,7 +2072,8 @@ def main():
         if args.command == 'xiangyuan':
             manifest = xiangyuan(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
-                              'summary': manifest['summary'], 'area': manifest['area']}, ensure_ascii=False))
+                              'summary': manifest['summary'], 'area': manifest['area'], 'warnings': manifest['warnings']},
+                             ensure_ascii=False))
             return
         if args.command == 'convert':
             manifest = convert(args)
