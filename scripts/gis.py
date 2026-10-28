@@ -24,6 +24,7 @@ FEATURES = {
     'image-enhance': ('cv2',),
     'network': ('networkx',),
     'cad': ('ezdxf',),
+    'cad-ole': ('olefile',),
     'spatial-sql': ('duckdb', 'pyarrow', 'pyproj'),
 }
 
