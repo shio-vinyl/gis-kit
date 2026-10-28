@@ -66,6 +66,7 @@ def codes(report):
 
 
 def test_zone_prefixed_grid_inventory_and_outputs(tmp_path):
+    pytest.importorskip('ezdxf')
     source = dxf(tmp_path/'site.dxf', site(39_500_000, 3_400_000))
     report = inspect(source, tmp_path/'out')
     assert report['header'] == {'readable': True, 'acadver': 'AC1009', 'release': 'R12', 'insunits': 6, 'units': 'meters',
@@ -133,6 +134,7 @@ def test_geographic_coordinates(tmp_path):
 
 
 def test_r2000_entity_types_and_hatch_is_not_text(tmp_path):
+    pytest.importorskip('ezdxf')
     frame = gpd.GeoDataFrame({'Layer': ['A', 'B', 'C']}, geometry=[LineString([(0, 0), (10, 10)]), Point(5, 5),
                                                                    Polygon([(0, 0), (10, 0), (10, 10)])])
     source = tmp_path/'r2000.dxf'
@@ -157,7 +159,7 @@ def test_gdal_fallback_lists_what_is_missing(tmp_path):
 
 
 def test_ezdxf_inventory_of_an_r2018_drawing(tmp_path):
-    import ezdxf
+    ezdxf = pytest.importorskip('ezdxf')
     doc = ezdxf.new('R2018', setup=True)
     doc.header['$INSUNITS'] = 6
     for name in ('地块界线', '地块编号', '用地代码', '图框', '辅助线'):
