@@ -1,4 +1,4 @@
-# CAD 图纸：清点、提取、围面与赋 CRS
+# CAD 图纸：清点、提取、围面、挂接与赋 CRS
 
 `cad.py inspect` 在把 DXF 当 GIS 数据用之前先看清楚它：有哪些图层、各层是什么实体、文字写了什么、图纸单位、范围里有没有离群的图框，以及坐标量级对得上哪些投影坐标系。结果发布到一个新目录。这里只清点，不写几何，也不给数据赋 CRS。
 
@@ -75,8 +75,13 @@ python cad.py extract 建筑.dxf --units mm --arc-tolerance 0.02 --include-block
   - `--include-blocks` 炸开图块（含嵌套，最多 16 层）：块内实体按类型写入各图层，`handle` 为空，`source_handle` 为最外层图块引用的句柄，`block` 记录块名路径；块内 0 层的实体沿用图块引用的图层，与 CAD 的显示规则一致。
 - **Z 值**：任何坐标的 Z 不为 0 时拒绝；加 `--drop-z` 才压平成二维，清单记录受影响的要素数和 Z 值范围。
 - **句柄**：R12 图纸可能不带实体句柄，此时句柄是 ezdxf 读取时分配的，在 CAD 里查不到，清单会给出警告。
-- **其他实体**：`HATCH`、`POINT`、`DIMENSION`、`LEADER` 等不提取，按类型计入 `skipped`。
-- **输出**：新目录，含 `raw.gpkg`（四个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
+- **引线**：
+  - `LEADER` 的箭头尖写入 `leaders` 图层（字段 `layer`、`dxf_type`、`handle`、`text_handle`、`linked`）。它标注的 MTEXT 如果也被提取，就改放到箭头处（`anchor = leader`、`arrows = 1`、`leader_handle`）。
+  - 一段文字被多条引线指着时，`arrows` 记条数，文字位置不变。
+  - `MULTILEADER` 的文字写入 `texts`（`dxf_type = MULTILEADER`）：只有一个箭头时放在箭头处，多个箭头时放在文字位置，`arrows` 记个数；每个箭头都写入 `leaders`。
+  - 没连到任何已提取文字的引线 `linked = false`。
+- **其他实体**：`HATCH`、`POINT`、`DIMENSION` 等不提取，按类型计入 `skipped`。
+- **输出**：新目录，含 `raw.gpkg`（`lines`、`closed_polygons`、`texts`、`blocks`、`leaders` 五个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
 
 ## 散线围成面
 
@@ -97,13 +102,67 @@ python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,�
 - **缺口（`--max-gap`，米，必填，须大于 `--snap`）**：打断后只连着一条边的端点视为自由端。自由端之间，或自由端到另一条边，距离不超过 `--max-gap` 的，写入 `qa_gaps`：`kind` 为 `endpoint` 或 `to-line`，另有 `length_m`、两侧句柄 `handles_a` / `handles_b`。同一条边的两端只有在沿边绕行远长于缺口时才算缺口，所以一段短的孤立线不会报成缺口。
 - **补缺口**：默认不补。加 `--close-gaps` 才用直线补上全部报告的缺口，补线写入 `added_lines`；用到补线的面 `closed_gap = true`，缺口记录的 `closed = true`。
 - **悬挂线**：`qa_dangles` 列出悬挂线（`dangle`）、面内的切割边（`cut-edge`）和无效环（`invalid-ring`），附长度和来源句柄。没闭合的整段线也会出现在这里。
-- **面（`faces`）**：字段 `face_id`（按位置从上到下、从左到右编号）、`area_m2`、`status`、`reason`、`valid`、`closed_gap`、`source_handles`（围成这个面的原始线句柄，逗号分隔）。
+- **面（`faces`）**：字段 `face_id`（按位置从上到下、从左到右编号）、`area_m2`、`status`、`reason`、`valid`、`closed_gap`、`source_handles`（围成这个面的原始线句柄，逗号分隔）、`source_layers`（这些线所在的 CAD 图层）。
   - 面积小于 `--min-area`（m²，必填）的面不删除，`status = hold`，`reason` 写"sliver"。
   - 无效的面同样 hold。其余的面为 `pass`，`pass` 也只是候选。
   - 这一步不判断面的性质，道路面留给文字挂接一步判定。
 - **规划范围线（`--boundary`）**：给出范围线所在的 CAD 图层，它的线参与打断（自动加入 `--cad-layers`），并且单独围成范围面；范围外的面不输出，个数记为 `outside_boundary`；清单记录面总面积、范围面积和两者的比值。范围线围不成面时报错。不给时不裁剪，清单注明面积未按规划范围限定。
 - **拓扑检查**：对面调用 `topo.py` 的检查（缺口、重叠、碎面、无效几何、重复），碎面阈值取 `--min-area`，结果写入 `qa_topology`。没有 CRS 时，在一个只代表图纸平面的米制坐标系里计算，清单注明。
 - **输出**：新目录，含 `faces.gpkg`（`faces`、`qa_gaps`、`qa_dangles`、`qa_topology`、`added_lines` 五个图层；空图层也保留字段结构）、`check.png`（通过的面浅蓝、hold 的面橙色，缺口红色、悬挂线紫色、补线绿色）、`manifest.json`（`manifest: cad-polygonize` v1：参数、用到的线数、吸附统计、各图层要素数、面的通过 / hold / 范围外个数、面积、说明）和 `record.json`。写出后回读核对各图层要素数。
+
+## 文字挂接到面
+
+`cad.py label` 按规则文件把 CAD 文字挂到 polygonize 得到的面上，生成带编号和用地性质的地块。凡是程序不能确定的情况，都列出来交给人工，不替人选择。
+
+```bash
+python cad.py label /work/cad/fatu-faces/faces.gpkg --texts /work/cad/fatu-raw/raw.gpkg --rules label-rules.yaml --output /work/cad/fatu-parcels
+```
+
+规则文件（YAML）：
+
+```yaml
+fields:                       # 一条文字给一个字段：layers 和 / 或 tags（块属性标签），pattern 须整条匹配 text_clean
+  parcel_id: {layers: [地块编号], tags: [BH], pattern: '\d{2}-\d{2}(-\d{2})?'}
+  landuse:   {layers: [用地代码], pattern: '(R[1-4]|C\d|M\d|GIC\d|S\d)(\+[A-Z]+\d*)*'}
+combined:                     # 一条文字拆出几个字段：用命名分组
+  - layers: [地块标注]
+    pattern: '(?P<parcel_id>\d{2}-\d{2})\s+(?P<landuse>[A-Z]+\d(\+[A-Z]+\d*)*)(\s+(?P<far>\d+(\.\d+)?))?'
+landuse_major: {R: 居住, C: 商业服务业, M: 工业, GIC: 公共管理与服务, S: 交通, U: 公用设施, G: 绿地广场}
+road: {layers: [道路红线], landuse: [S1]}
+```
+
+- **规则校验**：
+  - 字段名不能和输出字段重名。
+  - 组合规则必须有命名分组。
+  - 正则写错、出现未知的段落或键，都直接报错。
+  - 有 `landuse_major` 时必须有 `landuse` 字段。
+- **文字位置**：用 extract 给的点。设了对齐方式的 TEXT 取对齐点，有单根引线的取箭头点。
+- **分类**：每条文字只看覆盖它所在图层（或块属性标签）的规则。
+  - 没有规则覆盖的，只按图层计数（`ignored_text_layers`）。
+  - 有规则覆盖但一条都匹配不上的，写入 `unparsed_text`。
+- **挂接与冲突**：文字点落在哪个面里，就挂到哪个面上。下列情况写入 `label_conflicts`，字段 `kind`、`field`、`value`、`text_raw`、`text_clean`、`layer`、`handle`、`face_id`：
+  - `multi-value`：同一个面里，同一字段有两个以上不同的值。该面的这个字段留空，面标为 hold。值相同的重复标注不算冲突。
+  - `unassigned`：文字不在任何面里。
+  - `on-boundary`：文字点正好落在两个面的公共边上，不挂到任何一个面。
+  - `duplicate-id`：两个面得到同一个 `parcel_id`，两个面都标为 hold。
+  - `leader-ambiguous`：文字有多个箭头，不挂接。
+  - `leader-unlinked`：引线没连到任何已提取的文字，写在箭头处。
+- **用地大类**：取 `landuse` 的第一个代码（按 `+` 等分隔），按 `landuse_major` 里最长的前缀匹配，例如 `GIC1` 优先匹配 `GIC` 而不是 `G`。
+- **道路面**：满足以下任一条件即为道路面（`road = true`）：
+  - 用地代码属于 `road.landuse`。
+  - 面上没有任何字段值，而且围成它的线全部来自 `road.layers`。
+
+  道路红线和地块界线画在同一位置时，面的来源图层会包含两者，这时不判为道路面；需要的话，可以在道路面里标上道路用地代码。
+- **状态**：不是道路面、又没有 `landuse` 的面，标 hold，原因写 `unknown use`。polygonize 时已经 hold 的面保持 hold，原因合并。
+- **输出**：新目录，含：
+  - `parcels.gpkg`：
+    - `parcels`：`face_id`、`parcel_id`、`landuse`、`landuse_major`、`road`、`status`、`reason`、`area_m2`、`source_handles`、`source_layers`、`label_handles`，以及规则里的其他字段。
+    - `label_conflicts`。
+    - `unparsed_text`。
+  - `check.png`：按用地大类着色，道路灰色，hold 的面描橙边，冲突处标红叉。
+  - `rules.yaml`：所用规则的原样副本。
+  - `manifest.json`（`manifest: cad-label` v1）：输入的 SHA-256、规则的字段与 SHA-256、各图层要素数、通过 / hold 数、按类型统计的冲突数、`coverage`（面数、道路面数、用途未知数、用途已知的非道路面中有编号的个数和比例）、`ignored_text_layers`。
+  - `record.json`。
 
 ## 确认后赋 CRS
 

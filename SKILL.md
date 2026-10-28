@@ -34,7 +34,7 @@ description: 处理 GIS 矢量与栅格数据、空间分析、DEM 地形、路�
 
 - 大数据与内存：需要读前拦截时用 `gis.py --memory-budget`，契约见[内存预算](references/memory-budget.md)。
 - 大表与空间 SQL：先按[Spatial SQL 与规模路径](references/spatial-sql.md)选择 DuckDB / GDAL 等成熟引擎；可选薄入口直接接收原生 SQL，回读检查 Parquet 输出，不默认全量载入 GeoPandas。
-- 矢量准备与分析：[基础工作流](references/vector-workflows.md)、[日常结果包](references/daily-vector.md)、[匹配与制图综合](references/vector-cartography.md)、[分析扩展](references/analysis-extensions.md)；CAD 图纸先按[清点、提取、围面与赋 CRS](references/cad-intake.md)看清图层、单位和坐标网，再提取实体、按显式容差围面，确认后赋 CRS。
+- 矢量准备与分析：[基础工作流](references/vector-workflows.md)、[日常结果包](references/daily-vector.md)、[匹配与制图综合](references/vector-cartography.md)、[分析扩展](references/analysis-extensions.md)；CAD 图纸先按[清点、提取、围面、挂接与赋 CRS](references/cad-intake.md)看清图层、单位和坐标网，再提取实体、按显式容差围面、按规则挂文字，确认后赋 CRS。
 - 栅格与专业分析：[数值栅格](references/raster-numeric.md)、[栅格整理](references/raster-cleanup.md)、[地形诊断](references/terrain-analysis.md)、[路网与需求覆盖](references/network-access.md)、[其他专业分析](references/professional-analysis.md)。
 - 文件衔接与复用：[Harness](references/harness.md)、[顺序 recipe 与重复交付](references/repeated-delivery.md)、[Composer 显示交付](references/composer-display.md)、[在线瓦片本地快照](references/tile-snapshot.md)、[场地的行政区链](references/admin-chain.md)、[按图概括的显示矢量](references/display-vector.md)。
 - 图像描绘与赋位：[标注流程](references/raster-annotation.md)、[配准流程](references/raster-georeferencing.md)；仅写标注 patch 时再读[对象契约](references/raster-schema.md)。

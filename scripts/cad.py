@@ -21,6 +21,11 @@ by an explicit --units, non-zero Z refused unless --drop-z, no CRS. It needs ezd
 lines and polygonizes them into faces.gpkg: faces (small or invalid ones held, never dropped), gaps up to
 --max-gap and dangles as QA layers, topo.py checks on the faces. Gaps are closed only with --close-gaps.
 
+`cad.py label` puts parcel fields on those faces from CAD texts by YAML rules (one field per text, or several
+by named groups), placing each text at its alignment point or leader arrow. Several distinct values in a face,
+texts outside every face or on a shared edge, unparsed texts, duplicate parcel ids and unlinked leaders are
+listed, never resolved by choice; road faces come only from the road rule.
+
 `cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
 confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
 (or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
@@ -591,9 +596,12 @@ EXTRACT_LAYERS = {
     'lines': ('LineString', {'layer': str, 'dxf_type': str, 'handle': str, 'closed': bool, 'block': str, 'source_handle': str}),
     'closed_polygons': ('Polygon', {'layer': str, 'dxf_type': str, 'handle': str, 'valid': bool, 'block': str, 'source_handle': str}),
     'texts': ('Point', {'text_raw': str, 'text_clean': str, 'layer': str, 'dxf_type': str, 'tag': str, 'height': float,
-                        'rotation': float, 'anchor': str, 'handle': str, 'block': str, 'source_handle': str}),
+                        'rotation': float, 'anchor': str, 'arrows': int, 'leader_handle': str, 'handle': str, 'block': str,
+                        'source_handle': str}),
     'blocks': ('Point', {'layer': str, 'block': str, 'handle': str, 'rotation': float, 'xscale': float, 'yscale': float,
                          'attributes': str}),
+    # One row per leader arrow; text_handle is the text it labels, linked tells whether that text was extracted.
+    'leaders': ('Point', {'layer': str, 'dxf_type': str, 'handle': str, 'text_handle': str, 'linked': bool}),
 }
 
 
@@ -619,8 +627,44 @@ class Extraction:
             point = entity.ocs().to_wcs(point)
         self.rows['texts'].append({'text_raw': raw, 'text_clean': clean, 'layer': layer, 'dxf_type': kind,
                                    'tag': entity.dxf.tag if kind == 'ATTRIB' else None, 'height': float(height),
-                                   'rotation': float(rotation), 'anchor': anchor, 'handle': entity.dxf.get('handle'),
-                                   'block': block, 'source_handle': source, 'coords': [tuple(point)]})
+                                   'rotation': float(rotation), 'anchor': anchor, 'arrows': 0, 'leader_handle': None,
+                                   'handle': entity.dxf.get('handle'), 'block': block, 'source_handle': source,
+                                   'coords': [tuple(point)]})
+
+    def multileader(self, entity, layer, block, source):
+        """An MLEADER's text placed at its arrow when it has exactly one; every arrow also goes to leaders."""
+        from ezdxf.tools.text import plain_mtext
+        context, handle = entity.context, entity.dxf.get('handle')
+        arrows = [tuple(line.vertices[0]) for leader in context.leaders for line in leader.lines if line.vertices]
+        content = context.mtext
+        for arrow in arrows:
+            self.rows['leaders'].append({'layer': layer, 'dxf_type': 'MULTILEADER', 'handle': handle,
+                                         'text_handle': handle if content is not None else None,
+                                         'linked': content is not None, 'coords': [arrow]})
+        if content is None:  # block content: nothing to read as text
+            self.skipped['MULTILEADER (block content)'] += 1
+            return
+        single = len(arrows) == 1
+        self.rows['texts'].append({'text_raw': content.default_content, 'text_clean': clean_text(plain_mtext(content.default_content)),
+                                   'layer': layer, 'dxf_type': 'MULTILEADER', 'tag': None,
+                                   'height': float(getattr(context, 'char_height', 0.0) or 0.0), 'rotation': 0.0,
+                                   'anchor': 'leader' if single else 'insert', 'arrows': len(arrows),
+                                   'leader_handle': handle, 'handle': handle, 'block': block, 'source_handle': source,
+                                   'coords': [arrows[0] if single else tuple(content.insert)]})
+
+    def link_leaders(self):
+        """Move each text labelled by exactly one LEADER to that leader's arrow."""
+        texts = {row['handle']: row for row in self.rows['texts'] if row['handle'] and row['dxf_type'] != 'MULTILEADER'}
+        pointing = {}
+        for row in self.rows['leaders']:
+            if row['dxf_type'] == 'LEADER' and row['text_handle'] in texts:
+                row['linked'] = True
+                pointing.setdefault(row['text_handle'], []).append(row)
+        for text_handle, leaders in pointing.items():
+            text = texts[text_handle]
+            text['arrows'] = len(leaders)
+            if len(leaders) == 1:
+                text.update(anchor='leader', leader_handle=leaders[0]['handle'], coords=leaders[0]['coords'])
 
     def walk(self, entity, layer, block=None, source=None, depth=0):
         from ezdxf import path
@@ -646,6 +690,16 @@ class Extraction:
                                                          'block': block, 'source_handle': source, 'coords': points})
         elif kind in ('TEXT', 'MTEXT'):
             self.text(entity, layer, block, source)
+        elif kind == 'LEADER':
+            vertices = list(entity.vertices)
+            if not vertices:
+                self.skipped['LEADER (no vertices)'] += 1
+                return
+            self.rows['leaders'].append({'layer': layer, 'dxf_type': kind, 'handle': handle,
+                                         'text_handle': entity.dxf.get('annotation_handle'), 'linked': False,
+                                         'coords': [tuple(vertices[0])]})
+        elif kind == 'MULTILEADER':
+            self.multileader(entity, layer, block, source)
         elif kind == 'INSERT':
             name = entity.dxf.name
             for attrib in entity.attribs:
@@ -714,6 +768,7 @@ def extract(args):
             run.read.setdefault(layer, Counter())[entity.dxftype()] += 1
             run.walk(entity, layer)
 
+    run.link_leaders()
     coords = [p for rows in run.rows.values() for row in rows for p in row['coords']]
     if not coords:
         raise ValueError('Nothing to extract from the chosen layers')
@@ -785,7 +840,7 @@ def extract(args):
 # A plane in metres with no location, so topo.py can measure faces of a drawing that has no CRS yet.
 DRAWING_PLANE = '+proj=tmerc +lat_0=0 +lon_0=0 +k=1 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs'
 FACE_LAYERS = {
-    'faces': ('Polygon', ('face_id', 'area_m2', 'status', 'reason', 'valid', 'closed_gap', 'source_handles')),
+    'faces': ('Polygon', ('face_id', 'area_m2', 'status', 'reason', 'valid', 'closed_gap', 'source_handles', 'source_layers')),
     'qa_gaps': ('LineString', ('kind', 'length_m', 'handles_a', 'handles_b', 'closed')),
     'qa_dangles': ('LineString', ('kind', 'length_m', 'handles')),
     'qa_topology': ('Unknown', ('check', 'detail', 'area_m2', 'face_a', 'face_b')),
@@ -798,7 +853,7 @@ def plot_faces(frames, path, title, font):
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
-    figure, axis = plt.subplots(figsize=(10, 9))
+    figure, axis = plt.subplots(figsize=(12, 9))
     faces = frames['faces']
     for status, colour in (('pass', '#cfe3f5'), ('hold', '#f6b26b')):
         part = faces[faces['status'] == status]
@@ -813,7 +868,7 @@ def plot_faces(frames, path, title, font):
                for c, l in (('#cfe3f5', 'face pass'), ('#f6b26b', 'face hold'))]
     handles += [plt.Line2D([], [], color=c, linewidth=2, label=l)
                 for c, l in (('#d62728', 'gap'), ('#8e44ad', 'dangle / cut edge'), ('#27ae60', 'added by --close-gaps'))]
-    axis.legend(handles=handles, loc='upper right', fontsize=8)
+    axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
     axis.set_aspect('equal', adjustable='datalim')
     axis.ticklabel_format(useOffset=False, style='plain')
     axis.tick_params(labelsize=7)
@@ -867,10 +922,12 @@ def polygonize(args):
     edges, polys, cuts, dangles, invalid_rings = F.faces(lines)
     found = F.gaps(edges, args.max_gap)
     edge_labels = F.sources(edges, lines, labels)
+    edge_layers = F.sources(edges, lines, list(layers))
     added = np.array([g[0] for g in found], dtype=object) if args.close_gaps and found else np.array([], dtype=object)
     if len(added):
         edges, polys, cuts, dangles, invalid_rings = F.faces(np.concatenate([lines, added]))
         edge_labels = F.sources(edges, lines, labels)
+        edge_layers = F.sources(edges, lines, list(layers))
 
     notes = []
     boundary = None
@@ -898,7 +955,8 @@ def polygonize(args):
             for k in added_tree.query(polygon, predicate='intersects')))
         face_rows.append({'area_m2': round(area, 4), 'status': 'hold' if reasons else 'pass', 'reason': '; '.join(reasons) or None,
                           'valid': valid, 'closed_gap': closed_gap,
-                          'source_handles': ','.join(F.boundary_handles(polygon, edges, edge_labels, edge_tree)) or None,
+                          'source_handles': ','.join(F.boundary_labels(polygon, edges, edge_labels, edge_tree)) or None,
+                          'source_layers': ','.join(F.boundary_labels(polygon, edges, edge_layers, edge_tree)) or None,
                           'geometry': polygon})
     centre = lambda row: shapely.get_coordinates(shapely.point_on_surface(row['geometry']))[0]
     face_rows.sort(key=lambda row: (-round(centre(row)[1], 3), round(centre(row)[0], 3)))
@@ -978,6 +1036,208 @@ def polygonize(args):
                                                             'Endpoints within --snap are merged and free ends within --snap are moved onto the nearest line',
                                                             'Gaps up to --max-gap are reported; they are closed only with --close-gaps, and marked',
                                                             'Faces are candidates: no face is dropped for size, small and invalid ones are held']})
+    return manifest
+
+
+LABEL_FIXED = ('face_id', 'parcel_id', 'landuse', 'landuse_major', 'road', 'status', 'reason', 'area_m2',
+               'source_handles', 'source_layers', 'label_handles')
+CONFLICT_FIELDS = ('kind', 'field', 'value', 'text_raw', 'text_clean', 'layer', 'handle', 'face_id')
+UNPARSED_FIELDS = ('text_raw', 'text_clean', 'layer', 'tag', 'handle')
+
+
+def plot_parcels(parcels, conflicts, path, title, font):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    figure, axis = plt.subplots(figsize=(12, 9))
+    colours = matplotlib.colormaps['tab10']
+    classes = sorted({c for c in parcels['landuse_major'].dropna()}) if len(parcels) else []
+    handles = []
+    for i, name in enumerate(classes):
+        part = parcels[(parcels['landuse_major'] == name) & ~parcels['road']]
+        part.plot(ax=axis, facecolor=colours(i % 10), edgecolor='#4a4a4a', linewidth=0.4, alpha=0.6)
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=colours(i % 10), alpha=0.6, label=name))
+    for mask, colour, label in ((parcels['road'] if len(parcels) else [], '#dddddd', 'road'),
+                                ((parcels['landuse_major'].isna() & ~parcels['road']) if len(parcels) else [], '#ffffff', 'no class')):
+        part = parcels[mask] if len(parcels) else parcels
+        if len(part):
+            part.plot(ax=axis, facecolor=colour, edgecolor='#4a4a4a', linewidth=0.4)
+            handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=colour, edgecolor='#4a4a4a', label=label))
+    held = parcels[parcels['status'] == 'hold'] if len(parcels) else parcels
+    if len(held):
+        held.boundary.plot(ax=axis, color='#e67e22', linewidth=1.6)
+        handles.append(plt.Line2D([], [], color='#e67e22', linewidth=2, label='hold'))
+    for _, row in parcels[parcels['parcel_id'].notna()].iterrows() if len(parcels) else []:
+        point = row.geometry.representative_point()
+        axis.annotate(row['parcel_id'], (point.x, point.y), fontsize=6, ha='center', va='center')
+    if len(conflicts):
+        points = conflicts[conflicts.geometry.notna()]
+        axis.scatter(points.geometry.x, points.geometry.y, marker='x', color='#d62728', s=30, zorder=5)
+        handles.append(plt.Line2D([], [], color='#d62728', marker='x', linestyle='', label='label conflict'))
+    if handles:
+        axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
+    axis.set_aspect('equal', adjustable='datalim')
+    axis.ticklabel_format(useOffset=False, style='plain')
+    axis.tick_params(labelsize=7)
+    axis.set_title(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def label(args):
+    """Attach parcel fields from CAD texts to faces by point-in-face, listing every conflict instead of choosing."""
+    import warnings as python_warnings
+    from collections import Counter
+    import geopandas as gpd
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    import _cad_label as L
+    rules, rules_text = L.load(args.rules)
+    faces_path, texts_path = Path(args.faces), Path(args.texts)
+    check_vector(faces_path, args.faces_layer)
+    faces = gpd.read_file(faces_path, layer=args.faces_layer, engine='pyogrio')
+    texts = gpd.read_file(texts_path, layer=args.texts_layer, engine='pyogrio')
+    missing = {'face_id', 'status'} - set(faces.columns)
+    if missing:
+        raise ValueError(f'{faces_path}:{args.faces_layer} lacks {", ".join(sorted(missing))}; use cad.py polygonize output')
+    if {'text_clean', 'layer'} - set(texts.columns):
+        raise ValueError(f'{texts_path}:{args.texts_layer} lacks text_clean / layer; use cad.py extract output')
+    if faces.crs is not None and texts.crs is not None and not CRS.from_user_input(faces.crs).equals(CRS.from_user_input(texts.crs)):
+        raise ValueError('Faces and texts are in different CRS')
+    layers = [name for name, _ in pyogrio.list_layers(texts_path)]
+    leaders = gpd.read_file(texts_path, layer='leaders', engine='pyogrio') if 'leaders' in layers else None
+
+    conflicts, unparsed, ignored = [], [], Counter()
+    found = {}  # face position -> field -> [(value, text row)]
+    tree = shapely.STRtree(faces.geometry.to_numpy())
+
+    def conflict(kind, row=None, field=None, value=None, face_id=None, geometry=None):
+        conflicts.append({'kind': kind, 'field': field, 'value': value,
+                          'text_raw': None if row is None else row['text_raw'], 'text_clean': None if row is None else row['text_clean'],
+                          'layer': None if row is None else row['layer'], 'handle': None if row is None else row.get('handle'),
+                          'face_id': face_id, 'geometry': geometry if geometry is not None else (None if row is None else row.geometry)})
+
+    for _, row in texts.iterrows():
+        relevant, values = rules.classify(row['layer'], row.get('tag'), row['text_clean'])
+        if not relevant:
+            ignored[row['layer']] += 1
+            continue
+        if not values:
+            unparsed.append({k: row.get(k) for k in UNPARSED_FIELDS} | {'geometry': row.geometry})
+            continue
+        if int(row.get('arrows') or 0) > 1:
+            conflict('leader-ambiguous', row, ', '.join(values), ', '.join(values.values()))
+            continue
+        hits = tree.query(row.geometry, predicate='intersects')
+        if len(hits) == 0:
+            for field, value in values.items():
+                conflict('unassigned', row, field, value)
+            continue
+        if len(hits) > 1:
+            for field, value in values.items():
+                conflict('on-boundary', row, field, value)
+            continue
+        for field, value in values.items():
+            found.setdefault(int(hits[0]), {}).setdefault(field, []).append((value, row))
+    if leaders is not None and len(leaders):
+        for _, row in leaders[~leaders['linked'].astype(bool)].iterrows():
+            conflicts.append({'kind': 'leader-unlinked', 'field': None, 'value': None, 'text_raw': None, 'text_clean': None,
+                              'layer': row['layer'], 'handle': row['handle'], 'face_id': None, 'geometry': row.geometry})
+
+    records = []
+    for position, face in faces.reset_index(drop=True).iterrows():
+        record = {'face_id': int(face['face_id']), 'area_m2': face.get('area_m2'), 'source_handles': face.get('source_handles'),
+                  'source_layers': face.get('source_layers'), 'geometry': face.geometry}
+        reasons = [face['reason']] if face['status'] == 'hold' and isinstance(face.get('reason'), str) else []
+        used = []
+        for field in rules.fields:
+            hits = found.get(position, {}).get(field, [])
+            distinct = list(dict.fromkeys(value for value, _ in hits))
+            used += [r.get('handle') for _, r in hits if r.get('handle')]
+            if len(distinct) > 1:
+                reasons.append(f'multi-value {field}')
+                for value, r in hits:
+                    conflict('multi-value', r, field, value, record['face_id'])
+            record[field] = distinct[0] if len(distinct) == 1 else None
+        record['label_handles'] = ','.join(sorted(set(used))) or None
+        landuse = record.get('landuse')
+        record['landuse_major'] = rules.major(landuse)
+        labelled = any(record.get(f) for f in rules.fields)
+        record['road'] = rules.is_road(landuse, record['source_layers'], labelled)
+        if not record['road'] and 'landuse' in rules.fields and not landuse and not any(r.startswith('multi-value landuse') for r in reasons):
+            reasons.append('unknown use')
+        record['reason'] = '; '.join(reasons) or None
+        record['status'] = 'hold' if reasons else 'pass'
+        records.append(record)
+    if 'parcel_id' in rules.fields:
+        counts = Counter(r['parcel_id'] for r in records if r.get('parcel_id'))
+        for record in records:
+            if record.get('parcel_id') and counts[record['parcel_id']] > 1:
+                record['status'] = 'hold'
+                record['reason'] = '; '.join(filter(None, [record['reason'], 'duplicate parcel_id']))
+                conflicts.append({'kind': 'duplicate-id', 'field': 'parcel_id', 'value': record['parcel_id'], 'text_raw': None,
+                                  'text_clean': None, 'layer': None, 'handle': None, 'face_id': record['face_id'],
+                                  'geometry': shapely.point_on_surface(record['geometry'])})
+
+    extra = [f for f in rules.fields if f not in LABEL_FIXED]
+    columns = [*LABEL_FIXED, *extra, 'geometry']
+    for record in records:
+        record.setdefault('parcel_id', None)
+        record.setdefault('landuse', None)
+    parcels = gpd.GeoDataFrame(pd.DataFrame(records, columns=columns), geometry='geometry', crs=faces.crs)
+    conflict_frame = gpd.GeoDataFrame(pd.DataFrame(conflicts, columns=[*CONFLICT_FIELDS, 'geometry']), geometry='geometry', crs=faces.crs)
+    unparsed_frame = gpd.GeoDataFrame(pd.DataFrame(unparsed, columns=[*UNPARSED_FIELDS, 'geometry']), geometry='geometry', crs=faces.crs)
+
+    land = parcels[~parcels['road']] if len(parcels) else parcels
+    coverage = {'faces': len(parcels), 'road_faces': int(parcels['road'].sum()) if len(parcels) else 0,
+                'unknown_use': int(land['reason'].fillna('').str.contains('unknown use').sum()) if len(land) else 0}
+    if 'parcel_id' in rules.fields:
+        known = land[~land['reason'].fillna('').str.contains('unknown use')] if len(land) else land
+        with_id = int(known['parcel_id'].notna().sum()) if len(known) else 0
+        coverage.update(non_road_known_use=len(known), with_parcel_id=with_id,
+                        parcel_id_share=round(with_id/len(known), 4) if len(known) else None)
+    counts = {'parcels': len(parcels), 'label_conflicts': len(conflict_frame), 'unparsed_text': len(unparsed_frame)}
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    with bundle(args.output) as stage:
+        target = stage / 'parcels.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, frame, kind in (('parcels', parcels, 'Polygon'), ('label_conflicts', conflict_frame, 'Point'),
+                                      ('unparsed_text', unparsed_frame, 'Point')):
+                pyogrio.write_dataframe(frame, target, layer=name, driver='GPKG', geometry_type=kind)
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in counts}
+        if back != counts:
+            raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
+        hold = int((parcels['status'] == 'hold').sum()) if len(parcels) else 0
+        plot_parcels(parcels, conflict_frame, stage / 'check.png',
+                     f'{faces_path.name} · {len(parcels)} faces ({hold} hold) · {len(conflict_frame)} conflicts', font)
+        (stage / 'rules.yaml').write_text(rules_text, encoding='utf-8')
+        manifest = {'manifest': 'cad-label', 'schema_version': 1,
+                    'faces': {'name': faces_path.name, 'layer': args.faces_layer, 'sha256': digest(faces_path)},
+                    'texts': {'name': texts_path.name, 'layer': args.texts_layer, 'sha256': digest(texts_path),
+                              'leaders': None if leaders is None else len(leaders)},
+                    'rules': {'path': 'rules.yaml', 'sha256': digest(stage / 'rules.yaml'), 'fields': rules.fields},
+                    'layers': counts, 'parcels': {'pass': len(parcels)-hold, 'hold': hold},
+                    'conflicts': dict(Counter(c['kind'] for c in conflicts).most_common()),
+                    'coverage': coverage, 'ignored_text_layers': dict(ignored.most_common()),
+                    'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad label', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
+                                                      'check.png': digest(stage / 'check.png'), 'rules.yaml': manifest['rules']['sha256']},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['A text belongs to the face its anchor (alignment point or leader arrow) falls in',
+                                                            'Several distinct values for one field in a face are a conflict, never a choice',
+                                                            'Road faces come only from the road rule; unlabelled non-road faces are held']})
     return manifest
 
 
@@ -1106,6 +1366,13 @@ def main():
     faces.add_argument('--min-area', type=float, required=True, help='Faces smaller than this many m² are held as suspected slivers')
     faces.add_argument('--close-gaps', action='store_true', help='Close reported gaps with added lines, kept in added_lines and marked')
     faces.add_argument('--output', required=True, help='New directory for faces.gpkg, check.png, manifest.json and record.json')
+    tag = commands.add_parser('label', help='Attach parcel fields from CAD texts to polygonized faces by rules')
+    tag.add_argument('faces', help='faces.gpkg from cad.py polygonize')
+    tag.add_argument('--faces-layer', default='faces')
+    tag.add_argument('--texts', required=True, help='raw.gpkg from cad.py extract (its texts and leaders layers are read)')
+    tag.add_argument('--texts-layer', default='texts')
+    tag.add_argument('--rules', required=True, help='YAML label rules: fields, combined, landuse_major, road')
+    tag.add_argument('--output', required=True, help='New directory for parcels.gpkg, check.png, rules.yaml, manifest.json and record.json')
     assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
     assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
     assign.add_argument('--layer', help='Layer within source; required when it has several')
@@ -1126,6 +1393,11 @@ def main():
             manifest = polygonize(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'], 'faces': manifest['faces'],
                               'area': manifest['area']}, ensure_ascii=False))
+            return
+        if args.command == 'label':
+            manifest = label(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'parcels': manifest['parcels'],
+                              'conflicts': manifest['conflicts'], 'coverage': manifest['coverage']}, ensure_ascii=False))
             return
         if args.command == 'assign-crs':
             manifest = assign_crs(args)

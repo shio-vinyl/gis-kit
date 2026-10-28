@@ -15,6 +15,7 @@ import shapely
 from shapely.geometry import LineString, Point, Polygon, box
 
 SCRIPTS = Path(__file__).resolve().parents[1]/'scripts'
+sys.path.insert(0, str(SCRIPTS))
 
 
 def pairs(*items):
@@ -357,7 +358,7 @@ def test_extract_layers_fields_and_counts_match_inspect(tmp_path):
     manifest = extract(source, tmp_path/'out', '--units', 'header')
     counts = {row['layer']: row['entities'] for row in report['layers']}
     assert {k: sum(v.values()) for k, v in manifest['read'].items()} == counts  # same entities as the inspection
-    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2} and manifest['crs'] is None
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0} and manifest['crs'] is None
     lines, polygons, texts, blocks = (layer(tmp_path/'out', n) for n in ('lines', 'closed_polygons', 'texts', 'blocks'))
     assert lines.crs is None and set(lines['layer']) == {'地块界线', '道路'} and lines['handle'].notna().all()
     assert polygons['valid'].all() and polygons['handle'].iloc[0] == lines.set_index('dxf_type').loc['LWPOLYLINE', 'handle']
@@ -388,7 +389,7 @@ def test_extract_flattens_arcs_within_tolerance(tmp_path):
 def test_extract_explodes_blocks_on_request(tmp_path):
     source = plan_drawing(tmp_path/'plan.dxf')
     manifest = extract(source, tmp_path/'out', '--units', 'm', '--layers', '地块编号', '--include-blocks')
-    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 0, 'texts': 3, 'blocks': 0}
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 0, 'texts': 3, 'blocks': 0, 'leaders': 0}
     circles = layer(tmp_path/'out', 'lines')
     assert set(circles['dxf_type']) == {'CIRCLE'} and set(circles['layer']) == {'地块编号'}  # layer 0 takes the reference's
     assert circles['handle'].isna().all() and circles['source_handle'].notna().all() and set(circles['block']) == {'地块标签'}
@@ -468,7 +469,7 @@ def test_polygonize_closed_rectangles_and_shared_edge(tmp_path):
     assert manifest['faces'] == {'pass': 3, 'hold': 0, 'outside_boundary': None}
     assert sorted(faces['area_m2']) == [400, 1200, 2000] and faces['valid'].all()
     shared = faces[faces['area_m2'] == 2000].iloc[0]
-    assert shared['source_handles'] == 'A,B'  # the shared side belongs to both rectangles
+    assert shared['source_handles'] == 'A,B' and shared['source_layers'] == '地块'  # the shared side belongs to both
     assert manifest['layers']['qa_gaps'] == 0 and manifest['layers']['qa_dangles'] == 0
     assert not any(row['check'] == 'overlaps' for _, row in faces_of(tmp_path/'out', 'qa_topology').iterrows())
     assert manifest['area']['boundary_area_m2'] is None and manifest['notes'][0].startswith('No --boundary')
@@ -544,3 +545,113 @@ def test_extract_then_polygonize(tmp_path):
     # 100 x 100 square plus a half disc of radius 50 on its right side, flattened at 0.05 m.
     assert len(faces) == 1 and faces['area_m2'].iloc[0] == pytest.approx(10_000 + math.pi*50**2/2, rel=1e-3)
     assert manifest['layers']['qa_dangles'] == 1  # the road line runs on past the parcel
+
+
+RULES = r"""
+fields:
+  parcel_id:
+    layers: [地块编号]
+    pattern: '\d{2}-\d{2}'
+  landuse:
+    layers: [用地代码]
+    pattern: '(R[1-4]|C\d|M\d|GIC\d|S\d)(\+[A-Z]+\d*)*'
+combined:
+  - layers: [地块标注]
+    pattern: '(?P<parcel_id>\d{2}-\d{2})\s+(?P<landuse>[A-Z]+\d(\+[A-Z]+\d*)*)'
+landuse_major: {R: 居住, C: 商业服务业, G: 绿地广场, GIC: 公共管理与服务}
+road:
+  layers: [道路红线]
+  landuse: [S1]
+"""
+
+
+def label_drawing(path):
+    """Seven faces and texts covering every labelling case; see test_label_end_to_end for what each one is."""
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    doc.header['$INSUNITS'] = 6
+    msp = doc.modelspace()
+    def box(x, y, w, h, layer):
+        msp.add_lwpolyline([(x, y), (x+w, y), (x+w, y+h), (x, y+h)], close=True, dxfattribs={'layer': layer})
+    def text(value, x, y, layer, mtext=False):
+        if mtext:
+            return msp.add_mtext(value, dxfattribs={'layer': layer, 'insert': (x, y), 'char_height': 2})
+        return msp.add_text(value, dxfattribs={'layer': layer, 'insert': (x, y), 'height': 2})
+    for x, y in ((0, 0), (50, 0), (0, 40), (50, 40), (0, 80), (50, 80)):   # A B / C D / E F
+        box(x, y, 50, 40, '地块界线')
+    box(0, 200, 100, 20, '道路红线')                                        # G: a road strip
+    text(r'{\fSimSun;01-01}', 20, 30, '地块编号', mtext=True)               # A
+    text('R2', 20, 25, '用地代码')
+    text('编号待定', 25, 10, '地块编号')                                     # A: unparsed
+    text('01-02 GIC1', 70, 30, '地块标注')                                  # B: combined
+    text('01-03', 10, 70, '地块编号')                                       # C: two ids
+    text('01-09', 30, 70, '地块编号')
+    text('C1', 20, 60, '用地代码')
+    note = text('01-04', 150, 60, '地块编号', mtext=True)                  # D: by leader, text outside
+    leader = msp.add_leader([(75, 60), (120, 60), (150, 60)], dxfattribs={'layer': '标注'})
+    leader.dxf.annotation_handle = note.dxf.handle
+    text('R2+C1', 70, 50, '用地代码')
+    text('01-01', 70, 110, '地块编号')                                      # F: duplicate of A
+    text('M1', 70, 100, '用地代码')
+    text('09-09', 50, 20, '地块编号')                                       # on the A|B edge
+    text('01-05', 300, 300, '地块编号')                                     # outside every face
+    text('人民路', 50, 210, '道路名称')                                     # not covered by the rules
+    msp.add_leader([(25, 35), (40, 45)], dxfattribs={'layer': '标注'})      # points at nothing extracted
+    doc.saveas(path)
+    return path
+
+
+def run_label(faces, texts, rules, out, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'label', str(faces), '--texts', str(texts), '--rules', str(rules),
+                             '--output', str(out)], capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def test_label_end_to_end(tmp_path):
+    source = label_drawing(tmp_path/'fatu.dxf')
+    raw = extract(source, tmp_path/'raw', '--units', 'm')
+    assert raw['layers']['leaders'] == 2
+    leader_text = layer(tmp_path/'raw', 'texts').set_index('text_clean').loc['01-04']
+    assert leader_text['anchor'] == 'leader' and leader_text.geometry.x == 75 and leader_text['arrows'] == 1
+    polygonize(tmp_path/'raw'/'raw.gpkg', tmp_path/'faces', '--cad-layers', '地块界线,道路红线')
+    rules = tmp_path/'rules.yaml'
+    rules.write_text(RULES, encoding='utf-8')
+    manifest = run_label(tmp_path/'faces'/'faces.gpkg', tmp_path/'raw'/'raw.gpkg', rules, tmp_path/'out')
+    parcels = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='parcels')
+    at = lambda x, y: parcels[parcels.contains(Point(x, y))].iloc[0]
+    a, b, c, d, e, f, g = (at(*p) for p in ((25, 20), (75, 20), (25, 60), (75, 60), (25, 100), (75, 100), (50, 210)))
+    assert (a['parcel_id'], a['landuse'], a['landuse_major']) == ('01-01', 'R2', '居住') and 'duplicate' in a['reason']
+    assert (b['parcel_id'], b['landuse'], b['landuse_major'], b['status']) == ('01-02', 'GIC1', '公共管理与服务', 'pass')
+    assert c['parcel_id'] is None and c['status'] == 'hold' and 'multi-value parcel_id' in c['reason'] and c['landuse_major'] == '商业服务业'
+    assert (d['parcel_id'], d['landuse_major'], d['status']) == ('01-04', '居住', 'pass')
+    assert e['status'] == 'hold' and e['reason'] == 'unknown use' and not e['road']
+    assert f['parcel_id'] == '01-01' and f['landuse_major'] is None and 'duplicate parcel_id' in f['reason']
+    assert g['road'] and g['status'] == 'pass'
+    assert manifest['conflicts'] == {'multi-value': 2, 'duplicate-id': 2, 'on-boundary': 1, 'unassigned': 1, 'leader-unlinked': 1}
+    assert manifest['layers'] == {'parcels': 7, 'label_conflicts': 7, 'unparsed_text': 1}
+    assert manifest['ignored_text_layers'] == {'道路名称': 1}
+    assert manifest['coverage'] == {'faces': 7, 'road_faces': 1, 'unknown_use': 1, 'non_road_known_use': 5,
+                                    'with_parcel_id': 4, 'parcel_id_share': 0.8}
+    conflicts = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='label_conflicts')
+    assert set(conflicts[conflicts['kind'] == 'multi-value']['value']) == {'01-03', '01-09'}
+    assert conflicts[conflicts['kind'] == 'on-boundary']['value'].tolist() == ['09-09']
+    assert (tmp_path/'out'/'rules.yaml').read_text(encoding='utf-8') == RULES
+    assert (tmp_path/'out'/'check.png').stat().st_size > 10_000
+
+
+def test_label_rule_validation(tmp_path):
+    import _cad_label as L
+    for text, message in (("fields: {face_id: {layers: [a], pattern: 'x'}}", 'reserved'),
+                          ("fields: {parcel_id: {pattern: 'x'}}", 'layers and/or tags'),
+                          ("combined: [{layers: [a], pattern: 'x'}]", 'named groups'),
+                          ("fields: {parcel_id: {layers: [a], pattern: '('}}", 'bad pattern'),
+                          ("fields: {parcel_id: {layers: [a], pattern: 'x'}}\nlanduse_major: {R: 居住}", 'needs a landuse field'),
+                          ("colours: {}", 'Unknown rule sections')):
+        with pytest.raises(ValueError, match=message):
+            L.Rules(__import__('yaml').safe_load(text))
+    rules = L.Rules(__import__('yaml').safe_load(RULES))
+    assert rules.major('GIC1') == '公共管理与服务' and rules.major('G1') == '绿地广场' and rules.major('R2+C1') == '居住'
+    assert rules.classify('地块编号', None, '01-01') == (True, {'parcel_id': '01-01'})
+    assert rules.classify('地块编号', None, '01-01x') == (True, {})          # full match only
+    assert rules.classify('道路名称', None, '01-01') == (False, {})
