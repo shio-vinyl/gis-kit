@@ -294,7 +294,7 @@ def test_assign_crs_labels_without_touching_coordinates(tmp_path):
     assert list(shapely.to_wkb(after.geometry.to_numpy())) == list(shapely.to_wkb(before.geometry.to_numpy()))
     assert manifest['confirmed_by'] == '张三' and manifest['basis'].startswith('数据提供方')
     assert manifest['crs'] == {'id': 'EPSG:4527', 'name': 'CGCS2000 / 3-degree Gauss-Kruger zone 39', 'datum': 'China 2000'}
-    assert manifest['outside_candidates'] is False and manifest['checks']['geometry_wkb_identical'] is True
+    assert manifest['outside_candidates'] is False and manifest['checks']['drawing']['geometry_wkb_identical'] is True
     assert manifest['inspection']['drawing'] == 'drawing.dxf' and manifest['input']['sha256']
     assert gpd.read_file(gpkg).crs is None  # the input is not modified
 
@@ -439,7 +439,13 @@ def test_extract_then_assign_crs(tmp_path):
     extract(source, tmp_path/'raw', '--units', 'header')
     manifest = assign(tmp_path/'raw'/'raw.gpkg', tmp_path/'crs', '--layer', 'closed_polygons', '--inspection', tmp_path/'inspect',
                       '--crs', 'EPSG:4526', *CONFIRM)
-    assert manifest['crs']['id'] == 'EPSG:4526' and manifest['input']['layer'] == 'closed_polygons'
+    assert manifest['crs']['id'] == 'EPSG:4526' and manifest['input']['layers'] == ['closed_polygons']
+    every = assign(tmp_path/'raw'/'raw.gpkg', tmp_path/'all', '--inspection', tmp_path/'inspect', '--crs', 'EPSG:4526', *CONFIRM)
+    assert every['input']['layers'] == ['lines', 'closed_polygons', 'texts', 'blocks', 'leaders']
+    assert {k: v['features'] for k, v in every['checks'].items()} == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0}
+    for name in every['input']['layers']:
+        layer = gpd.read_file(tmp_path/'all'/'raw.gpkg', layer=name)
+        assert layer.crs.to_epsg() == 4526  # names kept, empty layers included
 
 
 def linework(path, lines):

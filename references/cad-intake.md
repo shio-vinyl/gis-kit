@@ -251,7 +251,7 @@ python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --i
   - 输入图层的范围必须落在体检时的模型空间范围内；带图纸空间要素、或者坐标被缩放过、平移过的图层会被拒绝。
   - `--crs` 必须在体检时按原坐标（`scale_to_metre` 为 1）列出的候选里。不在时报错，加 `--outside-candidates` 才执行，并在清单里记下 `outside_candidates: true`。
   - 只在按 `$INSUNITS` 换算后才对得上的坐标系（例如毫米图纸），加了 `--outside-candidates` 也拒绝：坐标要先换算成米，这一步还不能代劳。
-- **输入**：单个矢量图层，多图层时用 `--layer` 指定。已有 CRS 的图层拒绝，要换坐标系应当重投影。
+- **输入**：矢量文件。默认给其中所有图层一起赋 CRS，图层名不变，空图层也照样赋上，例如 `cad.py xiangyuan` 输出的 `parcels.gpkg` 一次就能处理完；只想处理一个图层时用 `--layer`。每个图层的范围都要落在体检记录的范围内；已经有 CRS 的图层直接拒绝，要换坐标系应当做重投影。
 - **CRS**：必须是以米为单位的投影坐标系。
-- **回读核对**：写出 `<输入名>.gpkg` 后重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一项不一致都不发布。输入文件不改动。
-- **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、图层、SHA-256、要素数与范围，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`，`checks`，输出的 SHA-256）和 `record.json`。
+- **回读核对**：写出 `<输入名>.gpkg` 后逐层重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一层有一项不一致，整个结果都不发布。输入文件不会被改动。
+- **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、SHA-256 与图层列表，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`，`checks`（逐层的要素数、范围和回读核对结果），输出的 SHA-256）和 `record.json`。
