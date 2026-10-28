@@ -10,7 +10,7 @@ import sys
 import geopandas as gpd
 import pyogrio
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon, box
 
 SCRIPTS = Path(__file__).resolve().parents[1]/'scripts'
 
@@ -201,3 +201,54 @@ def test_refuses_dwg_and_other_inputs(tmp_path):
     assert 'save it as DXF' in inspect(tmp_path/'plan.dwg', tmp_path/'a', success=False)
     assert '.dxf' in inspect(tmp_path/'missing.dxf', tmp_path/'b', success=False)
     assert not (tmp_path/'a').exists() and not (tmp_path/'b').exists()
+
+
+def reference(path, crs, bounds):
+    gpd.GeoDataFrame({'name': ['范围']}, geometry=[box(*bounds)], crs=crs).to_file(path)
+    return path
+
+
+def test_reference_overlap_lists_its_crs_for_unprefixed_coordinates(tmp_path):
+    source = dxf(tmp_path/'qianhai.dxf', site(495_000, 2_490_000))  # CGCS2000 CM 114E without prefix
+    ref = reference(tmp_path/'range.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000))
+    report = inspect(source, tmp_path/'out', '--reference', ref)
+    comparison = report['crs']['reference']['comparisons'][0]
+    assert comparison['verdict'] == 'extents-overlap' and comparison['overlap'] == 1.0
+    assert report['crs']['status'] == 'candidate' and codes(report) == ['EPSG:4547']
+    match = report['crs']['readings'][0]['matches'][0]
+    assert match['grid'] == 'reference layer (extents-overlap)' and match['candidates'][0]['basis'] == 'reference'
+    record = json.loads((tmp_path/'out'/'record.json').read_text())
+    assert record['reference']['sha256'] and record['reference']['layer'] == 'range'
+
+
+def test_reference_zone_prefix_both_ways(tmp_path):
+    bare = dxf(tmp_path/'bare.dxf', site(495_000, 2_490_000))
+    prefixed_ref = reference(tmp_path/'zone38.gpkg', 'EPSG:4526', (38_494_000, 2_489_000, 38_497_000, 2_492_000))
+    report = inspect(bare, tmp_path/'a', '--reference', prefixed_ref)
+    comparison = report['crs']['reference']['comparisons'][0]
+    assert comparison['verdict'] == 'zone-prefix' and comparison['zone'] == 38 and comparison['drawing_has_prefix'] is False
+    assert codes(report) == ['EPSG:4547']  # the reference's grid without the prefix
+    prefixed = dxf(tmp_path/'prefixed.dxf', site(38_495_000, 2_490_000))
+    bare_ref = reference(tmp_path/'cm114.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000))
+    report = inspect(prefixed, tmp_path/'b', '--reference', bare_ref)
+    assert report['crs']['reference']['comparisons'][0]['twin']['crs'] == 'EPSG:4526'
+    assert codes(report).count('EPSG:4526') == 1  # already a coordinate candidate; not listed twice
+
+
+def test_reference_shift_and_magnitude_are_held(tmp_path):
+    ref = reference(tmp_path/'range.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000))
+    shifted = inspect(dxf(tmp_path/'shift.dxf', site(480_000, 2_470_000)), tmp_path/'shift', '--reference', ref)
+    comparison = shifted['crs']['reference']['comparisons'][0]
+    assert comparison['verdict'] == 'shift-or-rotation' and comparison['overlap'] == 0.0
+    assert comparison['offset'][0] == pytest.approx(15_440, abs=1) and shifted['crs']['status'] == 'hold'
+    assert any('control points' in note and 'offset' in note for note in shifted['crs']['notes'])
+    local = inspect(dxf(tmp_path/'local.dxf', site(105_000, 32_000)), tmp_path/'local', '--reference', ref)
+    assert local['crs']['reference']['comparisons'][0]['verdict'] == 'different-magnitude'
+    assert local['crs']['status'] == 'hold' and codes(local) == []
+
+
+def test_reference_must_be_projected_in_metres(tmp_path):
+    source = dxf(tmp_path/'site.dxf', site(495_000, 2_490_000))
+    ref = reference(tmp_path/'lonlat.gpkg', 'EPSG:4326', (113.8, 22.4, 114.0, 22.6))
+    assert 'projected CRS in metres' in inspect(source, tmp_path/'out', '--reference', ref, success=False)
+    assert not (tmp_path/'out').exists()

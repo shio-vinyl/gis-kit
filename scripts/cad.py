@@ -7,7 +7,8 @@ block names and attributes, raw and cleaned text, layer state, layouts and viewp
 inventory comes from GDAL and cad.json lists what is missing. It reads $ACADVER / $INSUNITS /
 $DWGCODEPAGE from the header itself, and lists projected CRS
 whose grid the coordinates fit, mainly zone-prefixed Chinese Gauss-Kruger grids. Coordinates without
-the zone prefix are held: they may equally be a local grid, so no EPSG code is listed for them.
+the zone prefix are held: they may equally be a local grid, so no EPSG code is listed for them unless
+--reference, a layer in a known projected CRS, lines up with the drawing's extent.
 CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
 Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
 Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
@@ -40,6 +41,7 @@ DATUMS = ('CGCS2000', 'New Beijing', 'Xian 1980', 'Beijing 1954')
 TEXT_SAMPLES = 5
 PLOT_LAYERS = 12
 OUTLIER_SPREAD = 20
+REFERENCE_OVERLAP = 0.5  # share of the smaller extent inside the larger one
 # What the GDAL fallback cannot report; listed in cad.json when ezdxf is not installed.
 EZDXF_ONLY = ['DXF entity types for R12', 'closed and open polylines', 'block names and attribute tags',
               'raw and cleaned text', 'layer off and frozen state', 'unused layers', 'layouts and viewports']
@@ -154,6 +156,93 @@ def readings(x, y, scale, near, near_km):
     if not found and not bare and near is not None and abs(e) <= 20037508.35 and abs(n) <= 20037508.35:
         consider('web mercator', [('WGS 84', 'EPSG:3857', 'WGS 84 / Pseudo-Mercator', None)])
     return found, rejected, bare
+
+
+def read_reference(path, layer):
+    """Extent and CRS of a reference layer; the CRS must be projected in metres to compare plane coordinates."""
+    import pyogrio
+    from pyproj import CRS
+    info = pyogrio.read_info(path, layer=layer, force_total_bounds=True)
+    if info.get('crs') is None:
+        raise ValueError('--reference has no CRS')
+    crs = CRS.from_user_input(info['crs'])
+    unit = crs.axis_info[0].unit_name if crs.axis_info else None
+    if not crs.is_projected or unit != 'metre':
+        raise ValueError(f'--reference must be in a projected CRS in metres; got {crs.name}')
+    bounds = info.get('total_bounds')
+    if bounds is None or not all(math.isfinite(float(v)) for v in bounds):
+        raise ValueError('--reference has no extent')
+    authority = crs.to_authority(min_confidence=70)
+    return {'name': Path(path).name, 'layer': info.get('layer_name') or layer,
+            'crs': ':'.join(authority) if authority else crs.to_wkt(), 'crs_name': crs.name,
+            'datum': crs.datum.name if crs.datum else None, 'bounds': [round(float(v), 3) for v in bounds]}
+
+
+def share(a, b):
+    """Fraction of the smaller box inside the larger one, per axis multiplied; a degenerate axis counts as inside."""
+    total = 1.0
+    for low, high in ((0, 2), (1, 3)):
+        start, end = max(a[low], b[low]), min(a[high], b[high])
+        if end < start:
+            return 0.0
+        small = min(a[high]-a[low], b[high]-b[low])
+        total *= 1.0 if small <= 0 else (end-start)/small
+    return total
+
+
+@lru_cache(maxsize=None)
+def epsg_by_name():
+    from pyproj.database import query_crs_info
+    return {info.name: f'EPSG:{info.code}' for info in query_crs_info(auth_name='EPSG', pj_types='PROJECTED_CRS')
+            if not info.deprecated}
+
+
+def prefix_twin(name, zone):
+    """The same datum's grid with the zone prefix added (zone > 0: reference has it) or removed (zone < 0)."""
+    if zone > 0:
+        match = re.fullmatch(r'(.+ / (3-degree )?Gauss-Kruger) zone (\d+)', name)
+        if not match or int(match[3]) != zone:
+            return None
+        twin = f'{match[1]} CM {3*zone if match[2] else 6*zone-3}E'
+    else:
+        match = re.fullmatch(r'(.+ / (3-degree )?Gauss-Kruger) CM (\d+)E', name)
+        if not match:
+            return None
+        cm = int(match[3])
+        if (cm if match[2] else cm+3) != (3 if match[2] else 6)*-zone:
+            return None
+        twin = f'{match[1]} zone {-zone}'
+    code = epsg_by_name().get(twin)
+    return (code, twin) if code else None
+
+
+def compare(core, scale, reference):
+    """How the drawing's main extent, at one unit scale, sits against the reference extent."""
+    box = [v*scale for v in core]
+    ref = reference['bounds']
+    centre = ((box[0]+box[2])/2, (box[1]+box[3])/2)
+    ref_centre = ((ref[0]+ref[2])/2, (ref[1]+ref[3])/2)
+    offset = [round(ref_centre[0]-centre[0], 3), round(ref_centre[1]-centre[1], 3)]
+    span, ref_span = math.hypot(box[2]-box[0], box[3]-box[1]), math.hypot(ref[2]-ref[0], ref[3]-ref[1])
+    row = {'overlap': round(share(box, ref), 3), 'offset': offset,
+           'size_ratio': round(span/ref_span, 4) if ref_span > 0 else None}
+    if row['overlap'] >= REFERENCE_OVERLAP:
+        row['verdict'] = 'extents-overlap'
+        return row
+    zone = round(offset[0]/1e6)
+    shifted = [box[0]+zone*1e6, box[1], box[2]+zone*1e6, box[3]]
+    if (13 <= abs(zone) <= 23 or 25 <= abs(zone) <= 45) and share(shifted, ref) >= REFERENCE_OVERLAP:
+        row.update(verdict='zone-prefix', zone=abs(zone), drawing_has_prefix=zone < 0)
+        twin = prefix_twin(reference['crs_name'], zone)
+        if twin:
+            row['twin'] = {'crs': twin[0], 'name': twin[1]}
+        return row
+
+    def order(v):
+        return math.floor(math.log10(abs(v))) if abs(v) >= 1 else 0
+    same = all(order(a) == order(b) for a, b in zip(centre, ref_centre))
+    row['verdict'] = 'shift-or-rotation' if same else 'different-magnitude'
+    return row
 
 
 def looks_misdecoded(values):
@@ -397,6 +486,23 @@ def inspect(args):
         tried.append({'scale_to_metre': scale, 'basis': basis, 'matches': found})
         rejected += dropped
         unprefixed = unprefixed or bare
+    reference = None
+    if args.reference:
+        reference = read_reference(args.reference, args.reference_layer)
+        core_box = [float(v) for v in model[core].total_bounds]
+        reference['comparisons'] = []
+        for reading in tried:
+            row = compare(core_box, reading['scale_to_metre'], reference)
+            reference['comparisons'].append({'scale_to_metre': reading['scale_to_metre'], **row})
+            if row['verdict'] == 'extents-overlap':
+                found = (reference['crs'], reference['crs_name'])
+            elif row['verdict'] == 'zone-prefix' and 'twin' in row:
+                found = (row['twin']['crs'], row['twin']['name'])
+            else:
+                found = None
+            if found and found[0] not in {c['crs'] for m in reading['matches'] for c in m['candidates']}:
+                reading['matches'].append({'grid': f'reference layer ({row["verdict"]})', 'candidates': [
+                    {'crs': found[0], 'name': found[1], 'datum': reference['datum'], 'basis': 'reference'}]})
     candidates = [row for reading in tried for match in reading['matches'] for row in match['candidates']]
     notes = ['Coordinates cannot distinguish CGCS2000, New Beijing, Xian 1980 and Beijing 1954 grids; '
              'confirm the datum with the data provider or known control points']
@@ -406,12 +512,22 @@ def inspect(args):
                      'layer in a known CRS or fit control points')
     if not candidates and not unprefixed:
         notes.append('No national grid fits; treat as a local or engineering coordinate system that needs control points')
+    verdicts = {row['verdict']: row for row in (reference or {}).get('comparisons', [])}
+    if 'extents-overlap' in verdicts or 'zone-prefix' in verdicts:
+        notes.append('Extents that line up with the reference are consistent with its grid but do not prove it; '
+                     'overlay shared features (roads, parcel corners) before assigning a CRS')
+    elif 'shift-or-rotation' in verdicts:
+        dx, dy = verdicts['shift-or-rotation']['offset']
+        notes.append(f'Same magnitude as the reference but offset by about ({dx:.0f}, {dy:.0f}) m: likely a local grid or '
+                     'a moved origin; fit control points instead of assigning a CRS')
+    elif reference:
+        notes.append('Coordinate magnitudes differ from the reference at every scale tried; not the same grid')
     if declared and declared != 1.0 and any(r['matches'] for r in tried[:1]):
         warnings.append(f'Header says {header["units"]}, but coordinates as drawn fit a metre grid')
 
     crs = {'status': 'candidate' if candidates else 'hold', 'representative_point': [round(x, 3), round(y, 3)],
            'near': list(near) if near else None, 'near_km': args.near_km if near else None,
-           'readings': tried, 'rejected': rejected, 'notes': notes, 'assigned': None}
+           'readings': tried, 'rejected': rejected, 'reference': reference, 'notes': notes, 'assigned': None}
     extent = {'full': [round(float(v), 3) for v in model.total_bounds],
               'core': [round(float(v), 3) for v in model[core].total_bounds], 'outliers': int(len(stray))}
     summary = (', '.join(dict.fromkeys(c['crs'] for c in candidates[:4])) + (' …' if len(candidates) > 4 else '')
@@ -442,6 +558,9 @@ def inspect(args):
         write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad', 'version': VERSION,
                                             'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
                                             'source': {'path': str(source.absolute()), 'sha256': report['source']['sha256']},
+                                            'reference': ({'path': str(Path(args.reference).absolute()), 'layer': reference['layer'],
+                                                           'sha256': digest(args.reference) if Path(args.reference).is_file() else None}
+                                                          if reference else None),
                                             'files': {'cad.json': digest(stage / 'cad.json'), 'check.png': digest(stage / 'check.png')},
                                             'warnings': warnings,
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
@@ -460,6 +579,8 @@ def main():
     sub.add_argument('--near', help='Approximate LON,LAT of the area the drawing covers; candidates farther than --near-km are rejected')
     sub.add_argument('--near-km', type=float, default=50.0, help='Keep candidates within this distance of --near (default 50)')
     sub.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936 for Chinese drawings without one')
+    sub.add_argument('--reference', help='Layer in a known projected CRS (metres) covering the same area; extents are compared')
+    sub.add_argument('--reference-layer', help='Layer name within --reference')
     args = parser.parse_args()
     try:
         if args.near_km <= 0:

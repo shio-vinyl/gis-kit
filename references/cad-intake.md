@@ -6,6 +6,7 @@
 python cad.py inspect 控规图则.dxf --output /work/cad/plan
 python cad.py inspect 地形图.dxf --near 117.2,31.8 --output /work/cad/topo   # 剔除离图纸所在地太远的候选
 python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 文件头缺代码页时
+python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad/fatu   # 与已知 CRS 的参考图层比对
 ```
 
 - **输入**：只读 ASCII 或二进制 DXF。DWG 直接拒绝，先在 AutoCAD / 中望 CAD 里另存为 DXF，或用 ODA File Converter 转换。读模型空间实体，图纸空间（布局）实体单独计数，不参与范围和 CRS 判断。
@@ -21,10 +22,23 @@ python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 
 按代表点的坐标量级判断，然后用 pyproj 的 EPSG 库查出具体坐标系，再用各坐标系的适用范围核对一遍，范围外的列入 `rejected`。
 
 - **带带号的高斯-克吕格坐标**：东坐标为 3 度带 25–45 带或 6 度带 13–23 带的带号 ×10⁶ 加上 500000 左右，直接定出带号。
-- **不带带号的坐标**：东坐标在 0–10⁶ 之间。这样的坐标可能是不带带号的高斯坐标、UTM，也可能是城市或项目独立坐标系（例如深圳独立坐标），单看坐标分不出来，所以**不列任何 EPSG**，状态为 `hold`，给了 `--near` 也一样。要确定坐标系，只能和已知 CRS 的参考图层比对，或用控制点拟合。
+- **不带带号的坐标**：东坐标在 0–10⁶ 之间。这样的坐标可能是不带带号的高斯坐标、UTM，也可能是城市或项目独立坐标系（例如深圳独立坐标），单看坐标分不出来，所以**不列任何 EPSG**，状态为 `hold`，给了 `--near` 也一样。要确定坐标系，只能和已知 CRS 的参考图层比对（`--reference`，见下文），或用控制点拟合。
 - **经纬度**：x、y 落在经纬度范围内时，列 EPSG:4490 和 EPSG:4326。
 - **Web 墨卡托**：只在上面都不匹配、坐标不属于无带号的情况，且给了 `--near` 时，才列 EPSG:3857。
 - **其他**：都对不上时按局部或工程坐标处理，状态为 `hold`，需要控制点配准。
+
+## 参考图层比对
+
+`--reference`（可加 `--reference-layer`）给一个覆盖同一片区、CRS 已知的图层，它必须是以米为单位的投影坐标系。比对只用范围：把图纸主体范围（`core`）按每种单位换算后与参考图层的范围对照，结论记在 `crs.reference.comparisons[]`，每条含 `overlap`（较小的范围落在较大范围里的比例）、`offset`（参考中心减图纸中心，单位米）、`size_ratio` 和 `verdict`：
+
+- `extents-overlap`：`overlap` 不小于 0.5。参考图层的 CRS 列为候选（`basis: reference`），不带带号的坐标也一样，这是它们得到 EPSG 的唯一途径。
+- `zone-prefix`：东坐标正好相差一个带号 ×10⁶（`zone`、`drawing_has_prefix`），去掉或补上带号后范围重叠。按参考 CRS 的基准换算出带号或中央经线对应的坐标系（`twin`）列为候选，例如参考为 EPSG:4526（38 带）而图纸不带带号时，候选为 EPSG:4547（中央经线 114°E）。
+- `shift-or-rotation`：两个中心的坐标量级相同但范围不重叠，多半是独立坐标或移过原点。不列候选，记下偏移，应改用控制点拟合。
+- `different-magnitude`：量级不同，不是同一个坐标网。
+
+范围对得上只说明与参考的坐标网一致，不能证明就是它：独立坐标系的原点可能刚好落在附近，基准也分不出来。赋 CRS 之前要叠加共有的地物（道路、宗地角点）核对。`record.json` 记下参考图层的路径、图层名和 SHA-256（单文件时）。
+
+## 距离过滤
 
 给了 `--near LON,LAT`（图纸所在地的大致经纬度）时，反算位置离它超过 `--near-km`（默认 50 km）的候选移入 `rejected`，并记下距离。
 
@@ -32,7 +46,7 @@ python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 
 
 ## 输出
 
-- `cad.json`（`report: cad-inventory`，`schema_version` 1）：`source`（文件名、大小、SHA-256、修改时间），`header`，`reader`（`inventory` 为 `ezdxf <版本>` 或 `gdal`，`geometry` 为 GDAL 版本，`missing` 为退回时缺少的能力），`entities`（`model_space` 为清点口径的实体数，`geometries` 为展开图块后的几何数，以及图纸空间、空几何的数量和几何类型统计），`layers[]`（按实体数降序；ezdxf 时为 `entities`、`dxf_types`、`blocks`、`attributes`、`texts`、`text_samples[{raw, clean}]`、`state`、`bounds`，GDAL 退回时为 `entities`、`geometry_types`、`entity_types`、`texts`、`text_samples[{raw}]`、`bounds`），`unused_layers`，`layouts[]`（`name`、`entities`、`viewports`；GDAL 退回时这两项为 `null`），`extent`，`crs`（`status`、`representative_point`、`near`、`readings[]`，每个 reading 含 `scale_to_metre`、`basis` 和 `matches[]` 的 `grid` 与 `candidates[]`；`rejected`、`notes`、`assigned`），以及 `warnings`。
+- `cad.json`（`report: cad-inventory`，`schema_version` 1）：`source`（文件名、大小、SHA-256、修改时间），`header`，`reader`（`inventory` 为 `ezdxf <版本>` 或 `gdal`，`geometry` 为 GDAL 版本，`missing` 为退回时缺少的能力），`entities`（`model_space` 为清点口径的实体数，`geometries` 为展开图块后的几何数，以及图纸空间、空几何的数量和几何类型统计），`layers[]`（按实体数降序；ezdxf 时为 `entities`、`dxf_types`、`blocks`、`attributes`、`texts`、`text_samples[{raw, clean}]`、`state`、`bounds`，GDAL 退回时为 `entities`、`geometry_types`、`entity_types`、`texts`、`text_samples[{raw}]`、`bounds`），`unused_layers`，`layouts[]`（`name`、`entities`、`viewports`；GDAL 退回时这两项为 `null`），`extent`，`crs`（`status`、`representative_point`、`near`、`readings[]`，每个 reading 含 `scale_to_metre`、`basis` 和 `matches[]` 的 `grid` 与 `candidates[]`；`rejected`、`reference`（未给 `--reference` 时为 `null`）、`notes`、`assigned`），以及 `warnings`。
 - `check.png`：按图层着色（前 12 层，其余为灰色），有离群实体时左侧加一幅全图，用虚线框标出主体范围。坐标轴为图纸单位。
 - `record.json`：参数、输入 SHA-256、输出文件摘要与假设。
 
