@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `cad.py assign-crs` 默认给输入文件的全部图层赋 CRS，图层名不变（`--layer` 只处理一个）；每层都核对范围、回读 WKB、属性与 CRS。清单 `input.layers` 为图层列表，`checks` 按图层给出。
 - 新脚本 `package.py unpack`：安全解开 ArcGIS 图层包 / 地图包（`.lpk`、`.lpkx`、`.mpk`、`.mpkx`；7z 经 bsdtar 或 7-Zip，zip 经 zipfile）。解压前拒绝越界路径、链接和超过 `--max-bytes` 的包，解压后核对大小。读出包信息，为 `commondata/` 下每个数据集写 describe 卡片，把图层文件对应到数据：`.lyrx` 读渲染字段、分类、标注与定义查询，`.lyr` 只取数据源路径、名称与标注表达式；包里缺数据的图层单独报告。符号化不还原。说明见 `references/esri-package.md`。
 - `join.py --on 左字段=右字段`：按属性挂接，右侧可以是 CSV / Excel 表（`--right-sheet`、`--right-header-row`、`--right-encoding`；单元格按文本读入，前导零不丢，全数字的列转为数值）。`--normalize id` 按地块编号规范化（全角转半角、连字符统一、去空格、去每段数字的前导零）。报告列出两侧对不上的编号、空编号、重复编号、规范化后撞到一起的编号，以及每一处规范化的对照。原有的空间挂接行为不变。
 - 新子命令 `cad.py xiangyuan`：湘源控规图则直取。带 `用地代码` 扩展数据的闭合多段线即地块，扩展数据（每个属性一个应用名）按原名全部转成字段，另加 `parcel_id`、`landuse`、`landuse_name`、`control_type`、`unit_id`、计算面积与 `用地面积` 的差。图层与用地代码不符、删除标记、缺编号、重复编号、无效几何、面积差超限的面标 hold；编号图块逐个核对；`DY范围` 按 `DY编号` 命名为单元（重复的面识别出来）；另取配套设施与规划边界。`--units header` 与 `用地面积` 矛盾时拒绝。妈湾法图实测：54 个地块、45 个规划控制单元、97 个编号图块全部一致。
