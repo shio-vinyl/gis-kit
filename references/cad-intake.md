@@ -1,4 +1,4 @@
-# CAD 图纸：清点、提取与赋 CRS
+# CAD 图纸：清点、提取、围面与赋 CRS
 
 `cad.py inspect` 在把 DXF 当 GIS 数据用之前先看清楚它：有哪些图层、各层是什么实体、文字写了什么、图纸单位、范围里有没有离群的图框，以及坐标量级对得上哪些投影坐标系。结果发布到一个新目录。这里只清点，不写几何，也不给数据赋 CRS。
 
@@ -77,6 +77,33 @@ python cad.py extract 建筑.dxf --units mm --arc-tolerance 0.02 --include-block
 - **句柄**：R12 图纸可能不带实体句柄，此时句柄是 ezdxf 读取时分配的，在 CAD 里查不到，清单会给出警告。
 - **其他实体**：`HATCH`、`POINT`、`DIMENSION`、`LEADER` 等不提取，按类型计入 `skipped`。
 - **输出**：新目录，含 `raw.gpkg`（四个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
+
+## 散线围成面
+
+`cad.py polygonize` 把提取出的线按显式容差吸附、打断，再围成面，结果是待审的候选面。缺口和悬挂线只报告，不自动补。
+
+```bash
+python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,道路红线 --boundary 规划范围线 \
+  --snap 0.05 --max-gap 0.5 --min-area 10 --output /work/cad/fatu-faces
+```
+
+- **输入**：`cad.py extract` 的 `raw.gpkg`（默认读 `lines` 图层，可用 `--lines-layer` 改），或任何带 `layer` 字段、单位为米的线图层。带 CRS 时必须是以米为单位的投影坐标系，输出沿用它；没有 CRS 时按 extract 的约定视为米。`--cad-layers` 选择参与的 CAD 图层，不给时用全部。
+- **吸附（`--snap`，米，必填）**：
+  - 距离在 `--snap` 以内的端点合并到它们的平均位置。一条线首尾相距不到 `--snap` 时，因此会被闭合。
+  - 合并后仍然孤立的端点，如果离别的线在 `--snap` 以内，就移到那条线上最近的点，并在那条线上插入同一个顶点，处理 T 形接头差一点没碰上的情况。
+  - 本来就落在线上的端点只插入顶点，不计入移动。
+  - 合并和移动的次数、最大移动距离记入清单。
+- **打断与围面**：所有线一起打断（重合的线段去重），再用 GEOS 的 polygonize 围成面。
+- **缺口（`--max-gap`，米，必填，须大于 `--snap`）**：打断后只连着一条边的端点视为自由端。自由端之间，或自由端到另一条边，距离不超过 `--max-gap` 的，写入 `qa_gaps`：`kind` 为 `endpoint` 或 `to-line`，另有 `length_m`、两侧句柄 `handles_a` / `handles_b`。同一条边的两端只有在沿边绕行远长于缺口时才算缺口，所以一段短的孤立线不会报成缺口。
+- **补缺口**：默认不补。加 `--close-gaps` 才用直线补上全部报告的缺口，补线写入 `added_lines`；用到补线的面 `closed_gap = true`，缺口记录的 `closed = true`。
+- **悬挂线**：`qa_dangles` 列出悬挂线（`dangle`）、面内的切割边（`cut-edge`）和无效环（`invalid-ring`），附长度和来源句柄。没闭合的整段线也会出现在这里。
+- **面（`faces`）**：字段 `face_id`（按位置从上到下、从左到右编号）、`area_m2`、`status`、`reason`、`valid`、`closed_gap`、`source_handles`（围成这个面的原始线句柄，逗号分隔）。
+  - 面积小于 `--min-area`（m²，必填）的面不删除，`status = hold`，`reason` 写"sliver"。
+  - 无效的面同样 hold。其余的面为 `pass`，`pass` 也只是候选。
+  - 这一步不判断面的性质，道路面留给文字挂接一步判定。
+- **规划范围线（`--boundary`）**：给出范围线所在的 CAD 图层，它的线参与打断（自动加入 `--cad-layers`），并且单独围成范围面；范围外的面不输出，个数记为 `outside_boundary`；清单记录面总面积、范围面积和两者的比值。范围线围不成面时报错。不给时不裁剪，清单注明面积未按规划范围限定。
+- **拓扑检查**：对面调用 `topo.py` 的检查（缺口、重叠、碎面、无效几何、重复），碎面阈值取 `--min-area`，结果写入 `qa_topology`。没有 CRS 时，在一个只代表图纸平面的米制坐标系里计算，清单注明。
+- **输出**：新目录，含 `faces.gpkg`（`faces`、`qa_gaps`、`qa_dangles`、`qa_topology`、`added_lines` 五个图层；空图层也保留字段结构）、`check.png`（通过的面浅蓝、hold 的面橙色，缺口红色、悬挂线紫色、补线绿色）、`manifest.json`（`manifest: cad-polygonize` v1：参数、用到的线数、吸附统计、各图层要素数、面的通过 / hold / 范围外个数、面积、说明）和 `record.json`。写出后回读核对各图层要素数。
 
 ## 确认后赋 CRS
 

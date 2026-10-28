@@ -17,6 +17,10 @@ Writes cad.json, check.png and record.json to a new directory. DWG is not read; 
 blocks) with layer and handle on every feature: curves flattened to --arc-tolerance, units scaled to metres
 by an explicit --units, non-zero Z refused unless --drop-z, no CRS. It needs ezdxf.
 
+`cad.py polygonize` merges endpoints within --snap (and moves free ends onto lines within it), nodes the
+lines and polygonizes them into faces.gpkg: faces (small or invalid ones held, never dropped), gaps up to
+--max-gap and dangles as QA layers, topo.py checks on the faces. Gaps are closed only with --close-gaps.
+
 `cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
 confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
 (or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
@@ -778,6 +782,205 @@ def extract(args):
     return manifest
 
 
+# A plane in metres with no location, so topo.py can measure faces of a drawing that has no CRS yet.
+DRAWING_PLANE = '+proj=tmerc +lat_0=0 +lon_0=0 +k=1 +x_0=0 +y_0=0 +ellps=GRS80 +units=m +no_defs'
+FACE_LAYERS = {
+    'faces': ('Polygon', ('face_id', 'area_m2', 'status', 'reason', 'valid', 'closed_gap', 'source_handles')),
+    'qa_gaps': ('LineString', ('kind', 'length_m', 'handles_a', 'handles_b', 'closed')),
+    'qa_dangles': ('LineString', ('kind', 'length_m', 'handles')),
+    'qa_topology': ('Unknown', ('check', 'detail', 'area_m2', 'face_a', 'face_b')),
+    'added_lines': ('LineString', ('length_m', 'handles_a', 'handles_b')),
+}
+
+
+def plot_faces(frames, path, title, font):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    figure, axis = plt.subplots(figsize=(10, 9))
+    faces = frames['faces']
+    for status, colour in (('pass', '#cfe3f5'), ('hold', '#f6b26b')):
+        part = faces[faces['status'] == status]
+        if len(part):
+            part.plot(ax=axis, facecolor=colour, edgecolor='#4a4a4a', linewidth=0.4)
+    for name, colour, width in (('qa_dangles', '#8e44ad', 1.0), ('added_lines', '#27ae60', 1.6), ('qa_gaps', '#d62728', 1.6)):
+        if len(frames[name]):
+            frames[name].plot(ax=axis, color=colour, linewidth=width)
+            ends = frames[name].geometry.boundary.explode(index_parts=False)
+            axis.scatter(ends.x, ends.y, color=colour, s=14, zorder=5)
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor=c, edgecolor='#4a4a4a', label=l)
+               for c, l in (('#cfe3f5', 'face pass'), ('#f6b26b', 'face hold'))]
+    handles += [plt.Line2D([], [], color=c, linewidth=2, label=l)
+                for c, l in (('#d62728', 'gap'), ('#8e44ad', 'dangle / cut edge'), ('#27ae60', 'added by --close-gaps'))]
+    axis.legend(handles=handles, loc='upper right', fontsize=8)
+    axis.set_aspect('equal', adjustable='datalim')
+    axis.ticklabel_format(useOffset=False, style='plain')
+    axis.tick_params(labelsize=7)
+    axis.set_title(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def polygonize(args):
+    """Snap, node and polygonize extracted CAD lines into candidate faces with gap, dangle and topology checks."""
+    import warnings as python_warnings
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    import _cad_faces as F
+    from topo import check_topology
+    if not (args.snap > 0 and args.max_gap > args.snap and args.min_area >= 0):
+        raise ValueError('Need --snap > 0, --max-gap > --snap and --min-area >= 0')
+    source = Path(args.source)
+    check_vector(source, args.lines_layer)
+    frame = gpd.read_file(source, layer=args.lines_layer, engine='pyogrio')
+    if 'layer' not in frame:
+        raise ValueError(f'{source}:{args.lines_layer} has no "layer" field; use cad.py extract output')
+    if frame.crs is not None:
+        crs = CRS.from_user_input(frame.crs)
+        unit = crs.axis_info[0].unit_name if crs.axis_info else None
+        if not crs.is_projected or unit != 'metre':
+            raise ValueError(f'Input CRS must be projected in metres; got {crs.name}')
+    frame = frame[frame.geometry.notna() & ~frame.geometry.is_empty].explode(index_parts=False)
+    frame = frame[frame.geom_type == 'LineString']
+    present = sorted(frame['layer'].dropna().unique())
+    wanted = [n.strip() for n in args.cad_layers.split(',')] if args.cad_layers else list(present)
+    if args.boundary and args.boundary not in wanted:
+        wanted.append(args.boundary)
+    unknown = [n for n in wanted if n not in present]
+    if unknown:
+        raise ValueError(f'No lines on CAD layers {", ".join(unknown)}; layers present: {", ".join(present)}')
+    rows = frame[frame['layer'].isin(wanted)].reset_index(drop=True)
+    labels = [h if isinstance(h, str) and h else (s if isinstance(s, str) and s else None)
+              for h, s in zip(rows.get('handle', [None]*len(rows)), rows.get('source_handle', [None]*len(rows)))]
+
+    snapped, moves = F.snap([shapely.get_coordinates(g) for g in rows.geometry], args.snap)
+    lines = F.as_lines(snapped)
+    kept = shapely.length(lines) > 0
+    collapsed = int((~kept).sum())
+    lines, labels, layers = lines[kept], [l for l, k in zip(labels, kept) if k], rows['layer'].to_numpy()[kept]
+    edges, polys, cuts, dangles, invalid_rings = F.faces(lines)
+    found = F.gaps(edges, args.max_gap)
+    edge_labels = F.sources(edges, lines, labels)
+    added = np.array([g[0] for g in found], dtype=object) if args.close_gaps and found else np.array([], dtype=object)
+    if len(added):
+        edges, polys, cuts, dangles, invalid_rings = F.faces(np.concatenate([lines, added]))
+        edge_labels = F.sources(edges, lines, labels)
+
+    notes = []
+    boundary = None
+    if args.boundary:
+        _, ring_faces, *_ = F.faces(lines[layers == args.boundary])
+        if not len(ring_faces):
+            raise ValueError(f'Lines on boundary layer {args.boundary} do not close into an area at --snap {args.snap}')
+        boundary = shapely.union_all(ring_faces)
+        inside = shapely.within(shapely.point_on_surface(polys), boundary) if len(polys) else np.array([], bool)
+        outside = int((~inside).sum())
+        polys = polys[inside]
+    else:
+        outside = None
+        notes.append('No --boundary: faces are not limited to a planning area, so their total is not a planning-area total')
+
+    edge_tree = shapely.STRtree(edges)
+    added_tree = shapely.STRtree(added) if len(added) else None
+    face_rows = []
+    for polygon in polys:
+        valid = bool(shapely.is_valid(polygon))
+        area = float(shapely.area(polygon))
+        reasons = ([] if valid else ['invalid geometry']) + (['sliver: area below --min-area'] if area < args.min_area else [])
+        closed_gap = bool(added_tree is not None and any(
+            shapely.distance(shapely.boundary(polygon), shapely.line_interpolate_point(added[k], 0.5, normalized=True)) <= F.ON_EDGE
+            for k in added_tree.query(polygon, predicate='intersects')))
+        face_rows.append({'area_m2': round(area, 4), 'status': 'hold' if reasons else 'pass', 'reason': '; '.join(reasons) or None,
+                          'valid': valid, 'closed_gap': closed_gap,
+                          'source_handles': ','.join(F.boundary_handles(polygon, edges, edge_labels, edge_tree)) or None,
+                          'geometry': polygon})
+    centre = lambda row: shapely.get_coordinates(shapely.point_on_surface(row['geometry']))[0]
+    face_rows.sort(key=lambda row: (-round(centre(row)[1], 3), round(centre(row)[0], 3)))
+    for number, row in enumerate(face_rows, 1):
+        row['face_id'] = number
+
+    def labelled(index):
+        return ','.join(edge_labels[index]) or None
+    gap_rows = [{'kind': kind, 'length_m': round(float(shapely.length(line)), 4), 'handles_a': labelled(a), 'handles_b': labelled(b),
+                 'closed': bool(len(added)), 'geometry': line} for line, kind, a, b in found]
+    loose = [(kind, g) for kind, parts in (('dangle', dangles), ('cut-edge', cuts), ('invalid-ring', invalid_rings)) for g in parts]
+    loose_labels = F.sources([g for _, g in loose], lines, labels) if loose else []
+    dangle_rows = [{'kind': kind, 'length_m': round(float(shapely.length(g)), 4), 'handles': ','.join(h) or None, 'geometry': g}
+                   for (kind, g), h in zip(loose, loose_labels)]
+    added_rows = [{'length_m': r['length_m'], 'handles_a': r['handles_a'], 'handles_b': r['handles_b'], 'geometry': r['geometry']}
+                  for r in gap_rows] if len(added) else []
+
+    out_crs = frame.crs
+    face_frame = gpd.GeoDataFrame(face_rows, columns=[*FACE_LAYERS['faces'][1], 'geometry'], geometry='geometry', crs=out_crs)
+    topology = []
+    if len(face_frame):
+        report = check_topology(face_frame.set_crs(out_crs or DRAWING_PLANE, allow_override=True), id_field='face_id',
+                                checks={'gaps', 'overlaps', 'slivers', 'invalid-geometries', 'duplicates'},
+                                sliver_threshold_m2=args.min_area)
+        topology = [{'check': e.check, 'detail': e.detail, 'area_m2': e.area_m2, 'face_a': e.feature_a, 'face_b': e.feature_b,
+                     'geometry': e.geometry} for e in report.errors]
+        if out_crs is None:
+            notes.append('Topology was measured in the drawing plane (metres, no CRS)')
+    frames = {'faces': face_frame}
+    for name, rows_ in (('qa_gaps', gap_rows), ('qa_dangles', dangle_rows), ('qa_topology', topology), ('added_lines', added_rows)):
+        frames[name] = gpd.GeoDataFrame(rows_, columns=[*FACE_LAYERS[name][1], 'geometry'], geometry='geometry', crs=out_crs)
+    counts = {name: len(f) for name, f in frames.items()}
+    hold = int((face_frame['status'] == 'hold').sum()) if len(face_frame) else 0
+    total = float(face_frame['area_m2'].sum()) if len(face_frame) else 0.0
+    coverage = {'faces_area_m2': round(total, 3), 'boundary_area_m2': round(float(shapely.area(boundary)), 3) if boundary is not None else None}
+    if boundary is not None and coverage['boundary_area_m2']:
+        coverage['share_of_boundary'] = round(total/coverage['boundary_area_m2'], 6)
+    moved = [m[2] for m in moves]
+
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    stat = source.stat()
+    with bundle(args.output) as stage:
+        target = stage / 'faces.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, f in frames.items():
+                pyogrio.write_dataframe(f, target, layer=name, driver='GPKG', geometry_type=FACE_LAYERS[name][0])
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in frames}
+        if back != counts:
+            raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
+        plot_faces(frames, stage / 'check.png',
+                   f'{source.name} · {counts["faces"]} faces ({hold} hold) · {counts["qa_gaps"]} gaps · {counts["qa_dangles"]} dangles', font)
+        manifest = {'manifest': 'cad-polygonize', 'schema_version': 1,
+                    'source': {'name': source.name, 'layer': args.lines_layer, 'bytes': stat.st_size, 'sha256': digest(source),
+                               'crs': CRS.from_user_input(out_crs).to_string() if out_crs is not None else None},
+                    'parameters': {'cad_layers': wanted, 'boundary': args.boundary, 'snap_m': args.snap, 'max_gap_m': args.max_gap,
+                                   'min_area_m2': args.min_area, 'close_gaps': args.close_gaps},
+                    'lines': {'used': int(len(rows)), 'collapsed_by_snap': collapsed, 'edges_after_noding': int(len(edges))},
+                    'snap': {'endpoints_merged': sum(1 for m in moves if m[0] == 'endpoint'),
+                             'endpoints_moved_to_line': sum(1 for m in moves if m[0] == 'to-line'),
+                             'largest_move_m': round(max(moved), 6) if moved else 0.0},
+                    'layers': counts, 'faces': {'pass': counts['faces']-hold, 'hold': hold, 'outside_boundary': outside},
+                    'area': coverage, 'notes': notes,
+                    'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad polygonize', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
+                                                      'check.png': digest(stage / 'check.png')},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Coordinates are in metres (cad.py extract output or a projected CRS in metres)',
+                                                            'Endpoints within --snap are merged and free ends within --snap are moved onto the nearest line',
+                                                            'Gaps up to --max-gap are reported; they are closed only with --close-gaps, and marked',
+                                                            'Faces are candidates: no face is dropped for size, small and invalid ones are held']})
+    return manifest
+
+
 def load_inspection(path):
     path = Path(path)
     path = path / 'cad.json' if path.is_dir() else path
@@ -893,6 +1096,16 @@ def main():
     pull.add_argument('--drop-z', action='store_true', help='Flatten non-zero Z; without it such features are refused')
     pull.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936')
     pull.add_argument('--output', required=True, help='New directory for raw.gpkg, manifest.json and record.json')
+    faces = commands.add_parser('polygonize', help='Snap, node and polygonize extracted lines into candidate faces')
+    faces.add_argument('source', help='raw.gpkg from cad.py extract (or a line layer with a "layer" field, in metres)')
+    faces.add_argument('--lines-layer', default='lines', help='Line layer within source (default lines)')
+    faces.add_argument('--cad-layers', help='Comma-separated CAD layers to use (default: every layer in the line layer)')
+    faces.add_argument('--boundary', help='CAD layer whose lines enclose the planning area; faces outside are dropped and counted')
+    faces.add_argument('--snap', type=float, required=True, help='Merge endpoints, and move free ends onto lines, within this many metres')
+    faces.add_argument('--max-gap', type=float, required=True, help='Report gaps up to this many metres (must exceed --snap)')
+    faces.add_argument('--min-area', type=float, required=True, help='Faces smaller than this many m² are held as suspected slivers')
+    faces.add_argument('--close-gaps', action='store_true', help='Close reported gaps with added lines, kept in added_lines and marked')
+    faces.add_argument('--output', required=True, help='New directory for faces.gpkg, check.png, manifest.json and record.json')
     assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
     assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
     assign.add_argument('--layer', help='Layer within source; required when it has several')
@@ -908,6 +1121,11 @@ def main():
             manifest = extract(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
                               'skipped': manifest['skipped'], 'warnings': manifest['warnings']}, ensure_ascii=False))
+            return
+        if args.command == 'polygonize':
+            manifest = polygonize(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'], 'faces': manifest['faces'],
+                              'area': manifest['area']}, ensure_ascii=False))
             return
         if args.command == 'assign-crs':
             manifest = assign_crs(args)

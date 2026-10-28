@@ -432,3 +432,115 @@ def test_extract_then_assign_crs(tmp_path):
     manifest = assign(tmp_path/'raw'/'raw.gpkg', tmp_path/'crs', '--layer', 'closed_polygons', '--inspection', tmp_path/'inspect',
                       '--crs', 'EPSG:4526', *CONFIRM)
     assert manifest['crs']['id'] == 'EPSG:4526' and manifest['input']['layer'] == 'closed_polygons'
+
+
+def linework(path, lines):
+    """A raw.gpkg-like `lines` layer: (CAD layer, handle, coordinates) per line, no CRS."""
+    frame = gpd.GeoDataFrame({'layer': [l for l, _, _ in lines], 'handle': [h for _, h, _ in lines]},
+                             geometry=[LineString(c) for _, _, c in lines])
+    with pytest.warns(UserWarning):
+        frame.to_file(path, layer='lines')
+    return path
+
+
+def rect(x, y, w, h, gap=0.0):
+    """A rectangle as one open line; with `gap`, its last vertex stops `gap` short of the first along the bottom edge."""
+    return [(x+gap, y), (x+w, y), (x+w, y+h), (x, y+h), (x, y)] if gap else [(x, y), (x+w, y), (x+w, y+h), (x, y+h), (x, y)]
+
+
+def polygonize(source, out, *extra, success=True, snap=0.05, max_gap=0.5, min_area=10):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'polygonize', str(source), '--output', str(out),
+                             '--snap', str(snap), '--max-gap', str(max_gap), '--min-area', str(min_area), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def faces_of(out, name='faces'):
+    return gpd.read_file(out/'faces.gpkg', layer=name)
+
+
+def test_polygonize_closed_rectangles_and_shared_edge(tmp_path):
+    source = linework(tmp_path/'raw.gpkg', [('地块', 'A', rect(0, 0, 50, 40)), ('地块', 'B', rect(50, 0, 30, 40)),
+                                            ('地块', 'C', rect(200, 0, 20, 20))])
+    manifest = polygonize(source, tmp_path/'out')
+    faces = faces_of(tmp_path/'out')
+    assert manifest['faces'] == {'pass': 3, 'hold': 0, 'outside_boundary': None}
+    assert sorted(faces['area_m2']) == [400, 1200, 2000] and faces['valid'].all()
+    shared = faces[faces['area_m2'] == 2000].iloc[0]
+    assert shared['source_handles'] == 'A,B'  # the shared side belongs to both rectangles
+    assert manifest['layers']['qa_gaps'] == 0 and manifest['layers']['qa_dangles'] == 0
+    assert not any(row['check'] == 'overlaps' for _, row in faces_of(tmp_path/'out', 'qa_topology').iterrows())
+    assert manifest['area']['boundary_area_m2'] is None and manifest['notes'][0].startswith('No --boundary')
+    assert (tmp_path/'out'/'check.png').stat().st_size > 10_000 and faces.crs is None
+
+
+def test_polygonize_small_gap_snaps_large_gap_is_reported(tmp_path):
+    source = linework(tmp_path/'raw.gpkg', [('地块', 'S', rect(0, 0, 10, 10, gap=0.03)), ('地块', 'L', rect(100, 0, 10, 10, gap=0.3))])
+    manifest = polygonize(source, tmp_path/'out')
+    assert manifest['snap']['endpoints_merged'] == 2 and manifest['snap']['largest_move_m'] == pytest.approx(0.015)
+    faces = faces_of(tmp_path/'out')
+    assert len(faces) == 1 and faces['source_handles'].iloc[0] == 'S'
+    gap = faces_of(tmp_path/'out', 'qa_gaps')
+    assert len(gap) == 1 and gap['kind'].iloc[0] == 'endpoint' and gap['length_m'].iloc[0] == pytest.approx(0.3)
+    assert gap['handles_a'].iloc[0] == 'L' and not gap['closed'].iloc[0]
+    closed = polygonize(source, tmp_path/'closed', '--close-gaps')
+    faces = faces_of(tmp_path/'closed')
+    assert len(faces) == 2 and faces.set_index('source_handles').loc['L', 'closed_gap'] and closed['layers']['added_lines'] == 1
+
+
+def test_polygonize_t_junction_dangle_sliver_and_stray(tmp_path):
+    source = linework(tmp_path/'raw.gpkg', [
+        ('地块', 'R', rect(0, 0, 40, 20)),
+        ('地块', 'T', [(20, 0.02), (20, 20)]),        # stops 0.02 short of the bottom side
+        ('地块', 'D', [(40, 10), (60, 10)]),          # sticks out: a dangle
+        ('地块', 'P', rect(100, 0, 1, 2)),            # 2 m²: a suspected sliver
+        ('地块', 'X', [(300, 0), (300.4, 0)]),        # short stray line, not a gap
+    ])
+    manifest = polygonize(source, tmp_path/'out')
+    assert manifest['snap']['endpoints_moved_to_line'] == 1
+    faces = faces_of(tmp_path/'out')
+    assert sorted(faces['area_m2']) == [2, 400, 400]
+    sliver = faces[faces['area_m2'] == 2].iloc[0]
+    assert sliver['status'] == 'hold' and 'sliver' in sliver['reason']
+    loose = faces_of(tmp_path/'out', 'qa_dangles')
+    assert set(loose['handles']) == {'D', 'X'} and set(loose['kind']) == {'dangle'}
+    assert manifest['layers']['qa_gaps'] == 0
+    assert any(row['check'] == 'slivers' for _, row in faces_of(tmp_path/'out', 'qa_topology').iterrows())
+
+
+def test_polygonize_boundary_limits_faces(tmp_path):
+    source = linework(tmp_path/'raw.gpkg', [
+        ('规划范围线', 'B', rect(0, 0, 100, 50)),
+        ('地块', 'A', [(50, 0), (50, 50)]),
+        ('地块', 'O', rect(200, 0, 20, 20)),
+    ])
+    manifest = polygonize(source, tmp_path/'out', '--cad-layers', '地块', '--boundary', '规划范围线')
+    assert manifest['faces']['outside_boundary'] == 1 and manifest['parameters']['cad_layers'] == ['地块', '规划范围线']
+    assert manifest['area'] == {'faces_area_m2': 5000.0, 'boundary_area_m2': 5000.0, 'share_of_boundary': 1.0}
+    assert len(faces_of(tmp_path/'out')) == 2
+    open_boundary = linework(tmp_path/'open.gpkg', [('规划范围线', 'B', rect(0, 0, 100, 50, gap=2))])
+    assert 'do not close' in polygonize(open_boundary, tmp_path/'bad', '--boundary', '规划范围线', success=False)
+
+
+def test_polygonize_refusals_and_crs(tmp_path):
+    source = linework(tmp_path/'raw.gpkg', [('地块', 'A', rect(0, 0, 10, 10))])
+    assert '--max-gap > --snap' in polygonize(source, tmp_path/'a', snap=0.5, max_gap=0.5, success=False)
+    assert 'No lines on CAD layers 不存在' in polygonize(source, tmp_path/'b', '--cad-layers', '不存在', success=False)
+    projected = tmp_path/'projected.gpkg'
+    gpd.read_file(source, layer='lines').set_crs('EPSG:4547').to_file(projected, layer='lines')
+    assert polygonize(projected, tmp_path/'c')['source']['crs'] == 'EPSG:4547'
+    assert faces_of(tmp_path/'c').crs.to_epsg() == 4547
+    lonlat = tmp_path/'lonlat.gpkg'
+    gpd.read_file(source, layer='lines').set_crs('EPSG:4326').to_file(lonlat, layer='lines')
+    assert 'projected in metres' in polygonize(lonlat, tmp_path/'d', success=False)
+
+
+def test_extract_then_polygonize(tmp_path):
+    source = plan_drawing(tmp_path/'plan.dxf')
+    extract(source, tmp_path/'raw', '--units', 'header', '--layers', '地块界线,道路')
+    manifest = polygonize(tmp_path/'raw'/'raw.gpkg', tmp_path/'faces')
+    faces = faces_of(tmp_path/'faces')
+    # 100 x 100 square plus a half disc of radius 50 on its right side, flattened at 0.05 m.
+    assert len(faces) == 1 and faces['area_m2'].iloc[0] == pytest.approx(10_000 + math.pi*50**2/2, rel=1e-3)
+    assert manifest['layers']['qa_dangles'] == 1  # the road line runs on past the parcel
