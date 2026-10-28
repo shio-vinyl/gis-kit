@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 新子命令 `cad.py xiangyuan`：湘源控规图则直取。带 `用地代码` 扩展数据的闭合多段线即地块，扩展数据（每个属性一个应用名）按原名全部转成字段，另加 `parcel_id`、`landuse`、`landuse_name`、`control_type`、`unit_id`、计算面积与 `用地面积` 的差。图层与用地代码不符、删除标记、缺编号、重复编号、无效几何、面积差超限的面标 hold；编号图块逐个核对；`DY范围` 按 `DY编号` 命名为单元（重复的面识别出来）；另取配套设施与规划边界。`--units header` 与 `用地面积` 矛盾时拒绝。妈湾法图实测：54 个地块、45 个规划控制单元、97 个编号图块全部一致。
 - 新子命令 `cad.py convert`：调用本机已装的 ODA File Converter 或 LibreDWG（`dwg2dxf`），在副本上把 DWG 转成 DXF，回读版本、实体数、图层数与范围，写入 `manifest.json`（`cad-convert` v1）；不安装转换器，没有时报错。用妈湾法图（AC1032）实测 LibreDWG 0.14 可转。
 - `cad.py inspect` / `extract` 的编码处理：R2007 及以上的 DXF 一律按 UTF-8 读（此前 GDAL 按 `$DWGCODEPAGE` 读，ANSI_936 的 R2018 图纸会乱码），早期版本疑似 GBK 被读成 Latin-1 时自动用 CP936、GB18030 重读，取无法解码最少的一种，并记入 `encoding`。GDAL 读取取消每块 10000 要素的上限，多面网格不再导致读取失败；LibreDWG 写出的不合规 XDATA 会在副本中去掉后再交给 ezdxf，并计数。
 - 新脚本 `vector-georef.py`：用经过检查的四参数（默认）或六参数仿射变换，把局部平面坐标的矢量（城市独立坐标、CAD 成果）转到投影坐标系。`fit` 由显式标注 fit/check 的同名点拟合，按事先给定的检查点 RMSE / 最大误差判定 pass 或 hold，并画残差图；`define` 记录官方或用户给的参数，可用点检查；`apply` 转换全部图层，hold 的变换需 `--allow-hold`，落在拟合点凸包外的要素标为 `extrapolated`。说明见 `references/vector-georeferencing.md`。

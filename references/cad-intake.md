@@ -85,6 +85,43 @@ python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad
 
 输出目录必须是新的。
 
+## 湘源控规图纸直取
+
+湘源控规画的图则，地块本身就带着全部属性，可以跳过下面的提取、围面和文字挂接，用 `cad.py xiangyuan` 直接取。需要 ezdxf。
+
+```bash
+python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /work/cad/fatu-xy
+```
+
+- **湘源怎么存地块**（妈湾法图实测）：
+  - 地块边界：`<用地代码>_K` 图层上的闭合多段线（例如 `C1+R2_K`）；填充：`<用地代码>_T` 图层上的 HATCH。
+  - 属性：存在边界线的扩展数据里，每个属性单独注册成一个应用名（`地块编号`、`用地代码`、`用地性质`、`用地面积`、`容积率`、`建筑限高`、`配套设施名称`、`管控类型`、`主要功能代码`、`删除标记` 等），值放在 1000 组码。
+  - 规划控制单元：`用地代码 = DY`。
+  - 编号图块：`12 地块编号` 图层上的 `地块编号` 图块，块属性里重复了地块的属性。
+  - 配套设施：`配套设施` 图层上的图块，扩展数据里带设施类别、名称、建设状态、所在地块编号。
+- **地块（`parcels`）**：每条带 `用地代码` 扩展数据的闭合多段线生成一个面，圆弧按 `--arc-tolerance` 离散。
+  - 扩展数据字段按原名全部保留（清单 `fields` 列出），另加 `parcel_id`（地块编号）、`landuse`（用地代码）、`landuse_name`（用地性质）、`control_type`（`地块` / `规划控制单元`）、`unit_id`、`area_m2`（按几何算）、`area_declared`（`用地面积`）、`area_diff`（相对差）、`number_block`（有没有编号图块落在里面且编号一致）、`valid`、`layer`、`handle`。
+  - 出现下列情况时标 hold，并写明原因：
+    - 图层既不是 `<用地代码>_K` 也不是 `<用地代码>`；
+    - 有删除标记；
+    - 没有地块编号；
+    - 同类面里编号重复；
+    - 几何无效；
+    - 给了 `--max-area-diff` 时，面积差超过它。
+- **编号图块核对**：编号图块不在任何面里（`number-block-outside`），或者所在面的编号不一致（`number-block-mismatch`）时，写入 `qa_number_blocks`。
+- **单元（`units`）**：`--unit-layer`（默认 `DY范围`）上的闭合面，按落在里面的 `--unit-label-layer`（默认 `DY编号`）文字命名。
+  - 没有标签、有多个标签、或者与已有的面重合（不论起点和方向）的，都标 hold。
+  - 地块按代表点落在哪个单元来取 `unit_id`。
+  - 清单的 `area.units_by_id_m2` 给出各单元面积，可以直接对照说明书。
+- **配套设施（`facilities`）、规划边界（`boundary`）**：分别取 `--facility-layer`（默认 `配套设施`）的图块，和 `--boundary-layer`（默认 `----规划边界`）的闭合面。清单记录地块面积在边界内的部分。图层名不一样时用参数指定，传空值就跳过。
+- **单位**：`--units m|mm|header` 必填。湘源图纸的 `$INSUNITS` 常写成英寸，实际按米画；用 `header` 时，如果 `用地面积` 只有按米算才对得上，就拒绝执行，并提示改用 `--units m`。
+- **输出**：
+  - `parcels.gpkg`：`parcels`、`units`、`facilities`、`qa_number_blocks`、`boundary`，无 CRS；
+  - `check.png`：地块按用地大类着色，单元画虚线，hold 的面描橙边；
+  - `manifest.json`（`manifest: cad-xiangyuan` v1）：统计、hold 原因、面积汇总；
+  - `record.json`。
+- **CRS**：不设 CRS，之后接 `assign-crs` 或 [矢量控制点转换](vector-georeferencing.md)。
+
 ## 实体提取
 
 `cad.py extract` 把选定图层的模型空间实体写成 `raw.gpkg`，每个要素都带 `layer` 和 `handle`，后续步骤可以追溯到原图实体。需要 ezdxf。

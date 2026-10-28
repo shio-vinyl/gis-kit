@@ -766,3 +766,94 @@ def test_convert_with_libredwg(tmp_path):
     # LibreDWG's dxf2dwg is experimental, so only the conversion itself is checked here, not its content.
     assert manifest['converter']['tool'] in ('libredwg', 'oda') and manifest['source']['release'] == 'R2000'
     assert manifest['readback']['header']['acadver'] and (tmp_path/'out'/'seed.dxf').stat().st_size > 0
+
+
+def xiangyuan_drawing(path):
+    """A small drawing laid out the way 湘源控规 writes one: parcel outlines on <code>_K with one XDATA application per
+    attribute, number blocks repeating them, units on DY范围 named by DY编号, facilities and a planning boundary."""
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    doc.header['$INSUNITS'] = 1  # 湘源 drawings often say inches while drawn in metres
+    msp = doc.modelspace()
+    fields = ('地块编号', '用地代码', '用地性质', '用地面积', '容积率', '删除标记', '设施小类名称', '地块')
+    for name in fields:
+        doc.appids.new(name)
+    def parcel(layer, number, code, name, box_, declared=None, deleted='', bulge=False):
+        x0, y0, x1, y1 = box_
+        points = [(x0, y0, 0, 0, 0), (x1, y0, 0, 0, 1 if bulge else 0), (x1, y1, 0, 0, 0), (x0, y1, 0, 0, 0)]
+        outline = msp.add_lwpolyline(points, format='xyseb', close=True, dxfattribs={'layer': layer})
+        area = (x1-x0)*(y1-y0) + (math.pi*((y1-y0)/2)**2/2 if bulge else 0)
+        for key, value in (('地块编号', number), ('用地代码', code), ('用地性质', name),
+                           ('用地面积', str(round(declared if declared is not None else area))), ('容积率', '2.5'), ('删除标记', deleted)):
+            outline.set_xdata(key, [(1000, value)])
+        return outline
+    parcel('C1_K', '01-01', 'C1', '商业用地', (0, 0, 100, 80), bulge=True)
+    parcel('G1+C1', '01-02', 'G1+C1', '公园绿地', (100, 0, 200, 80))           # suffix dropped: still consistent
+    parcel('R2_K', '01-03', 'R3', '三类居住用地', (0, 80, 100, 160))           # layer says R2, XDATA says R3
+    parcel('C1_K', '01-01', 'C1', '商业用地', (100, 80, 200, 160))            # duplicate number
+    parcel('C1_K', '01-05', 'C1', '商业用地', (200, 0, 300, 80), deleted='1')
+    parcel('G1_K', '01-06', 'G1', '公园绿地', (200, 80, 300, 160), declared=5000)  # 8000 m² drawn
+    parcel('DY_K', '02-01', 'DY', '规划控制单元', (0, 200, 300, 300))
+    block = doc.blocks.new('地块编号')
+    for tag in ('地块编号', '用地代码'):
+        block.add_attdef(tag, (0, 0))
+    for point, number in (((150, 40), '01-02'), ((50, 120), '09-09'), ((500, 500), '01-07')):
+        msp.add_blockref('地块编号', point, dxfattribs={'layer': '12 地块编号'}).add_attrib('地块编号', number, point)
+    facility = msp.add_blockref('地块编号', (250, 250), dxfattribs={'layer': '配套设施'})
+    facility.set_xdata('设施小类名称', [(1000, '通信机房')])
+    facility.set_xdata('地块编号', [(1000, '02-01')])
+    msp.add_lwpolyline([(-10, -10), (310, -10), (310, 310), (-10, 310)], close=True, dxfattribs={'layer': '----规划边界'})
+    msp.add_lwpolyline([(0, 0), (300, 0), (300, 160), (0, 160)], close=True, dxfattribs={'layer': 'DY范围'})
+    msp.add_lwpolyline([(0, 160), (300, 160), (300, 0), (0, 0)], close=True, dxfattribs={'layer': 'DY范围'})  # same, reversed
+    msp.add_lwpolyline([(0, 200), (300, 200), (300, 300), (0, 300)], close=True, dxfattribs={'layer': 'DY范围'})
+    msp.add_mtext('DY01', dxfattribs={'layer': 'DY编号', 'insert': (150, 100)})
+    msp.add_lwpolyline([(400, 0), (500, 0), (500, 50)], dxfattribs={'layer': '地块'})  # no XDATA: ignored
+    doc.saveas(path)
+    return path
+
+
+def xiangyuan(source, out, *extra, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'xiangyuan', str(source), '--output', str(out), *map(str, extra)],
+                            capture_output=True, text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def test_xiangyuan_parcels_from_xdata(tmp_path):
+    source = xiangyuan_drawing(tmp_path/'xy.dxf')
+    manifest = xiangyuan(source, tmp_path/'out', '--units', 'm', '--max-area-diff', 0.005)
+    parcels = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='parcels')
+    by = {(row['parcel_id'], row['layer']): row for _, row in parcels.iterrows()}
+    first, second = parcels[parcels['parcel_id'] == '01-01'].sort_values('area_m2', ascending=False).itertuples()
+    assert first.landuse == 'C1' and first.landuse_name == '商业用地' and first.容积率 == '2.5'
+    assert first.area_m2 == pytest.approx(8000 + math.pi*40**2/2, rel=1e-3) and abs(first.area_diff) < 1e-3
+    assert 'duplicate 地块编号' in first.reason and 'duplicate 地块编号' in second.reason
+    g = by[('01-02', 'G1+C1')]
+    assert g['status'] == 'pass' and g['number_block'] and g['unit_id'] == 'DY01'
+    assert 'layer R2_K does not match 用地代码 R3' in by[('01-03', 'R2_K')]['reason']
+    assert by[('01-05', 'C1_K')]['reason'] == 'marked deleted'
+    assert by[('01-06', 'G1_K')]['reason'].startswith('area differs from 用地面积 by +60.00%')
+    unit = by[('02-01', 'DY_K')]
+    assert unit['control_type'] == '规划控制单元' and unit['status'] == 'pass' and unit['unit_id'] is None
+    assert {'地块编号', '用地代码', '用地性质', '用地面积', '容积率', '删除标记'} <= set(manifest['fields'])
+    checks = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='qa_number_blocks')
+    assert sorted(zip(checks['kind'], checks['parcel_id'], checks['found'].fillna(''))) == [
+        ('number-block-mismatch', '09-09', '01-03'), ('number-block-outside', '01-07', '')]
+    units = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='units').sort_values('handle')
+    assert list(units['status']) == ['pass', 'hold', 'hold']
+    assert list(units['reason'].fillna('')) == ['', 'duplicate outline', 'no unit label inside']
+    assert manifest['area']['units_by_id_m2'] == {'DY01': 48000.0}
+    facilities = gpd.read_file(tmp_path/'out'/'parcels.gpkg', layer='facilities')
+    assert facilities['设施小类名称'].tolist() == ['通信机房'] and facilities['地块编号'].tolist() == ['02-01']
+    assert manifest['summary']['parcels'] == 6 and manifest['summary']['control_units'] == 1
+    assert manifest['area']['boundary_m2'] == pytest.approx(320*320)
+    assert manifest['summary']['number_block_problems'] == 2 and (tmp_path/'out'/'check.png').stat().st_size > 10_000
+
+
+def test_xiangyuan_refusals(tmp_path):
+    source = xiangyuan_drawing(tmp_path/'xy.dxf')
+    message = xiangyuan(source, tmp_path/'a', '--units', 'header', success=False)  # header says inches
+    assert 'matches the drawing in metres' in message and 'pass --units m' in message
+    plain = dxf(tmp_path/'plain.dxf', site(0, 0))
+    assert 'does not look like a 湘源控规 drawing' in xiangyuan(plain, tmp_path/'b', '--units', 'm', success=False)
+    assert 'convert DWG first' in xiangyuan(tmp_path/'plan.dwg', tmp_path/'c', '--units', 'm', success=False)
