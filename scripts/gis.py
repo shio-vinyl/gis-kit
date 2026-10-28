@@ -23,6 +23,7 @@ FEATURES = {
     'clustering': ('sklearn', 'scipy'),
     'image-enhance': ('cv2',),
     'network': ('networkx',),
+    'cad': ('ezdxf',),
     'spatial-sql': ('duckdb', 'pyarrow', 'pyproj'),
 }
 

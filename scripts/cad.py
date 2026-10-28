@@ -1,0 +1,930 @@
+#!/usr/bin/env python3
+"""Inspect a DXF drawing before using it as GIS data: layers, entities, units, extent, candidate CRS and a check plot.
+
+`cad.py inspect` reads model-space geometry through GDAL (block references expanded) and, when the optional
+ezdxf is installed, inventories layers as CAD counts them: DXF entity types, closed and open polylines,
+block names and attributes, raw and cleaned text, layer state, layouts and viewports. Without ezdxf the
+inventory comes from GDAL and cad.json lists what is missing. It reads $ACADVER / $INSUNITS /
+$DWGCODEPAGE from the header itself, and lists projected CRS
+whose grid the coordinates fit, mainly zone-prefixed Chinese Gauss-Kruger grids. Coordinates without
+the zone prefix are held: they may equally be a local grid, so no EPSG code is listed for them unless
+--reference, a layer in a known projected CRS, lines up with the drawing's extent.
+CAD files carry no CRS: every match is a candidate, the datum (CGCS2000, New Beijing, Xian 1980,
+Beijing 1954) cannot be told apart from coordinates, and nothing is assigned to the data here.
+Writes cad.json, check.png and record.json to a new directory. DWG is not read; save it as DXF first.
+
+`cad.py extract` writes model-space entities of chosen layers to raw.gpkg (lines, closed_polygons, texts,
+blocks) with layer and handle on every feature: curves flattened to --arc-tolerance, units scaled to metres
+by an explicit --units, non-zero Z refused unless --drop-z, no CRS. It needs ezdxf.
+
+`cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
+confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
+(or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+from functools import lru_cache
+import json
+import math
+from pathlib import Path
+import re
+
+from _sandbox import configure_writable_caches
+
+configure_writable_caches()
+
+from _budget import check_vector
+from _delivery import bundle, digest, write_json
+
+VERSION = '0.1.0'
+VERSIONS = {'AC1009': 'R12', 'AC1012': 'R13', 'AC1014': 'R14', 'AC1015': 'R2000', 'AC1018': 'R2004',
+            'AC1021': 'R2007', 'AC1024': 'R2010', 'AC1027': 'R2013', 'AC1032': 'R2018'}
+# $INSUNITS code -> (name, metres per drawing unit); codes not listed are reported without a scale.
+UNITS = {0: ('unitless', None), 1: ('inches', 0.0254), 2: ('feet', 0.3048), 4: ('millimeters', 0.001),
+         5: ('centimeters', 0.01), 6: ('meters', 1.0), 7: ('kilometers', 1000.0), 10: ('yards', 0.9144),
+         14: ('decimeters', 0.1)}
+DATUMS = ('CGCS2000', 'New Beijing', 'Xian 1980', 'Beijing 1954')
+TEXT_SAMPLES = 5
+PLOT_LAYERS = 12
+OUTLIER_SPREAD = 20
+REFERENCE_OVERLAP = 0.5  # share of the smaller extent inside the larger one
+# What the GDAL fallback cannot report; listed in cad.json when ezdxf is not installed.
+EZDXF_ONLY = ['DXF entity types for R12', 'closed and open polylines', 'block names and attribute tags',
+              'raw and cleaned text', 'layer off and frozen state', 'unused layers', 'layouts and viewports']
+
+
+def read_header(path):
+    """Header variables of an ASCII DXF; GDAL does not expose them."""
+    with open(path, 'rb') as stream:
+        if stream.read(18) == b'AutoCAD Binary DXF':
+            return {'readable': False, 'reason': 'binary DXF header is not parsed'}
+        stream.seek(0)
+        values, name, in_header, code = {}, None, False, None
+        for number, raw in enumerate(stream):
+            text = raw.decode('latin-1').strip()
+            if number % 2 == 0:
+                code = text
+                continue
+            if code == '0' and text == 'ENDSEC' and in_header:
+                break
+            if code == '2' and text == 'HEADER':
+                in_header = True
+            elif code == '0' and text == 'SECTION':
+                continue
+            elif code == '2' and not in_header:
+                break  # the first section is not HEADER: an entities-only R12 file
+            elif in_header and code == '9':
+                name = text
+            elif in_header and name:
+                values.setdefault(name, {})[code] = text
+    version = values.get('$ACADVER', {}).get('1')
+    units = values.get('$INSUNITS', {}).get('70')
+    units = int(units) if units is not None and units.lstrip('-').isdigit() else None
+    extent = [values.get(key, {}).get(axis) for key in ('$EXTMIN', '$EXTMAX') for axis in ('10', '20')]
+    try:
+        extent = [float(v) for v in extent]
+    except (TypeError, ValueError):
+        extent = None
+    return {'readable': bool(values), 'acadver': version, 'release': VERSIONS.get(version),
+            'insunits': units, 'units': UNITS.get(units, ('unknown', None))[0] if units is not None else None,
+            'codepage': values.get('$DWGCODEPAGE', {}).get('3'), 'extent': extent,
+            # R12 may carry no entity handles ($HANDLING 0 or missing); R13 and later always do.
+            'handles': (version != 'AC1009' or values.get('$HANDLING', {}).get('70') == '1') if version else None}
+
+
+@lru_cache(maxsize=None)
+def gauss_kruger():
+    """EPSG zone-prefixed Gauss-Kruger grids keyed by (width, zone), datums in DATUMS order."""
+    from pyproj.database import query_crs_info
+    pattern = re.compile(r'(%s) / (3-degree )?Gauss-Kruger zone (\d+)' % '|'.join(DATUMS))
+    grids = {}
+    for info in query_crs_info(auth_name='EPSG', pj_types='PROJECTED_CRS'):
+        match = pattern.fullmatch(info.name)
+        if match and not info.deprecated:
+            key = (3 if match[2] else 6, int(match[3]))
+            grids.setdefault(key, []).append((match[1], f'EPSG:{info.code}', info.name, info.area_of_use))
+    return {key: sorted(rows, key=lambda row: DATUMS.index(row[0])) for key, rows in grids.items()}
+
+
+def distance_km(a, b):
+    lon1, lat1, lon2, lat2 = map(math.radians, (*a, *b))
+    h = math.sin((lat2-lat1)/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin((lon2-lon1)/2)**2
+    return 2*6371.0088*math.asin(math.sqrt(h))
+
+
+def locate(code, x, y):
+    from pyproj import Transformer
+    lon, lat = Transformer.from_crs(code, 'EPSG:4326', always_xy=True).transform(x, y)
+    return (lon, lat) if math.isfinite(lon) and math.isfinite(lat) else None
+
+
+def check(code, name, datum, x, y, area, near, near_km):
+    """A candidate row when the point lands in the CRS's area of use (0.5 deg slack) and near the hint."""
+    place = locate(code, x, y)
+    if place is None:
+        return None, 'does not project'
+    lon, lat = place
+    if area is not None and not (area.west-0.5 <= lon <= area.east+0.5 and area.south-0.5 <= lat <= area.north+0.5):
+        return None, 'outside the area of use'
+    row = {'crs': code, 'name': name, 'datum': datum, 'lonlat': [round(lon, 5), round(lat, 5)]}
+    if near is not None:
+        row['distance_km'] = round(distance_km(near, place), 1)
+        if row['distance_km'] > near_km:
+            return None, f'{row["distance_km"]} km from --near'
+    return row, None
+
+
+def readings(x, y, scale, near, near_km):
+    """Grid kinds the representative point fits at one drawing-unit scale, with candidate CRS."""
+    from pyproj import CRS
+    e, n = x*scale, y*scale
+    found, rejected = [], []
+
+    def consider(grid, rows):
+        kept = []
+        for datum, code, name, area in rows:
+            row, reason = check(code, name, datum, e, n, area, near, near_km)
+            if row:
+                kept.append(row)
+            else:
+                rejected.append({'crs': code, 'reason': reason})
+        if kept:
+            found.append({'grid': grid, 'candidates': kept})
+
+    if scale == 1 and -180 <= x <= 180 and -90 <= y <= 90:
+        consider('geographic', [(CRS(code).name, code, CRS(code).name, CRS(code).area_of_use)
+                                for code in ('EPSG:4490', 'EPSG:4326')])
+    zone = e // 1e6
+    if 0 < n < 6.5e6 and (13 <= zone <= 23 or 25 <= zone <= 45):
+        width = 6 if zone <= 23 else 3
+        consider(f'gauss-kruger {width}-degree zone {int(zone)} (zone prefix)', gauss_kruger().get((width, int(zone)), []))
+    # Without the zone prefix a Gauss-Kruger grid, a UTM zone and a city or project local grid (Shenzhen's,
+    # for one) look alike, so no EPSG code is listed for them, --near or not.
+    bare = 0 < e < 1e6 and 0 < n < 6.5e6
+    if not found and not bare and near is not None and abs(e) <= 20037508.35 and abs(n) <= 20037508.35:
+        consider('web mercator', [('WGS 84', 'EPSG:3857', 'WGS 84 / Pseudo-Mercator', None)])
+    return found, rejected, bare
+
+
+def read_reference(path, layer):
+    """Extent and CRS of a reference layer; the CRS must be projected in metres to compare plane coordinates."""
+    import pyogrio
+    from pyproj import CRS
+    info = pyogrio.read_info(path, layer=layer, force_total_bounds=True)
+    if info.get('crs') is None:
+        raise ValueError('--reference has no CRS')
+    crs = CRS.from_user_input(info['crs'])
+    unit = crs.axis_info[0].unit_name if crs.axis_info else None
+    if not crs.is_projected or unit != 'metre':
+        raise ValueError(f'--reference must be in a projected CRS in metres; got {crs.name}')
+    bounds = info.get('total_bounds')
+    if bounds is None or not all(math.isfinite(float(v)) for v in bounds):
+        raise ValueError('--reference has no extent')
+    authority = crs.to_authority(min_confidence=70)
+    return {'name': Path(path).name, 'layer': info.get('layer_name') or layer,
+            'crs': ':'.join(authority) if authority else crs.to_wkt(), 'crs_name': crs.name,
+            'datum': crs.datum.name if crs.datum else None, 'bounds': [round(float(v), 3) for v in bounds]}
+
+
+def share(a, b):
+    """Fraction of the smaller box inside the larger one, per axis multiplied; a degenerate axis counts as inside."""
+    total = 1.0
+    for low, high in ((0, 2), (1, 3)):
+        start, end = max(a[low], b[low]), min(a[high], b[high])
+        if end < start:
+            return 0.0
+        small = min(a[high]-a[low], b[high]-b[low])
+        total *= 1.0 if small <= 0 else (end-start)/small
+    return total
+
+
+@lru_cache(maxsize=None)
+def epsg_by_name():
+    from pyproj.database import query_crs_info
+    return {info.name: f'EPSG:{info.code}' for info in query_crs_info(auth_name='EPSG', pj_types='PROJECTED_CRS')
+            if not info.deprecated}
+
+
+def prefix_twin(name, zone):
+    """The same datum's grid with the zone prefix added (zone > 0: reference has it) or removed (zone < 0)."""
+    if zone > 0:
+        match = re.fullmatch(r'(.+ / (3-degree )?Gauss-Kruger) zone (\d+)', name)
+        if not match or int(match[3]) != zone:
+            return None
+        twin = f'{match[1]} CM {3*zone if match[2] else 6*zone-3}E'
+    else:
+        match = re.fullmatch(r'(.+ / (3-degree )?Gauss-Kruger) CM (\d+)E', name)
+        if not match:
+            return None
+        cm = int(match[3])
+        if (cm if match[2] else cm+3) != (3 if match[2] else 6)*-zone:
+            return None
+        twin = f'{match[1]} zone {-zone}'
+    code = epsg_by_name().get(twin)
+    return (code, twin) if code else None
+
+
+def compare(core, scale, reference):
+    """How the drawing's main extent, at one unit scale, sits against the reference extent."""
+    box = [v*scale for v in core]
+    ref = reference['bounds']
+    centre = ((box[0]+box[2])/2, (box[1]+box[3])/2)
+    ref_centre = ((ref[0]+ref[2])/2, (ref[1]+ref[3])/2)
+    offset = [round(ref_centre[0]-centre[0], 3), round(ref_centre[1]-centre[1], 3)]
+    span, ref_span = math.hypot(box[2]-box[0], box[3]-box[1]), math.hypot(ref[2]-ref[0], ref[3]-ref[1])
+    row = {'overlap': round(share(box, ref), 3), 'offset': offset,
+           'size_ratio': round(span/ref_span, 4) if ref_span > 0 else None}
+    if row['overlap'] >= REFERENCE_OVERLAP:
+        row['verdict'] = 'extents-overlap'
+        return row
+    zone = round(offset[0]/1e6)
+    shifted = [box[0]+zone*1e6, box[1], box[2]+zone*1e6, box[3]]
+    if (13 <= abs(zone) <= 23 or 25 <= abs(zone) <= 45) and share(shifted, ref) >= REFERENCE_OVERLAP:
+        row.update(verdict='zone-prefix', zone=abs(zone), drawing_has_prefix=zone < 0)
+        twin = prefix_twin(reference['crs_name'], zone)
+        if twin:
+            row['twin'] = {'crs': twin[0], 'name': twin[1]}
+        return row
+
+    def order(v):
+        return math.floor(math.log10(abs(v))) if abs(v) >= 1 else 0
+    same = all(order(a) == order(b) for a, b in zip(centre, ref_centre))
+    row['verdict'] = 'shift-or-rotation' if same else 'different-magnitude'
+    return row
+
+
+def looks_misdecoded(values):
+    """Names that are GBK bytes read as Latin-1, as when $DWGCODEPAGE is missing or says ANSI_1252."""
+    for value in values:
+        if not isinstance(value, str) or value.isascii():
+            continue
+        try:
+            raw = value.encode('latin-1')
+            if raw.decode('gbk') != value:
+                return True
+        except UnicodeError:
+            continue
+    return False
+
+
+def entity_type(subclasses):
+    if isinstance(subclasses, str) and subclasses:
+        return subclasses.split(':')[-1]
+    return None
+
+
+def inventory(frame):
+    """Per-layer counts, entity and geometry types, text samples and bounds of model-space entities."""
+    import numpy as np
+    types = frame['SubClasses'].map(entity_type) if 'SubClasses' in frame else None
+    text = frame['Text'] if 'Text' in frame else None
+    is_text = np.zeros(len(frame), bool)
+    if text is not None:
+        has_text = text.notna() & (text.astype(str).str.strip() != '')
+        if types is not None and types.notna().any():
+            is_text = (has_text & types.fillna('').str.contains('Text')).to_numpy()
+        else:  # R12 has no subclass markers: TEXT entities come through as points with text
+            is_text = (has_text & (frame.geom_type == 'Point')).to_numpy()
+    layers = []
+    for name, rows in frame.groupby(frame['Layer'].fillna(''), sort=False):
+        index = rows.index
+        row = {'layer': name, 'entities': len(rows),
+               'geometry_types': {k: int(v) for k, v in rows.geom_type.value_counts().items()}}
+        if types is not None and types.loc[index].notna().any():
+            row['entity_types'] = {k: int(v) for k, v in types.loc[index].value_counts().items()}
+        mask = is_text[frame.index.get_indexer(index)]
+        if mask.any():
+            values = text.loc[index][mask].astype(str).str.strip()
+            row['texts'] = int(mask.sum())
+            row['text_samples'] = [{'raw': v[:80]} for v in dict.fromkeys(values)][:TEXT_SAMPLES]
+        row['bounds'] = [round(float(v), 3) for v in rows.total_bounds]
+        layers.append(row)
+    return sorted(layers, key=lambda row: -row['entities'])
+
+
+def clean_text(text):
+    """Text with full-width ASCII folded to half-width and whitespace (MTEXT \\P included) collapsed."""
+    folded = ''.join(chr(ord(c) - 0xFEE0) if 0xFF01 <= ord(c) <= 0xFF5E else ' ' if c == '　' else c for c in text)
+    return ' '.join(folded.split())
+
+
+def read_drawing(path, encoding):
+    """(ezdxf document, audit counts); (None, None) when ezdxf is not installed."""
+    try:
+        import ezdxf
+        from ezdxf import recover
+    except ImportError:
+        return None, None
+    if encoding:  # recover mode takes the encoding from the header only
+        return ezdxf.readfile(path, encoding=encoding), None
+    doc, auditor = recover.readfile(path)
+    return doc, {'errors': len(auditor.errors), 'fixes': len(auditor.fixes)}
+
+
+def drawing_inventory(doc, bounds):
+    """Per-layer DXF entity types counted as CAD counts them (one INSERT per block reference), block names,
+    attribute tags, raw and cleaned text, and layer state; bounds come from the expanded GDAL geometry."""
+    from collections import Counter
+    layers = {}
+    for entity in doc.modelspace():
+        kind = entity.dxftype()
+        if kind == 'LWPOLYLINE':
+            kind += ' closed' if entity.closed else ' open'
+        elif kind == 'POLYLINE':
+            kind += ' closed' if entity.is_closed else ' open'
+        row = layers.setdefault(entity.dxf.layer, {'layer': entity.dxf.layer, 'entities': 0, 'dxf_types': Counter(),
+                                                    'blocks': Counter(), 'attributes': {}, 'text': []})
+        row['entities'] += 1
+        row['dxf_types'][kind] += 1
+        if kind == 'INSERT':
+            row['blocks'][entity.dxf.name] += 1
+            for attrib in entity.attribs:
+                samples = row['attributes'].setdefault(attrib.dxf.tag, [])
+                value = clean_text(attrib.dxf.text)
+                if value not in samples and len(samples) < TEXT_SAMPLES:
+                    samples.append(value)
+        elif kind == 'TEXT':
+            row['text'].append((entity.dxf.text, clean_text(entity.plain_text())))
+        elif kind == 'MTEXT':
+            row['text'].append((entity.text, clean_text(entity.plain_text(split=False))))
+    table = {layer.dxf.name: layer for layer in doc.layers}
+    result = []
+    for name, row in layers.items():
+        out = {'layer': name, 'entities': row['entities'], 'dxf_types': dict(row['dxf_types'].most_common())}
+        if row['blocks']:
+            out['blocks'] = dict(row['blocks'].most_common())
+        if row['attributes']:
+            out['attributes'] = row['attributes']
+        if row['text']:
+            out['texts'] = len(row['text'])
+            out['text_samples'] = [{'raw': raw[:80], 'clean': clean[:80]}
+                                   for raw, clean in dict(row['text']).items()][:TEXT_SAMPLES]
+        layer = table.get(name)
+        state = [flag for flag, on in (('off', layer and layer.is_off()), ('frozen', layer and layer.is_frozen())) if on]
+        if state:
+            out['state'] = state
+        out['bounds'] = bounds.get(name)
+        result.append(out)
+    unused = sorted(set(table) - set(layers) - {'0', 'Defpoints'})
+    layouts = [{'name': layout.name, 'entities': len(layout),
+                'viewports': sum(1 for v in layout.query('VIEWPORT') if v.dxf.get('id', 0) != 1)}
+               for layout in doc.layouts if layout.name != 'Model']
+    return sorted(result, key=lambda row: -row['entities']), unused, layouts
+
+
+def split_core(frame):
+    """Entities more than OUTLIER_SPREAD median distances from the median centre (title blocks at the origin,
+    strays) are outliers; returns the core mask and the core's median centre."""
+    import numpy as np
+    bounds = frame.geometry.bounds
+    cx, cy = ((bounds.minx+bounds.maxx)/2).to_numpy(), ((bounds.miny+bounds.maxy)/2).to_numpy()
+    distance = np.hypot(cx-np.median(cx), cy-np.median(cy))
+    core = distance <= OUTLIER_SPREAD*max(float(np.median(distance)), 1e-9)
+    return core, float(np.median(cx[core])), float(np.median(cy[core]))
+
+
+def plot(frame, core, layers, path, title, font):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    outliers = not core.all()
+    figure, axes = plt.subplots(1, 2 if outliers else 1, figsize=(15 if outliers else 9, 8), squeeze=False)
+    axes = axes[0]
+    shown = [row['layer'] for row in layers[:PLOT_LAYERS]]
+    colours = matplotlib.colormaps['tab20']
+    names = frame['Layer'].fillna('')
+    panels = [(axes[-1], frame[core], 'core extent')] + ([(axes[0], frame, 'full extent')] if outliers else [])
+    for axis, part, label in panels:
+        other = part[~names.loc[part.index].isin(shown)]
+        if len(other):
+            other.plot(ax=axis, color='#b0b0b0', linewidth=0.5, markersize=3)
+        for i, layer in enumerate(shown):
+            rows = part[names.loc[part.index] == layer]
+            if len(rows):
+                rows.plot(ax=axis, color=colours(i % 20), linewidth=0.7, markersize=4)
+        axis.set_title(label)
+        axis.set_xlabel('x (drawing units)')
+        axis.set_ylabel('y (drawing units)')
+        axis.set_aspect('equal', adjustable='datalim')
+        axis.ticklabel_format(useOffset=False, style='plain')
+        axis.tick_params(labelsize=7)
+    if outliers:
+        minx, miny, maxx, maxy = frame[core].total_bounds
+        axes[0].add_patch(Rectangle((minx, miny), maxx-minx, maxy-miny, fill=False, linestyle='--', edgecolor='black'))
+        stray = frame[~core].geometry.centroid
+        axes[0].scatter(stray.x, stray.y, marker='x', color='red', s=40, label='outlier', zorder=5)
+    handles = [plt.Line2D([], [], color=colours(i % 20), label=layer or '(no layer)') for i, layer in enumerate(shown)]
+    if len(layers) > PLOT_LAYERS:
+        handles.append(plt.Line2D([], [], color='#b0b0b0', label=f'{len(layers)-PLOT_LAYERS} other layers'))
+    figure.legend(handles=handles, loc='center right', fontsize=8, frameon=False)
+    figure.suptitle(title, fontsize=11)
+    figure.tight_layout(rect=(0, 0, 0.85, 0.95))
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def parse_near(text):
+    try:
+        lon, lat = (float(part) for part in text.split(','))
+    except ValueError as error:
+        raise ValueError('--near must be LON,LAT in degrees') from error
+    if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+        raise ValueError('--near must be LON,LAT in degrees')
+    return lon, lat
+
+
+def inspect(args):
+    import pyogrio
+    source = Path(args.source)
+    if source.suffix.lower() == '.dwg':
+        raise ValueError('DWG is not read; save it as DXF first (AutoCAD / ZWCAD "Save As", or ODA File Converter)')
+    if source.suffix.lower() != '.dxf' or not source.is_file():
+        raise ValueError('Source must be an existing .dxf file')
+    near = parse_near(args.near) if args.near else None
+    header = read_header(source)
+    check_vector(source)
+    if args.encoding:
+        pyogrio.set_gdal_config_options({'DXF_ENCODING': args.encoding})
+    frame = pyogrio.read_dataframe(source)
+    warnings = []
+    names = [*frame['Layer'].dropna().unique()[:200], *(frame['Text'].dropna().unique()[:200] if 'Text' in frame else [])]
+    if not args.encoding and looks_misdecoded(names):
+        warnings.append(f'Layer or text names look like GBK read as Latin-1 ($DWGCODEPAGE = {header.get("codepage")}); '
+                        'rerun with --encoding CP936')
+    empty = frame.geometry.isna() | frame.geometry.is_empty
+    paper = frame['PaperSpace'].eq(True) if 'PaperSpace' in frame else empty & False
+    if paper.any():
+        warnings.append(f'{int(paper.sum())} paper-space entities left out of extent and CRS checks')
+    model = frame[~empty & ~paper]
+    if model.empty:
+        raise ValueError('No model-space geometry in the drawing')
+    core, x, y = split_core(model)
+    try:
+        doc, audit = read_drawing(source, args.encoding)
+    except Exception as error:  # ezdxf's own errors vary by damage; GDAL already read the drawing
+        doc, audit = None, None
+        warnings.append(f'ezdxf could not read the drawing ({type(error).__name__}: {error}); layer inventory falls back to GDAL')
+    if doc is not None:
+        import ezdxf
+        bounds = {name: [round(float(v), 3) for v in rows.total_bounds] for name, rows in model.groupby(model['Layer'].fillna(''))}
+        layers, unused, layouts = drawing_inventory(doc, bounds)
+        reader = {'inventory': f'ezdxf {ezdxf.__version__}', 'missing': []}
+        if audit and audit['errors']:
+            warnings.append(f'ezdxf recovered the drawing with {audit["errors"]} structure errors and {audit["fixes"]} fixes')
+    else:
+        layers, unused, layouts = inventory(model), None, None
+        reader = {'inventory': 'gdal', 'missing': EZDXF_ONLY}
+    reader['geometry'] = f'gdal {pyogrio.__gdal_version_string__}'
+    stray = model[~core]
+    if len(stray):
+        counts = stray['Layer'].fillna('').value_counts()
+        warnings.append(f'{len(stray)} entities lie far outside the main drawing (layers: '
+                        + ', '.join(f'{k or "(no layer)"} {v}' for k, v in counts.head(5).items()) + ')')
+
+    scales = [(1.0, 'coordinates as drawn')]
+    declared = UNITS.get(header.get('insunits'), (None, None))[1]
+    if declared and declared != 1.0:
+        scales.append((declared, f'header $INSUNITS = {header["units"]}'))
+    tried, rejected, unprefixed = [], [], False
+    for scale, basis in scales:
+        found, dropped, bare = readings(x, y, scale, near, args.near_km)
+        tried.append({'scale_to_metre': scale, 'basis': basis, 'matches': found})
+        rejected += dropped
+        unprefixed = unprefixed or bare
+    reference = None
+    if args.reference:
+        reference = read_reference(args.reference, args.reference_layer)
+        core_box = [float(v) for v in model[core].total_bounds]
+        reference['comparisons'] = []
+        for reading in tried:
+            row = compare(core_box, reading['scale_to_metre'], reference)
+            reference['comparisons'].append({'scale_to_metre': reading['scale_to_metre'], **row})
+            if row['verdict'] == 'extents-overlap':
+                found = (reference['crs'], reference['crs_name'])
+            elif row['verdict'] == 'zone-prefix' and 'twin' in row:
+                found = (row['twin']['crs'], row['twin']['name'])
+            else:
+                found = None
+            if found and found[0] not in {c['crs'] for m in reading['matches'] for c in m['candidates']}:
+                reading['matches'].append({'grid': f'reference layer ({row["verdict"]})', 'candidates': [
+                    {'crs': found[0], 'name': found[1], 'datum': reference['datum'], 'basis': 'reference'}]})
+    candidates = [row for reading in tried for match in reading['matches'] for row in match['candidates']]
+    notes = ['Coordinates cannot distinguish CGCS2000, New Beijing, Xian 1980 and Beijing 1954 grids; '
+             'confirm the datum with the data provider or known control points']
+    if unprefixed:
+        notes.append('Coordinates look like a Gauss-Kruger grid without zone prefix, a UTM zone or a city or project '
+                     'local grid, which coordinates alone cannot tell apart; no EPSG code is listed. Compare with a '
+                     'layer in a known CRS or fit control points')
+    if not candidates and not unprefixed:
+        notes.append('No national grid fits; treat as a local or engineering coordinate system that needs control points')
+    verdicts = {row['verdict']: row for row in (reference or {}).get('comparisons', [])}
+    if 'extents-overlap' in verdicts or 'zone-prefix' in verdicts:
+        notes.append('Extents that line up with the reference are consistent with its grid but do not prove it; '
+                     'overlay shared features (roads, parcel corners) before assigning a CRS')
+    elif 'shift-or-rotation' in verdicts:
+        dx, dy = verdicts['shift-or-rotation']['offset']
+        notes.append(f'Same magnitude as the reference but offset by about ({dx:.0f}, {dy:.0f}) m: likely a local grid or '
+                     'a moved origin; fit control points instead of assigning a CRS')
+    elif reference:
+        notes.append('Coordinate magnitudes differ from the reference at every scale tried; not the same grid')
+    if declared and declared != 1.0 and any(r['matches'] for r in tried[:1]):
+        warnings.append(f'Header says {header["units"]}, but coordinates as drawn fit a metre grid')
+
+    crs = {'status': 'candidate' if candidates else 'hold', 'representative_point': [round(x, 3), round(y, 3)],
+           'near': list(near) if near else None, 'near_km': args.near_km if near else None,
+           'readings': tried, 'rejected': rejected, 'reference': reference, 'notes': notes, 'assigned': None}
+    extent = {'full': [round(float(v), 3) for v in model.total_bounds],
+              'core': [round(float(v), 3) for v in model[core].total_bounds], 'outliers': int(len(stray))}
+    summary = (', '.join(dict.fromkeys(c['crs'] for c in candidates[:4])) + (' …' if len(candidates) > 4 else '')
+               if candidates else 'CRS on hold')
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    stat = source.stat()
+    total = sum(row['entities'] for row in layers)
+    with bundle(args.output) as stage:
+        plot(model, core, layers, stage / 'check.png',
+             f'{source.name} · {total} entities · {len(layers)} layers · {summary}', font)
+        report = {'report': 'cad-inventory', 'schema_version': 1,
+                  'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source),
+                             'modified': datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec='seconds')},
+                  'header': header, 'reader': reader,
+                  'entities': {'model_space': total, 'geometries': int(len(model)), 'paper_space': int(paper.sum()),
+                               'empty': int(empty.sum()),
+                               'geometry_types': {k: int(v) for k, v in model.geom_type.value_counts().items()}},
+                  'blocks': ('each reference counts once per layer; geometry, extent and the plot expand references'
+                             if doc is not None else 'expanded into their geometry; block names are not reported'),
+                  'layers': layers, 'unused_layers': unused, 'layouts': layouts,
+                  'extent': extent, 'crs': crs, 'warnings': warnings,
+                  'files': {'plot': 'check.png', 'record': 'record.json'}}
+        write_json(stage / 'cad.json', report)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': report['source']['sha256']},
+                                            'reference': ({'path': str(Path(args.reference).absolute()), 'layer': reference['layer'],
+                                                           'sha256': digest(args.reference) if Path(args.reference).is_file() else None}
+                                                          if reference else None),
+                                            'files': {'cad.json': digest(stage / 'cad.json'), 'check.png': digest(stage / 'check.png')},
+                                            'warnings': warnings,
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Geometry comes from GDAL with block references expanded',
+                                                            'CRS candidates come from coordinate magnitude and EPSG areas of use only',
+                                                            'No CRS is assigned and no geometry is written']})
+    return report
+
+
+CURVES = {'LINE', 'LWPOLYLINE', 'POLYLINE', 'ARC', 'CIRCLE', 'ELLIPSE', 'SPLINE'}
+MAX_BLOCK_DEPTH = 16
+# Output layers of raw.gpkg: name -> (geometry type, fields and dtypes)
+EXTRACT_LAYERS = {
+    'lines': ('LineString', {'layer': str, 'dxf_type': str, 'handle': str, 'closed': bool, 'block': str, 'source_handle': str}),
+    'closed_polygons': ('Polygon', {'layer': str, 'dxf_type': str, 'handle': str, 'valid': bool, 'block': str, 'source_handle': str}),
+    'texts': ('Point', {'text_raw': str, 'text_clean': str, 'layer': str, 'dxf_type': str, 'tag': str, 'height': float,
+                        'rotation': float, 'anchor': str, 'handle': str, 'block': str, 'source_handle': str}),
+    'blocks': ('Point', {'layer': str, 'block': str, 'handle': str, 'rotation': float, 'xscale': float, 'yscale': float,
+                         'attributes': str}),
+}
+
+
+class Extraction:
+    """Rows per output layer, walked from model-space entities; block references are kept or exploded."""
+
+    def __init__(self, tolerance, explode):
+        from collections import Counter
+        self.tolerance, self.explode = tolerance, explode
+        self.rows = {name: [] for name in EXTRACT_LAYERS}
+        self.read, self.skipped = {}, Counter()
+
+    def text(self, entity, layer, block, source):
+        kind = entity.dxftype()
+        if kind == 'MTEXT':
+            raw, clean = entity.text, clean_text(entity.plain_text(split=False))
+            point, height, rotation, anchor = entity.dxf.insert, entity.dxf.char_height, entity.get_rotation(), 'insert'
+        else:  # TEXT and ATTRIB: aligned text is placed by its alignment point
+            raw, clean = entity.dxf.text, clean_text(entity.plain_text())
+            aligned = (entity.dxf.get('halign', 0) or entity.dxf.get('valign', 0)) and entity.dxf.hasattr('align_point')
+            point = entity.dxf.align_point if aligned else entity.dxf.insert
+            height, rotation, anchor = entity.dxf.height, entity.dxf.get('rotation', 0.0), 'align' if aligned else 'insert'
+            point = entity.ocs().to_wcs(point)
+        self.rows['texts'].append({'text_raw': raw, 'text_clean': clean, 'layer': layer, 'dxf_type': kind,
+                                   'tag': entity.dxf.tag if kind == 'ATTRIB' else None, 'height': float(height),
+                                   'rotation': float(rotation), 'anchor': anchor, 'handle': entity.dxf.get('handle'),
+                                   'block': block, 'source_handle': source, 'coords': [tuple(point)]})
+
+    def walk(self, entity, layer, block=None, source=None, depth=0):
+        from ezdxf import path
+        kind = entity.dxftype()
+        handle = entity.dxf.get('handle')
+        if kind in CURVES:
+            try:
+                points = [tuple(p) for p in path.make_path(entity).flattening(distance=self.tolerance)]
+            except (TypeError, ValueError):  # polyface meshes and degenerate curves have no 2D path
+                self.skipped[f'{kind} (no path)'] += 1
+                return
+            if len(points) < 2:
+                self.skipped[f'{kind} (degenerate)'] += 1
+                return
+            closed = (entity.closed if kind == 'LWPOLYLINE' else entity.is_closed if kind == 'POLYLINE' else False)
+            self.rows['lines'].append({'layer': layer, 'dxf_type': kind, 'handle': handle, 'closed': bool(closed),
+                                       'block': block, 'source_handle': source, 'coords': points})
+            if closed:
+                if len({p[:2] for p in points}) < 3:
+                    self.skipped[f'{kind} closed (fewer than 3 vertices)'] += 1
+                else:
+                    self.rows['closed_polygons'].append({'layer': layer, 'dxf_type': kind, 'handle': handle,
+                                                         'block': block, 'source_handle': source, 'coords': points})
+        elif kind in ('TEXT', 'MTEXT'):
+            self.text(entity, layer, block, source)
+        elif kind == 'INSERT':
+            name = entity.dxf.name
+            for attrib in entity.attribs:
+                self.text(attrib, layer, name, source or handle)
+            if not self.explode:
+                self.rows['blocks'].append({'layer': layer, 'block': name, 'handle': handle,
+                                            'rotation': float(entity.dxf.get('rotation', 0.0)),
+                                            'xscale': float(entity.dxf.get('xscale', 1.0)), 'yscale': float(entity.dxf.get('yscale', 1.0)),
+                                            'attributes': json.dumps({a.dxf.tag: a.dxf.text for a in entity.attribs}, ensure_ascii=False),
+                                            'coords': [tuple(entity.ocs().to_wcs(entity.dxf.insert))]})
+                return
+            if depth >= MAX_BLOCK_DEPTH:
+                raise ValueError(f'Block nesting deeper than {MAX_BLOCK_DEPTH} at {name}')
+            for part in entity.virtual_entities():
+                # Entities on layer 0 inside a block take the reference's layer, as in CAD.
+                own = part.dxf.get('layer', '0')
+                self.walk(part, layer if own == '0' else own, f'{block}/{name}' if block else name, source or handle, depth+1)
+        else:
+            self.skipped[kind] += 1
+
+
+def extract(args):
+    """Model-space entities of chosen layers to raw.gpkg (lines, closed_polygons, texts, blocks), in metres, no CRS."""
+    import warnings as python_warnings
+    import geopandas as gpd
+    import numpy as np
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from collections import Counter
+    source = Path(args.source)
+    if source.suffix.lower() != '.dxf' or not source.is_file():
+        raise ValueError('Source must be an existing .dxf file')
+    if args.arc_tolerance <= 0:
+        raise ValueError('--arc-tolerance must be positive')
+    header = read_header(source)
+    doc, audit = read_drawing(source, args.encoding)
+    if doc is None:
+        raise ValueError('cad.py extract needs ezdxf (pip install ezdxf); GDAL keeps neither handles nor block attributes')
+    import ezdxf
+    warnings = []
+    if header.get('handles') is not True:
+        warnings.append('The drawing may carry no entity handles (R12 or no readable header): handle fields can be '
+                        'assigned by ezdxf on reading and then cannot be looked up in CAD')
+    if audit and audit['errors']:
+        warnings.append(f'ezdxf recovered the drawing with {audit["errors"]} structure errors and {audit["fixes"]} fixes')
+
+    if args.units == 'header':
+        name, scale = UNITS.get(header.get('insunits'), (header.get('units') or 'missing', None))
+        if not scale:
+            raise ValueError(f'Header $INSUNITS is {name}; pass --units m or --units mm')
+        basis = f'header $INSUNITS = {name}'
+    else:
+        scale, basis = {'m': 1.0, 'mm': 0.001}[args.units], f'--units {args.units}'
+
+    model = doc.modelspace()
+    present = Counter(entity.dxf.layer for entity in model)
+    wanted = [name.strip() for name in args.layers.split(',')] if args.layers else sorted(present)
+    unknown = [name for name in wanted if name not in present]
+    if unknown:
+        raise ValueError(f'No model-space entities on layers {", ".join(unknown)}; layers with entities: {", ".join(sorted(present))}')
+    run = Extraction(args.arc_tolerance/scale, args.include_blocks)
+    for entity in model:
+        layer = entity.dxf.layer
+        if layer in wanted:
+            run.read.setdefault(layer, Counter())[entity.dxftype()] += 1
+            run.walk(entity, layer)
+
+    coords = [p for rows in run.rows.values() for row in rows for p in row['coords']]
+    if not coords:
+        raise ValueError('Nothing to extract from the chosen layers')
+    xs, ys, zs = (np.array(axis, dtype=float) for axis in zip(*coords))
+    if scale != 1.0 and args.units == 'header':
+        x, y = float(np.median(xs)), float(np.median(ys))
+        if readings(x, y, 1.0, None, 50.0)[0] and not readings(x, y, scale, None, 50.0)[0]:
+            raise ValueError(f'Header says {header["units"]}, but coordinates as drawn fit a metre grid; pass --units m')
+    lifted = {name: sum(1 for row in rows if any(abs(p[2]) > 1e-9 for p in row['coords'])) for name, rows in run.rows.items()}
+    z = {'features': sum(lifted.values()), 'by_layer': {k: v for k, v in lifted.items() if v},
+         'min': float(zs.min())*scale, 'max': float(zs.max())*scale, 'dropped': bool(args.drop_z and any(lifted.values()))}
+    if z['features'] and not args.drop_z:
+        raise ValueError(f'{z["features"]} features have non-zero Z ({z["min"]:g} to {z["max"]:g} m); pass --drop-z to flatten them')
+
+    frames = {}
+    for name, (geometry_type, fields) in EXTRACT_LAYERS.items():
+        rows = run.rows[name]
+        points = [[(p[0]*scale, p[1]*scale) for p in row['coords']] for row in rows]
+        maker = {'LineString': shapely.linestrings, 'Polygon': shapely.polygons, 'Point': shapely.points}[geometry_type]
+        geometry = [maker(p[0] if geometry_type == 'Point' else p) for p in points]
+        table = pd.DataFrame({field: pd.Series([row.get(field) for row in rows], dtype=object if kind is str else kind)
+                              for field, kind in fields.items() if field != 'valid'})
+        if name == 'closed_polygons':
+            table['valid'] = pd.Series(shapely.is_valid(np.array(geometry, dtype=object)) if rows else [], dtype=bool)
+        if name == 'texts':
+            table['height'] = table['height']*scale
+        frames[name] = gpd.GeoDataFrame(table, geometry=gpd.GeoSeries(geometry, dtype='geometry'))
+    paper = sum(len(layout) for layout in doc.layouts if layout.name != 'Model')
+    if paper:
+        warnings.append(f'{paper} paper-space entities not extracted')
+    invalid = int((~frames['closed_polygons']['valid']).sum()) if len(frames['closed_polygons']) else 0
+    if invalid:
+        warnings.append(f'{invalid} closed polygons are invalid (valid = false); kept as drawn, not repaired')
+
+    stat = source.stat()
+    with bundle(args.output) as stage:
+        target = stage / 'raw.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, frame in frames.items():
+                pyogrio.write_dataframe(frame, target, layer=name, driver='GPKG', geometry_type=EXTRACT_LAYERS[name][0])
+        counts = {name: len(frame) for name, frame in frames.items()}
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in frames}
+        if back != counts:
+            raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
+        manifest = {'manifest': 'cad-extract', 'schema_version': 1,
+                    'source': {'name': source.name, 'bytes': stat.st_size, 'sha256': digest(source)},
+                    'header': header, 'reader': f'ezdxf {ezdxf.__version__}',
+                    'parameters': {'layers': wanted, 'units': args.units, 'scale_to_metre': scale, 'units_basis': basis,
+                                   'arc_tolerance_m': args.arc_tolerance, 'include_blocks': args.include_blocks,
+                                   'drop_z': args.drop_z, 'encoding': args.encoding},
+                    'read': {layer: dict(types.most_common()) for layer, types in sorted(run.read.items())},
+                    'layers': counts, 'skipped': dict(run.skipped.most_common()), 'paper_space': paper, 'z': z,
+                    'crs': None, 'warnings': warnings,
+                    'output': {'path': target.name, 'sha256': digest(target)}}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad extract', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256']},
+                                            'warnings': warnings,
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Coordinates are only scaled to metres; no CRS is set and nothing is moved',
+                                                            'Curves are flattened so no chord is farther than --arc-tolerance from the curve',
+                                                            'Closed polygons are taken as drawn; invalid ones are flagged, not repaired']})
+    return manifest
+
+
+def load_inspection(path):
+    path = Path(path)
+    path = path / 'cad.json' if path.is_dir() else path
+    report = json.loads(path.read_text(encoding='utf-8'))
+    if report.get('report') != 'cad-inventory' or report.get('schema_version') != 1:
+        raise ValueError(f'--inspection is not a cad.py inspect report (cad.json v1): {path}')
+    return path, report
+
+
+def assign_crs(args):
+    """Label a CRS-less layer converted from an inspected drawing with a confirmed CRS; coordinates are not touched."""
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    from _safe_io import write_vector_atomic
+    for flag, value in (('--confirmed-by', args.confirmed_by), ('--basis', args.basis)):
+        if not value or not value.strip():
+            raise ValueError(f'{flag} is required and must not be blank')
+    crs = CRS.from_user_input(args.crs)
+    unit = crs.axis_info[0].unit_name if crs.axis_info else None
+    if not crs.is_projected or unit != 'metre':
+        raise ValueError(f'--crs must be a projected CRS in metres; got {crs.name}')
+    authority = crs.to_authority(min_confidence=70)
+    code = ':'.join(authority) if authority else None
+    inspection_path, inspection = load_inspection(args.inspection)
+
+    source = Path(args.source)
+    layers = [name for name, _ in pyogrio.list_layers(source)]
+    layer = args.layer or (layers[0] if len(layers) == 1 else None)
+    if layer is None:
+        raise ValueError(f'{source} has {len(layers)} layers ({", ".join(layers)}); pass --layer')
+    info = pyogrio.read_info(source, layer=layer, force_total_bounds=True)
+    if info.get('crs') is not None:
+        raise ValueError(f'{source} already has a CRS ({info["crs"]}); assigning would relabel it, reproject instead')
+    bounds = [float(v) for v in info['total_bounds']]
+    full = inspection['extent']['full']
+    slack = 1e-9*max(abs(v) for v in full) + 1e-6
+    if not (full[0]-slack <= bounds[0] and full[1]-slack <= bounds[1] and bounds[2] <= full[2]+slack and bounds[3] <= full[3]+slack):
+        raise ValueError(f'{source} extent {bounds} lies outside the inspected drawing\'s model-space extent {full}; '
+                         'it is not this drawing as drawn (paper-space features, scaled or moved coordinates?)')
+
+    readings = inspection['crs']['readings']
+    as_drawn = {c['crs'] for r in readings if r['scale_to_metre'] == 1.0 for m in r['matches'] for c in m['candidates']}
+    scaled = {c['crs'] for r in readings if r['scale_to_metre'] != 1.0 for m in r['matches'] for c in m['candidates']}
+    if code in scaled and code not in as_drawn:
+        raise ValueError(f'{code} fits the drawing only after unit scaling; convert the units before assigning')
+    outside = code not in as_drawn
+    if outside and not args.outside_candidates:
+        raise ValueError(f'{code or crs.name} is not among the inspection candidates as drawn '
+                         f'({", ".join(sorted(as_drawn)) or "none"}); pass --outside-candidates to assign it anyway')
+
+    check_vector(source, layer)
+    frame = pyogrio.read_dataframe(source, layer=layer)
+    labelled = frame.set_crs(crs)
+    stat = source.stat()
+    with bundle(args.output) as stage:
+        target = stage / f'{source.stem}.gpkg'
+        evidence = write_vector_atomic(labelled, target)
+        back = pyogrio.read_dataframe(target)
+        same_geometry = bool(len(back) == len(frame) and
+                             (shapely.to_wkb(back.geometry.to_numpy()) == shapely.to_wkb(frame.geometry.to_numpy())).all())
+        if not same_geometry:
+            raise ValueError('Readback geometry differs from the input; nothing was published')
+        try:
+            pd.testing.assert_frame_equal(back.drop(columns=back.geometry.name).reset_index(drop=True),
+                                          frame.drop(columns=frame.geometry.name).reset_index(drop=True), check_dtype=False)
+        except AssertionError as error:
+            raise ValueError(f'Readback attributes differ from the input; nothing was published ({error})') from error
+        if not CRS.from_user_input(back.crs).equals(crs):
+            raise ValueError('Readback CRS differs from --crs; nothing was published')
+        manifest = {'manifest': 'crs-assignment', 'schema_version': 1,
+                    'input': {'name': source.name, 'layer': layer, 'sha256': digest(source) if source.is_file() else None,
+                              'bytes': stat.st_size, 'features': len(frame), 'bounds': [round(v, 3) for v in bounds]},
+                    'crs': {'id': code, 'name': crs.name, 'datum': crs.datum.name if crs.datum else None},
+                    'confirmed_by': args.confirmed_by.strip(), 'basis': args.basis.strip(),
+                    'confirmed_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'inspection': {'path': str(inspection_path.absolute()), 'sha256': digest(inspection_path),
+                                   'drawing': inspection['source']['name'], 'drawing_sha256': inspection['source']['sha256'],
+                                   'crs_status': inspection['crs']['status'], 'candidates_as_drawn': sorted(as_drawn)},
+                    'outside_candidates': outside,
+                    'checks': {'features': evidence['features'], 'geometry_wkb_identical': True, 'attributes_identical': True,
+                               'crs_readback': code or crs.name},
+                    'output': {'path': target.name, 'sha256': digest(target)}}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad assign-crs', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256']},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Only the CRS label changes; geometry WKB and attributes are compared on readback',
+                                                            'The confirmation and its basis are the user\'s; the tool does not verify them']})
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest='command', required=True)
+    sub = commands.add_parser('inspect', help='Inventory a DXF and list candidate CRS')
+    sub.add_argument('source', help='DXF file')
+    sub.add_argument('--output', required=True, help='New directory for cad.json, check.png and record.json')
+    sub.add_argument('--near', help='Approximate LON,LAT of the area the drawing covers; candidates farther than --near-km are rejected')
+    sub.add_argument('--near-km', type=float, default=50.0, help='Keep candidates within this distance of --near (default 50)')
+    sub.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936 for Chinese drawings without one')
+    sub.add_argument('--reference', help='Layer in a known projected CRS (metres) covering the same area; extents are compared')
+    sub.add_argument('--reference-layer', help='Layer name within --reference')
+    pull = commands.add_parser('extract', help='Extract model-space entities of chosen layers to raw.gpkg, in metres')
+    pull.add_argument('source', help='DXF file')
+    pull.add_argument('--layers', help='Comma-separated CAD layers (default: every layer with model-space entities)')
+    pull.add_argument('--units', required=True, choices=('m', 'mm', 'header'),
+                      help='Drawing unit: m, mm, or header ($INSUNITS; refused when unitless or contradicted by the coordinates)')
+    pull.add_argument('--arc-tolerance', type=float, default=0.05, help='Largest chord-to-curve distance in metres (default 0.05)')
+    pull.add_argument('--include-blocks', action='store_true', help='Explode block references instead of keeping insertion points')
+    pull.add_argument('--drop-z', action='store_true', help='Flatten non-zero Z; without it such features are refused')
+    pull.add_argument('--encoding', help='Text encoding overriding $DWGCODEPAGE, e.g. CP936')
+    pull.add_argument('--output', required=True, help='New directory for raw.gpkg, manifest.json and record.json')
+    assign = commands.add_parser('assign-crs', help='Label a CRS-less layer from an inspected drawing with a confirmed CRS')
+    assign.add_argument('source', help='Vector file converted from the drawing, without a CRS (e.g. convert.py output)')
+    assign.add_argument('--layer', help='Layer within source; required when it has several')
+    assign.add_argument('--inspection', required=True, help='cad.json (or its directory) from cad.py inspect of the drawing')
+    assign.add_argument('--crs', required=True, help='Projected CRS in metres, e.g. EPSG:4547')
+    assign.add_argument('--confirmed-by', required=True, help='Who confirmed the CRS')
+    assign.add_argument('--basis', required=True, help='What the confirmation rests on, e.g. provider statement, control-point check')
+    assign.add_argument('--outside-candidates', action='store_true', help='Allow a CRS the inspection did not list; recorded')
+    assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
+    args = parser.parse_args()
+    try:
+        if args.command == 'extract':
+            manifest = extract(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
+                              'skipped': manifest['skipped'], 'warnings': manifest['warnings']}, ensure_ascii=False))
+            return
+        if args.command == 'assign-crs':
+            manifest = assign_crs(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'crs': manifest['crs']['id'],
+                              'features': manifest['checks']['features'], 'outside_candidates': manifest['outside_candidates']},
+                             ensure_ascii=False))
+            return
+        if args.near_km <= 0:
+            raise ValueError('--near-km must be positive')
+        report = inspect(args)
+        candidates = [row['crs'] for reading in report['crs']['readings'] for match in reading['matches'] for row in match['candidates']]
+        print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': len(report['layers']),
+                          'entities': report['entities']['model_space'], 'crs_status': report['crs']['status'],
+                          'candidates': candidates, 'warnings': report['warnings']}, ensure_ascii=False))
+    except (ValueError, OSError, RuntimeError) as exc:  # pyogrio's DataSourceError is a RuntimeError
+        parser.exit(1, f'ERROR: {exc}\n')
+
+
+if __name__ == '__main__':
+    main()
