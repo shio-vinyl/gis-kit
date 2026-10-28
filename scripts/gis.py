@@ -45,7 +45,7 @@ def catalog(scripts: Path = SCRIPTS) -> list[dict]:
 
 
 # Run records written by the CAD, package and vector-transform tools, by their manifest / report name.
-MANIFESTS = ('cad-inventory', 'cad-convert', 'cad-extract', 'cad-polygonize', 'cad-label', 'cad-xiangyuan', 'crs-assignment', 'vector-transform', 'vector-georef-apply', 'esri-package')
+MANIFESTS = ('cad-inventory', 'cad-convert', 'cad-extract', 'cad-polygonize', 'cad-label', 'cad-xiangyuan', 'cad-overlay', 'crs-assignment', 'vector-transform', 'vector-georef-apply', 'esri-package')
 
 
 def capabilities() -> dict:

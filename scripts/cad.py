@@ -30,6 +30,11 @@ listed, never resolved by choice; road faces come only from the road rule.
 `cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
 confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
 (or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
+
+`cad.py overlay` puts parcels (in a projected CRS) over reference layers in one check plot: hold parcels outlined,
+QA layers of the same file (qa_*, label_conflicts) marked. References are read within the parcels' extent plus a
+margin and reprojected; parcel x reference intersections go to overlay.gpkg with area and both shares. Invalid
+polygons are listed and plotted, never repaired or measured.
 """
 from __future__ import annotations
 
@@ -60,6 +65,7 @@ TEXT_SAMPLES = 5
 PLOT_LAYERS = 12
 OUTLIER_SPREAD = 20
 REFERENCE_OVERLAP = 0.5  # share of the smaller extent inside the larger one
+OVERLAY_MARGIN = 0.1  # share of the parcels' longer side shown, and read from references, around them
 # What the GDAL fallback cannot report; listed in cad.json when ezdxf is not installed.
 EZDXF_ONLY = ['DXF entity types for R12', 'closed and open polylines', 'block names and attribute tags',
               'raw and cleaned text', 'layer off and frozen state', 'unused layers', 'layouts and viewports']
@@ -2001,6 +2007,243 @@ def assign_crs(args):
     return manifest
 
 
+OVERLAY_FIELDS = ('parcel_id', 'landuse', 'control_type', 'status')
+REFERENCE_COLOURS = ('#1f77b4', '#2ca02c', '#9467bd', '#8c564b', '#17becf', '#e377c2', '#7f7f7f', '#bcbd22')
+
+
+def layer_spec(text):
+    """PATH[:LAYER]; split only when the whole text is not an existing path."""
+    if ':' in text and not Path(text).exists():
+        path, layer = text.rsplit(':', 1)
+        return Path(path), layer or None
+    return Path(text), None
+
+
+def projected_metres(crs):
+    unit = crs.axis_info[0].unit_name if crs.axis_info else None
+    return crs.is_projected and unit == 'metre'
+
+
+def polygon_parts(geometry):
+    import shapely
+    parts = [part for part in shapely.get_parts(geometry) if part.geom_type == 'Polygon' and not part.is_empty]
+    return shapely.MultiPolygon(parts) if parts else None
+
+
+def plot_overlay(parcels, references, qa, view, path, title, font):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+    figure, axis = plt.subplots(figsize=(12, 9))
+    held = parcels['status'] == 'hold' if 'status' in parcels else parcels.geometry.isna()
+    parcels[~held].plot(ax=axis, facecolor='#eeeeee', edgecolor='none')
+    handles = [plt.Rectangle((0, 0), 1, 1, facecolor='#eeeeee', edgecolor='#222222', label=f'parcels ({len(parcels)})')]
+    for i, (name, frame) in enumerate(references):
+        colour = REFERENCE_COLOURS[i % len(REFERENCE_COLOURS)]
+        kinds = frame.geometry.geom_type.fillna('')
+        areas, lines, points = (frame[kinds.str.contains(k)] for k in ('Polygon', 'LineString', 'Point'))
+        if len(areas):
+            areas.plot(ax=axis, facecolor=colour, edgecolor=colour, linewidth=1.0, alpha=0.18)
+            areas.boundary.plot(ax=axis, color=colour, linewidth=1.0)
+        if len(lines):
+            lines.plot(ax=axis, color=colour, linewidth=1.0)
+        if len(points):
+            points.plot(ax=axis, color=colour, markersize=10)
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=colour, edgecolor=colour, alpha=0.5, label=f'{name} ({len(frame)})'))
+    parcels[~held].boundary.plot(ax=axis, color='#222222', linewidth=0.6)
+    if held.any():
+        parcels[held].boundary.plot(ax=axis, color='#e67e22', linewidth=1.6)
+        handles.append(plt.Line2D([], [], color='#e67e22', linewidth=2, label=f'hold ({int(held.sum())})'))
+    shown = 0
+    for frame in qa.values():
+        frame = frame[frame.geometry.notna() & ~frame.geometry.is_empty]
+        kinds = frame.geometry.geom_type
+        points = frame[kinds.str.contains('Point')].geometry.centroid
+        if len(points):
+            axis.scatter(points.x, points.y, marker='x', color='#d62728', s=30, zorder=5)
+        lines = frame[kinds.str.contains('LineString')]
+        if len(lines):
+            lines.plot(ax=axis, color='#d62728', linewidth=1.4)
+        areas = frame[kinds.str.contains('Polygon')]
+        if len(areas):
+            areas.boundary.plot(ax=axis, color='#d62728', linewidth=1.2)
+        shown += len(frame)
+    if shown:
+        handles.append(plt.Line2D([], [], color='#d62728', marker='x', linestyle='', label=f'QA ({shown})'))
+    if 'parcel_id' in parcels:
+        for _, row in parcels[parcels['parcel_id'].fillna('') != ''].iterrows():
+            point = row.geometry.representative_point()
+            axis.annotate(row['parcel_id'], (point.x, point.y), fontsize=5, ha='center', va='center')
+    axis.set_xlim(view[0], view[2])
+    axis.set_ylim(view[1], view[3])
+    axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
+    axis.set_aspect('equal', adjustable='datalim')
+    axis.ticklabel_format(useOffset=False, style='plain')
+    axis.tick_params(labelsize=7)
+    axis.set_title(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def overlay(args):
+    """Parcels over reference layers in one check plot, with their intersections measured; nothing is repaired."""
+    import warnings as python_warnings
+    import geopandas as gpd
+    import numpy as np
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    from pyproj.transformer import Transformer
+
+    source = Path(args.source)
+    available = [name for name, _ in pyogrio.list_layers(source)]
+    if args.parcels_layer not in available:
+        raise ValueError(f'{source} has no layer {args.parcels_layer} ({", ".join(available)})')
+    check_vector(source, args.parcels_layer)
+    parcels = pyogrio.read_dataframe(source, layer=args.parcels_layer, fid_as_index=True)
+    if parcels.crs is None:
+        raise ValueError(f'{source}:{args.parcels_layer} has no CRS; run cad.py assign-crs (or vector-georef.py) first')
+    crs = CRS.from_user_input(parcels.crs)
+    if not projected_metres(crs):
+        raise ValueError(f'{source}:{args.parcels_layer} must be in a projected CRS in metres; got {crs.name}')
+    parcels = parcels[parcels.geometry.notna() & ~parcels.geometry.is_empty]
+    if not len(parcels):
+        raise ValueError(f'{source}:{args.parcels_layer} has no geometry')
+    if not parcels.geometry.geom_type.str.contains('Polygon').all():
+        raise ValueError(f'{source}:{args.parcels_layer} must hold polygons; got {sorted(set(parcels.geometry.geom_type))}')
+    held = parcels['status'] == 'hold' if 'status' in parcels else parcels.geometry.isna()
+    measured = parcels[~held] if args.exclude_hold else parcels
+    if not len(measured):
+        raise ValueError(f'{source}:{args.parcels_layer} has no parcels left to measure without the hold ones')
+    minx, miny, maxx, maxy = (float(v) for v in measured.total_bounds)
+    pad = OVERLAY_MARGIN*max(maxx-minx, maxy-miny, 1.0)
+    view = (minx-pad, miny-pad, maxx+pad, maxy+pad)
+    parcel_valid = measured.geometry.is_valid.to_numpy()
+    parcel_geoms = measured.geometry.to_numpy()
+    parcel_area = float(shapely.union_all(parcel_geoms[parcel_valid]).area)
+
+    references, report, rows, labels = [], [], [], set()
+    for spec in args.reference:
+        path, layer = layer_spec(spec)
+        names = [name for name, _ in pyogrio.list_layers(path)]
+        given = layer is not None
+        if not given and len(names) != 1:
+            raise ValueError(f'{path} has {len(names)} layers ({", ".join(names)}); name one as {path}:LAYER')
+        layer = layer or names[0]
+        if layer not in names:
+            raise ValueError(f'{path} has no layer {layer} ({", ".join(names)})')
+        info = pyogrio.read_info(path, layer=layer)
+        if info.get('crs') is None:
+            raise ValueError(f'{path}:{layer} has no CRS; a reference must carry one')
+        ref_crs = CRS.from_user_input(info['crs'])
+        reprojected = not ref_crs.equals(crs)
+        bbox = Transformer.from_crs(crs, ref_crs, always_xy=True).transform_bounds(*view, densify_pts=21) if reprojected else view
+        check_vector(path, layer)
+        frame = pyogrio.read_dataframe(path, layer=layer, bbox=tuple(bbox), fid_as_index=True)
+        frame = frame[frame.geometry.notna() & ~frame.geometry.is_empty]
+        dropped_z = bool(frame.geometry.has_z.any())
+        if dropped_z:
+            frame = frame.set_geometry(shapely.force_2d(frame.geometry.to_numpy()), crs=frame.crs)
+        if reprojected:
+            frame = frame.to_crs(crs)
+        name = layer if given else path.stem
+        base, n = name, 2
+        while name in labels:
+            name, n = f'{base}#{n}', n+1
+        labels.add(name)
+        kinds = frame.geometry.geom_type
+        areal = kinds.str.contains('Polygon').to_numpy()
+        valid = frame.geometry.is_valid.to_numpy()
+        invalid = [int(fid) for fid in frame.index[areal & ~valid]]
+        entry = {'label': name, 'path': str(path.absolute()), 'layer': layer, 'features': len(frame),
+                 'geometry_types': sorted(set(kinds)), 'crs': ':'.join(ref_crs.to_authority()) if ref_crs.to_authority() else ref_crs.name,
+                 'reprojected': reprojected, 'dropped_z': dropped_z, 'invalid_fids': invalid,
+                 'parcels_touched': 0, 'intersection_area_m2': 0.0, 'share_of_parcels': 0.0}
+        usable = frame[areal & valid]
+        if len(usable):
+            ref_geoms = usable.geometry.to_numpy()
+            tree = shapely.STRtree(ref_geoms)
+            left, right = tree.query(np.where(parcel_valid, parcel_geoms, None), predicate='intersects')
+            pieces = shapely.intersection(parcel_geoms[left], ref_geoms[right])
+            areas = shapely.area(pieces)
+            keep = areas > 0
+            left, right, pieces, areas = left[keep], right[keep], pieces[keep], areas[keep]
+            parcel_areas, ref_areas = shapely.area(parcel_geoms[left]), shapely.area(ref_geoms[right])
+            for i, j, piece, area, pa, ra in zip(left, right, pieces, areas, parcel_areas, ref_areas):
+                row = measured.iloc[i]
+                rows.append({'parcel_fid': int(measured.index[i]), **{f: row[f] for f in OVERLAY_FIELDS if f in parcels},
+                             'reference': name, 'reference_fid': int(usable.index[j]), 'area_m2': round(float(area), 3),
+                             'parcel_share': round(float(area/pa), 6), 'reference_share': round(float(area/ra), 6),
+                             'geometry': polygon_parts(piece)})
+            if len(pieces):
+                union = float(shapely.union_all(pieces).area)
+                entry.update(parcels_touched=len(set(left.tolist())), intersection_area_m2=round(union, 3),
+                             share_of_parcels=round(union/parcel_area, 6) if parcel_area else None)
+        references.append((name, frame))
+        report.append(entry)
+
+    if args.qa_layers is None:
+        qa_names = [name for name in available if name != args.parcels_layer and (name.startswith('qa_') or name == 'label_conflicts')]
+    else:
+        qa_names = [name.strip() for name in args.qa_layers.split(',') if name.strip()]
+        missing = [name for name in qa_names if name not in available]
+        if missing:
+            raise ValueError(f'{source} has no QA layer {", ".join(missing)} ({", ".join(available)})')
+    qa = {}
+    for name in qa_names:
+        frame = pyogrio.read_dataframe(source, layer=name)
+        if frame.crs is None:
+            raise ValueError(f'{source}:{name} has no CRS; QA layers must share the parcels\' CRS')
+        qa[name] = frame if CRS.from_user_input(frame.crs).equals(crs) else frame.to_crs(crs)
+    hold = {'count': int(held.sum()), 'measured': not args.exclude_hold,
+            'parcel_fids': [int(fid) for fid in parcels.index[held]],
+            'parcel_ids': sorted(str(v) for v in parcels.loc[held, 'parcel_id'].dropna()) if 'parcel_id' in parcels else []}
+    columns = ['parcel_fid', *[f for f in OVERLAY_FIELDS if f in parcels], 'reference', 'reference_fid', 'area_m2',
+               'parcel_share', 'reference_share']
+    intersections = gpd.GeoDataFrame(rows, columns=[*columns, 'geometry'], geometry='geometry', crs=crs)
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    code = ':'.join(crs.to_authority()) if crs.to_authority() else crs.name
+    with bundle(args.output) as stage:
+        target = stage / 'overlay.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message='.*geometry column.*')
+            pyogrio.write_dataframe(intersections, target, layer='intersections', driver='GPKG', geometry_type='MultiPolygon')
+        back = int(pyogrio.read_info(target, layer='intersections', force_feature_count=True)['features'])
+        if back != len(intersections):
+            raise ValueError(f'Readback count {back} of intersections differs from {len(intersections)}; nothing was published')
+        plot_overlay(parcels, references, qa, view, stage / 'check.png',
+                     f'{source.name}:{args.parcels_layer} · {len(parcels)} parcels · {hold["count"]} hold · '
+                     f'{len(references)} references', font)
+        manifest = {'manifest': 'cad-overlay', 'schema_version': 1,
+                    'input': {'name': source.name, 'layer': args.parcels_layer, 'sha256': digest(source) if source.is_file() else None,
+                              'features': len(parcels), 'measured': len(measured), 'measured_area_m2': round(parcel_area, 3),
+                              'invalid_fids': [int(fid) for fid in measured.index[~parcel_valid]]},
+                    'crs': code, 'view': [round(v, 3) for v in view], 'margin': OVERLAY_MARGIN,
+                    'references': report, 'hold': hold, 'qa': {name: len(frame) for name, frame in qa.items()},
+                    'intersections': len(intersections),
+                    'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad overlay', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': manifest['input']['sha256']},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
+                                                      'check.png': digest(stage / 'check.png')},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['References are read only within the view (parcels\' extent plus the margin) and '
+                                                            'reprojected to the parcels\' CRS; Z is dropped',
+                                                            'Invalid parcels and reference polygons are plotted and listed, not repaired or measured',
+                                                            *(['Hold parcels are plotted and listed, not measured'] if args.exclude_hold else []),
+                                                            'Areas are planar, in the parcels\' CRS']})
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -2067,8 +2310,27 @@ def main():
     assign.add_argument('--basis', required=True, help='What the confirmation rests on, e.g. provider statement, control-point check')
     assign.add_argument('--outside-candidates', action='store_true', help='Allow a CRS the inspection did not list; recorded')
     assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
+    lay = commands.add_parser('overlay', help='Parcels over reference layers in one check plot, intersections measured')
+    lay.add_argument('source', help='Vector file with parcels in a projected CRS, e.g. parcels.gpkg after assign-crs')
+    lay.add_argument('--parcels-layer', default='parcels', help='Parcel layer within source (default parcels)')
+    lay.add_argument('--reference', action='append', required=True,
+                     help='PATH[:LAYER] of a reference layer with a CRS (repeatable); a single-layer file needs no layer')
+    lay.add_argument('--qa-layers', help='Comma-separated layers of source to mark as QA (default: qa_* and label_conflicts; '
+                                         'empty for none)')
+    lay.add_argument('--exclude-hold', action='store_true',
+                     help='Plot and list hold parcels but leave them out of the intersections and the view extent')
+    lay.add_argument('--output', required=True, help='New directory for overlay.gpkg, check.png, manifest.json and record.json')
     args = parser.parse_args()
     try:
+        if args.command == 'overlay':
+            manifest = overlay(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'parcels': manifest['input']['features'],
+                              'hold': manifest['hold']['count'], 'intersections': manifest['intersections'],
+                              'references': {r['label']: {k: r[k] for k in ('features', 'parcels_touched', 'intersection_area_m2',
+                                                                            'share_of_parcels', 'invalid_fids')}
+                                             for r in manifest['references']},
+                              'qa': manifest['qa']}, ensure_ascii=False))
+            return
         if args.command == 'xiangyuan':
             manifest = xiangyuan(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
