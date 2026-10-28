@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `cad.py extract` 新增 `hatches` 图层（需求 R8）：每个 HATCH 按边界路径和填充样式生成它填充的面，孤岛成洞，保留图案名、ACI 颜色、真彩色和样式；边界自相交的不填充、不修复，标 `valid = false`。新子命令 `cad.py compare-fills`：把填充面按 IoU 配给 polygonize / label / xiangyuan 的面，报告重叠、IoU，以及只在填充或只在面里的面积（`fill_only`、`face_only` 图层），可用 `--exclude-hold`。运行清单 `cad-fill-compare` v1 已加入 capabilities。
 - `cad.py xiangyuan` 取出嵌入对象：`OLE2FRAME` 写入 `ole_frames` 图层（位置取二进制头部的角点，LibreDWG 的 10/11 组码是占位值），嵌入的文件原样另存到 `ole/`（Excel 2007+ 为 xlsx），列出工作表和框里显示的那张，各工作簿同名表内容不同时报告并警告；`*T` 表格块的单元格按位置排行列写到 `tables/`；LibreDWG 转丢内容的 `ACAD_TABLE` 给出警告。编号图块只补面上为空的字段（`filled_from_block`），不覆盖已有值。新增可选依赖 olefile（`gis.py capabilities` 的 `cad-ole`）。
 - 新子命令 `cad.py overlay`（需求 R10）：把有投影 CRS 的地块和参考图层叠在一张检查图里，hold 地块橙色描边、`qa_*` 与 `label_conflicts` 层红色标出；参考按地块范围外扩 10% 读入并重投影，地块与每个参考面的交集写进 `overlay.gpkg`（面积、占地块比例、占参考比例），清单 `cad-overlay` v1 按参考汇总碰到的地块数与交集面积。无效面只列出不修复；`--exclude-hold` 让 hold 地块不参与统计和视图范围。`gis.py capabilities` 的 `contracts` 一并声明 `cad-overlay`。说明见 `references/cad-intake.md`。
 - `gis.py capabilities` 的 `contracts` 声明新增的运行清单（`cad-inventory`、`cad-convert`、`cad-extract`、`cad-polygonize`、`cad-label`、`cad-xiangyuan`、`crs-assignment`、`vector-transform`、`vector-georef-apply`、`esri-package`，均为 v1）。README 补充 CAD 规划图纸、ArcGIS 包与按编号挂接的介绍。

@@ -173,8 +173,13 @@ python cad.py extract 建筑.dxf --units mm --arc-tolerance 0.02 --include-block
   - 一段文字被多条引线指着时，`arrows` 记条数，文字位置不变。
   - `MULTILEADER` 的文字写入 `texts`（`dxf_type = MULTILEADER`）：只有一个箭头时放在箭头处，多个箭头时放在文字位置，`arrows` 记个数；每个箭头都写入 `leaders`。
   - 没连到任何已提取文字的引线 `linked = false`。
-- **其他实体**：`HATCH`、`POINT`、`DIMENSION` 等不提取，按类型计入 `skipped`。
-- **输出**：新目录，含 `raw.gpkg`（`lines`、`closed_polygons`、`texts`、`blocks`、`leaders` 五个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
+- **图层 `hatches`**：每个 `HATCH` 生成它填充的那块面（多面），作为地块边界的备用来源。
+  - 边界路径按 `--arc-tolerance` 离散，按包含关系分出层次，再按填充样式取面：`normal`（`hatch_style = 0`）奇偶填充，孤岛成洞，孤岛里的孤岛再填上；`outer`（1）只取最外一层减去第一层孤岛；`ignore`（2）只取最外层。
+  - 字段：`layer`、`dxf_type`、`handle`、`pattern`（图案名，实心填充为 `SOLID`）、`solid`、`color`（ACI 色号，256 为随层、0 为随块）、`true_color`（设了真彩色时为 `#rrggbb`）、`hatch_style`、`loops`（边界环数）、`area_m2`、`valid`、`block`、`source_handle`。
+  - 边界环不是简单多边形（自相交等）时不填充、不修复：原样保留各个环，`valid = false`，`area_m2` 为空，并给出警告。几个环按填充样式互相抵消、面积为 0 的（例如同一个环画了两遍）也给出警告。
+  - 图案和颜色只记录，不渲染。
+- **其他实体**：`POINT`、`DIMENSION` 等不提取，按类型计入 `skipped`；没有边界路径的 `HATCH` 记为 `HATCH (no boundary)`。
+- **输出**：新目录，含 `raw.gpkg`（`lines`、`closed_polygons`、`texts`、`blocks`、`leaders`、`hatches` 六个图层，无 CRS；没有要素的图层也保留字段结构）、`manifest.json`（`manifest: cad-extract` v1：源文件 SHA-256、文件头、参数、按图层和类型统计的读取数 `read`、各输出图层的要素数、`skipped`、图纸空间数、`z`、`warnings`、输出 SHA-256）和 `record.json`。`read` 的计数口径与 inspect 的图层实体数相同，可以直接对照。写出后回读核对各图层的要素数，不一致不发布。
 
 ## 散线围成面
 
@@ -202,6 +207,34 @@ python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,�
 - **规划范围线（`--boundary`）**：给出范围线所在的 CAD 图层，它的线参与打断（自动加入 `--cad-layers`），并且单独围成范围面；范围外的面不输出，个数记为 `outside_boundary`；清单记录面总面积、范围面积和两者的比值。范围线围不成面时报错。不给时不裁剪，清单注明面积未按规划范围限定。
 - **拓扑检查**：对面调用 `topo.py` 的检查（缺口、重叠、碎面、无效几何、重复），碎面阈值取 `--min-area`，结果写入 `qa_topology`。没有 CRS 时，在一个只代表图纸平面的米制坐标系里计算，清单注明。
 - **输出**：新目录，含 `faces.gpkg`（`faces`、`qa_gaps`、`qa_dangles`、`qa_topology`、`added_lines` 五个图层；空图层也保留字段结构）、`check.png`（通过的面浅蓝、hold 的面橙色，缺口红色、悬挂线紫色、补线绿色）、`manifest.json`（`manifest: cad-polygonize` v1：参数、用到的线数、吸附统计、各图层要素数、面的通过 / hold / 范围外个数、面积、说明）和 `record.json`。写出后回读核对各图层要素数。
+
+## 填充与面对比
+
+`cad.py compare-fills` 把 `extract` 得到的填充面和围好的面逐个对照，看两种来源的边界是否一致。面可以是 `polygonize` 的 `faces`，也可以是 `label` 或 `xiangyuan` 的 `parcels`。程序只量差异，不吸附、不合并，也不替你选。
+
+```bash
+python cad.py extract 法图.dxf --units m --layers C1_T,G1_T,R2_T,DY控制地块 --output /work/cad/fatu-fills
+python cad.py compare-fills /work/cad/fatu-xy/parcels.gpkg --faces-layer parcels --fills /work/cad/fatu-fills/raw.gpkg \
+  --exclude-hold --output /work/cad/fatu-fill-compare
+```
+
+- **输入**：面图层（`--faces-layer`，默认 `faces`）和 `raw.gpkg` 的 `hatches`（`--fills-layer`）。两边的 CRS 必须相同，或者都没有；带 CRS 时须是以米为单位的投影坐标系。`--cad-layers` 只取这些 CAD 图层上的填充；`--exclude-hold` 去掉 `status = hold` 的面，清单记个数。
+- **配对**：每个填充配给 IoU（交集面积除以并集面积）最大的那个面。按 IoU 而不是按重叠面积，是因为图框、规划范围这类大面和每个填充都重叠，却和哪个都对不上。妈湾法图里误标成 `DY` 的图框面就是这种情况。
+- **图层 `fills`**：填充的全部字段，另加：
+  - `match`：`one face`、`several faces`（同时和几个面有重叠，`faces` 记个数）、`no face`、`invalid fill`、`empty fill`；
+  - 最佳面的序号 `face_index` 和字段 `face_face_id`、`face_parcel_id`、`face_landuse`、`face_control_type`、`face_status`、`face_layer`、`face_handle`（面图层里有哪些就带哪些）；
+  - `overlap_m2`、`iou`；
+  - `fill_only_m2`：填充落在所有面以外的面积。
+- **图层 `faces`**：每个面的 `fills`（配给它的填充数）、`fills_overlapping`（和它有任何重叠的填充数，包括邻接处的细缝）、`fill_cover_m2`、`face_only_m2`、`valid`。
+- **图层 `fill_only`、`face_only`**：两边并集互减后的每一块，带 `area_m2`。贴边的浮点细缝也会列出，面积很小，按 `area_m2` 筛选。
+- **无效几何**：无效的填充和面照样列出，但不参与比较，并给出警告。
+- **输出**：新目录，含 `fill_compare.gpkg`、`check.png`（只有面的部分为橙色，填充为浅蓝，只有填充的部分为红色，面的边界为灰线）、`manifest.json`（`manifest: cad-fill-compare` v1：输入、`summary`（配对情况、没有填充的面数、IoU 中位数和最小值）、`area`（两边面积、共有面积、`fill_only_m2`、`face_only_m2`））和 `record.json`。
+- **妈湾法图实测**（湘源直取地块，`_T` 和 `DY控制地块` 两类填充，去掉 hold 的图框面）：
+  - 51 个 `_T` 填充和地块的 IoU 都是 1，边界完全一致；
+  - 4 个各 240 m² 的 `_T` 填充不在任何地块里，位于图例区，是图例色块；
+  - 07-24 的 G1 填充边界自相交，未参与比较；
+  - 01-02、02-04 两块 `G1+C1` 地块没有填充，图里没有 `G1+C1_T` 图层；
+  - `DY控制地块` 的 8 个填充一个盖住几个规划控制单元面（IoU 0.13 到 0.26），03-08、03-09、03-10 三个单元面没有填充。
 
 ## 文字挂接到面
 

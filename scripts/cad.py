@@ -22,7 +22,11 @@ by an explicit --units, non-zero Z refused unless --drop-z, no CRS. It needs ezd
 lines and polygonizes them into faces.gpkg: faces (small or invalid ones held, never dropped), gaps up to
 --max-gap and dangles as QA layers, topo.py checks on the faces. Gaps are closed only with --close-gaps.
 
-`cad.py label` puts parcel fields on those faces from CAD texts by YAML rules (one field per text, or several
+`cad.py extract` also writes each HATCH as the area it fills (hatches): boundary loops nested by containment and
+filled by the hatch style, with pattern, colour and style kept. `cad.py compare-fills` matches those fills to faces
+from polygonize, label or xiangyuan (each fill to the face with the highest IoU) and measures the area only one side covers.
+
+`cad.py label` puts parcel fields on polygonized faces from CAD texts by YAML rules (one field per text, or several
 by named groups), placing each text at its alignment point or leader arrow. Several distinct values in a face,
 texts outside every face or on a shared edge, unparsed texts, duplicate parcel ids and unlinked leaders are
 listed, never resolved by choice; road faces come only from the road rule.
@@ -720,7 +724,31 @@ EXTRACT_LAYERS = {
                          'attributes': str}),
     # One row per leader arrow; text_handle is the text it labels, linked tells whether that text was extracted.
     'leaders': ('Point', {'layer': str, 'dxf_type': str, 'handle': str, 'text_handle': str, 'linked': bool}),
+    # The area each HATCH fills; color is the ACI number (256 = BYLAYER, 0 = BYBLOCK), true_color #rrggbb when set.
+    'hatches': ('MultiPolygon', {'layer': str, 'dxf_type': str, 'handle': str, 'pattern': str, 'solid': bool, 'color': int,
+                                 'true_color': str, 'hatch_style': int, 'loops': int, 'area_m2': float, 'valid': bool,
+                                 'block': str, 'source_handle': str}),
 }
+HATCH_STYLES = {0: 'normal', 1: 'outer', 2: 'ignore'}
+
+
+def fill_area(loops, style):
+    """(area a HATCH fills, valid) from its boundary loops, nested by containment: the normal style fills even-odd
+    (islands are holes, islands in them filled again), outer stops at the first island level, ignore keeps only the
+    outermost loops. Loops that are not simple polygons are returned as drawn, flagged invalid, never repaired."""
+    import shapely
+    rings = [shapely.Polygon(loop) for loop in loops]
+    if not all(ring.is_valid and ring.area > 0 for ring in rings):
+        return shapely.MultiPolygon([ring for ring in rings if not ring.is_empty]), False
+    depth = [sum(1 for j, other in enumerate(rings) if j != i and other.covers(ring) and (other.area > ring.area or j < i))
+             for i, ring in enumerate(rings)]
+    limit = {1: 1, 2: 0}.get(style, len(rings))
+    area = shapely.GeometryCollection()
+    for ring, level in zip(rings, depth):
+        if level <= limit:
+            area = shapely.symmetric_difference(area, ring) if style != 2 else shapely.union(area, ring)
+    parts = [part for part in shapely.get_parts(area) if part.geom_type == 'Polygon' and not part.is_empty]
+    return shapely.MultiPolygon(parts), True
 
 
 class Extraction:
@@ -818,6 +846,26 @@ class Extraction:
                                          'coords': [tuple(vertices[0])]})
         elif kind == 'MULTILEADER':
             self.multileader(entity, layer, block, source)
+        elif kind == 'HATCH':
+            loops = []
+            try:
+                for item in path.from_hatch(entity):
+                    points = [tuple(p) for p in item.flattening(distance=self.tolerance)]
+                    if len({p[:2] for p in points}) >= 3:
+                        loops.append(points)
+            except (TypeError, ValueError):
+                loops = []
+            if not loops:
+                self.skipped['HATCH (no boundary)'] += 1
+                return
+            rgb = entity.rgb
+            self.rows['hatches'].append({'layer': layer, 'dxf_type': kind, 'handle': handle,
+                                         'pattern': entity.dxf.get('pattern_name'), 'solid': bool(entity.dxf.get('solid_fill', 0)),
+                                         'color': int(entity.dxf.get('color', 256)),
+                                         'true_color': '#%02x%02x%02x' % tuple(rgb) if rgb else None,
+                                         'hatch_style': int(entity.dxf.get('hatch_style', 0)), 'loops': len(loops),
+                                         'block': block, 'source_handle': source, 'loop_points': loops,
+                                         'coords': [p for loop in loops for p in loop]})
         elif kind == 'INSERT':
             name = entity.dxf.name
             for attrib in entity.attribs:
@@ -914,10 +962,17 @@ def extract(args):
     for name, (geometry_type, fields) in EXTRACT_LAYERS.items():
         rows = run.rows[name]
         points = [[(p[0]*scale, p[1]*scale) for p in row['coords']] for row in rows]
-        maker = {'LineString': shapely.linestrings, 'Polygon': shapely.polygons, 'Point': shapely.points}[geometry_type]
-        geometry = [maker(p[0] if geometry_type == 'Point' else p) for p in points]
+        if name == 'hatches':
+            filled = [fill_area([[(x*scale, y*scale) for x, y, *_ in loop] for loop in row['loop_points']], row['hatch_style'])
+                      for row in rows]
+            for row, (shape, valid) in zip(rows, filled):
+                row.update(area_m2=round(float(shape.area), 3) if valid else None, valid=valid)
+            geometry = [shape for shape, _ in filled]
+        else:
+            maker = {'LineString': shapely.linestrings, 'Polygon': shapely.polygons, 'Point': shapely.points}[geometry_type]
+            geometry = [maker(p[0] if geometry_type == 'Point' else p) for p in points]
         table = pd.DataFrame({field: pd.Series([row.get(field) for row in rows], dtype=object if kind is str else kind)
-                              for field, kind in fields.items() if field != 'valid'})
+                              for field, kind in fields.items() if field != 'valid' or name == 'hatches'})
         if name == 'closed_polygons':
             table['valid'] = pd.Series(shapely.is_valid(np.array(geometry, dtype=object)) if rows else [], dtype=bool)
         if name == 'texts':
@@ -929,6 +984,14 @@ def extract(args):
     invalid = int((~frames['closed_polygons']['valid']).sum()) if len(frames['closed_polygons']) else 0
     if invalid:
         warnings.append(f'{invalid} closed polygons are invalid (valid = false); kept as drawn, not repaired')
+    hatches = frames['hatches']
+    invalid = int((~hatches['valid'].astype(bool)).sum()) if len(hatches) else 0
+    if invalid:
+        warnings.append(f'{invalid} hatches have boundary loops that are not simple polygons (valid = false); '
+                        'their loops are kept as drawn, not filled or repaired')
+    empty = int((hatches['valid'].astype(bool) & (hatches['area_m2'] == 0)).sum()) if len(hatches) else 0
+    if empty:
+        warnings.append(f'{empty} hatches fill no area: their loops cancel out under the hatch style (e.g. a loop drawn twice)')
 
     stat = source.stat()
     with bundle(args.output) as stage:
@@ -960,7 +1023,9 @@ def extract(args):
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                             'assumptions': ['Coordinates are only scaled to metres; no CRS is set and nothing is moved',
                                                             'Curves are flattened so no chord is farther than --arc-tolerance from the curve',
-                                                            'Closed polygons are taken as drawn; invalid ones are flagged, not repaired']})
+                                                            'Closed polygons are taken as drawn; invalid ones are flagged, not repaired',
+                                                            'A hatch is the area its boundary loops fill under its hatch style; '
+                                                            'its pattern and colour are kept, not rendered']})
     return manifest
 
 
@@ -1163,6 +1228,190 @@ def polygonize(args):
                                                             'Endpoints within --snap are merged and free ends within --snap are moved onto the nearest line',
                                                             'Gaps up to --max-gap are reported; they are closed only with --close-gaps, and marked',
                                                             'Faces are candidates: no face is dropped for size, small and invalid ones are held']})
+    return manifest
+
+
+FACE_KEYS = ('face_id', 'parcel_id', 'landuse', 'control_type', 'status', 'layer', 'handle')
+
+
+def plot_fill_compare(faces, fills, fill_only, face_only, path, title, font):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    figure, axis = plt.subplots(figsize=(12, 9))
+    handles = []
+    for frame, style, label in ((face_only, {'facecolor': '#f6b26b', 'edgecolor': 'none'}, 'face only'),
+                                (fills, {'facecolor': '#9fc5e8', 'edgecolor': '#3d85c6', 'linewidth': 0.3, 'alpha': 0.6}, 'fill'),
+                                (fill_only, {'facecolor': '#d62728', 'edgecolor': 'none'}, 'fill only')):
+        if len(frame):
+            frame.plot(ax=axis, **style)
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=style['facecolor'], label=f'{label} ({len(frame)})'))
+    if len(faces):
+        faces.boundary.plot(ax=axis, color='#4a4a4a', linewidth=0.4)
+        handles.append(plt.Line2D([], [], color='#4a4a4a', label=f'face ({len(faces)})'))
+    axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
+    axis.set_aspect('equal', adjustable='datalim')
+    axis.ticklabel_format(useOffset=False, style='plain')
+    axis.tick_params(labelsize=7)
+    axis.set_title(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def compare_fills(args):
+    """Hatch areas from cad.py extract against faces (polygonize faces, label or xiangyuan parcels): which face each
+    fill covers, and the area only one side covers. Nothing is snapped, merged or chosen."""
+    import warnings as python_warnings
+    from collections import Counter
+    import geopandas as gpd
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    faces_path, fills_path = Path(args.faces), Path(args.fills)
+    check_vector(faces_path, args.faces_layer)
+    check_vector(fills_path, args.fills_layer)
+    faces = gpd.read_file(faces_path, layer=args.faces_layer, engine='pyogrio')
+    fills = gpd.read_file(fills_path, layer=args.fills_layer, engine='pyogrio')
+    if not {'pattern', 'hatch_style', 'valid'} <= set(fills.columns):
+        raise ValueError(f'{fills_path}:{args.fills_layer} is not a hatches layer from cad.py extract')
+    if (faces.crs is None) != (fills.crs is None) or (faces.crs is not None and not CRS.from_user_input(faces.crs).equals(fills.crs)):
+        raise ValueError(f'Faces and fills must share a CRS (or both have none); got {faces.crs} and {fills.crs}')
+    if faces.crs is not None:
+        crs = CRS.from_user_input(faces.crs)
+        if not crs.is_projected or (crs.axis_info[0].unit_name if crs.axis_info else None) != 'metre':
+            raise ValueError(f'Input CRS must be projected in metres; got {crs.name}')
+    if args.cad_layers:
+        wanted = [name.strip() for name in args.cad_layers.split(',')]
+        present = set(fills['layer'].dropna())
+        unknown = [name for name in wanted if name not in present]
+        if unknown:
+            raise ValueError(f'No hatches on CAD layers {", ".join(unknown)}; layers present: {", ".join(sorted(present))}')
+        fills = fills[fills['layer'].isin(wanted)]
+    faces = faces[faces.geometry.notna() & faces.geom_type.isin(['Polygon', 'MultiPolygon'])].copy()
+    held = 0
+    if args.exclude_hold:
+        if 'status' not in faces:
+            raise ValueError(f'--exclude-hold needs a status field in {faces_path}:{args.faces_layer}')
+        held = int((faces['status'] == 'hold').sum())
+        faces = faces[faces['status'] != 'hold']
+    if not len(faces):
+        raise ValueError(f'{faces_path}:{args.faces_layer} has no polygons to compare')
+    faces['face_index'] = faces.index
+    fills = fills.reset_index(drop=True)
+    fills['fill_index'] = fills.index
+    usable_faces = faces[faces.geometry.is_valid]
+    usable_fills = fills[fills['valid'].astype(bool) & fills.geometry.notna() & ~fills.geometry.is_empty]
+    keys = [k for k in FACE_KEYS if k in faces.columns]
+
+    tree = shapely.STRtree(usable_faces.geometry.to_numpy())
+    pairs = tree.query(usable_fills.geometry.to_numpy(), predicate='intersects')
+    pieces = shapely.intersection(usable_fills.geometry.to_numpy()[pairs[0]], usable_faces.geometry.to_numpy()[pairs[1]])
+    pair_frame = pd.DataFrame({'fill': usable_fills['fill_index'].to_numpy()[pairs[0]],
+                               'face': usable_faces['face_index'].to_numpy()[pairs[1]], 'overlap': shapely.area(pieces)})
+    pair_frame = pair_frame[pair_frame['overlap'] > 0]
+    face_area = faces.geometry.area
+    # The best face has the highest IoU: a frame or boundary face around everything overlaps every fill but fits none.
+    pair_frame['iou'] = pair_frame['overlap']/(fills.geometry.area.to_numpy()[pair_frame['fill'].to_numpy()]
+                                               + face_area.loc[pair_frame['face']].to_numpy() - pair_frame['overlap'])
+    by_fill = pair_frame.sort_values('iou', ascending=False).groupby('fill')
+    rows = []
+    for _, fill in fills.iterrows():
+        row = {k: fill[k] for k in fills.columns if k not in ('geometry', 'fill_index')}
+        hits = by_fill.get_group(fill['fill_index']) if fill['fill_index'] in by_fill.groups else pair_frame.iloc[:0]
+        usable = fill['fill_index'] in usable_fills['fill_index'].values
+        if not usable:
+            row.update(match='invalid fill' if not fill['valid'] else 'empty fill')
+        elif not len(hits):
+            row.update(match='no face', fill_only_m2=round(float(fill.geometry.area), 3))
+        else:
+            best = hits.iloc[0]
+            face = faces.loc[best['face']]
+            covered = shapely.intersection(fill.geometry, shapely.union_all(faces.loc[hits['face']].geometry.to_numpy())).area
+            overlap = float(best['overlap'])
+            row.update(match='one face' if len(hits) == 1 else 'several faces', faces=len(hits), face_index=int(best['face']),
+                       **{f'face_{k}': face[k] for k in keys}, overlap_m2=round(overlap, 3),
+                       iou=round(float(best['iou']), 6),
+                       fill_only_m2=round(float(fill.geometry.area - covered), 3))
+        rows.append({**row, 'geometry': fill.geometry})
+    fill_frame = gpd.GeoDataFrame(pd.DataFrame(rows), geometry='geometry', crs=fills.crs)
+
+    by_face = pair_frame.groupby('face')
+    matched = Counter(int(i) for i in fill_frame.get('face_index', pd.Series(dtype=float)).dropna())
+    face_rows = []
+    for index, face in faces.iterrows():
+        hits = by_face.get_group(index) if index in by_face.groups else pair_frame.iloc[:0]
+        covered = (shapely.intersection(face.geometry, shapely.union_all(fills.loc[hits['fill']].geometry.to_numpy())).area
+                   if len(hits) and face.geometry.is_valid else 0.0)
+        face_rows.append({'face_index': index, **{k: face[k] for k in keys}, 'valid': bool(face.geometry.is_valid),
+                          'area_m2': round(float(face_area[index]), 3), 'fills': matched.get(index, 0), 'fills_overlapping': len(hits),
+                          'fill_cover_m2': round(float(covered), 3), 'face_only_m2': round(float(face_area[index] - covered), 3),
+                          'geometry': face.geometry})
+    face_frame = gpd.GeoDataFrame(pd.DataFrame(face_rows), geometry='geometry', crs=faces.crs)
+
+    fill_union = shapely.union_all(usable_fills.geometry.to_numpy())
+    face_union = shapely.union_all(usable_faces.geometry.to_numpy())
+
+    def parts(shape, side):
+        found = [p for p in shapely.get_parts(shape) if p.geom_type == 'Polygon' and p.area > 0]
+        return gpd.GeoDataFrame({'side': [side]*len(found), 'area_m2': [round(float(p.area), 6) for p in found]},
+                                geometry=gpd.GeoSeries(found, dtype='geometry'), crs=faces.crs)
+    fill_only = parts(shapely.difference(fill_union, face_union), 'fill only')
+    face_only = parts(shapely.difference(face_union, fill_union), 'face only')
+    matches = Counter(fill_frame['match'])
+    summary = {'fills': int(len(fills)), 'faces': int(len(faces)), 'matches': dict(matches.most_common()),
+               'faces_held_out': held, 'faces_without_fill': int((face_frame['fills'] == 0).sum()),
+               'faces_with_several_fills': int((face_frame['fills'] > 1).sum()),
+               'invalid_faces': int((~face_frame['valid']).sum()),
+               'iou_median': round(float(fill_frame['iou'].median()), 6) if 'iou' in fill_frame and fill_frame['iou'].notna().any() else None,
+               'iou_min': round(float(fill_frame['iou'].min()), 6) if 'iou' in fill_frame and fill_frame['iou'].notna().any() else None}
+    area = {'fills_m2': round(float(fill_union.area), 3), 'faces_m2': round(float(face_union.area), 3),
+            'both_m2': round(float(shapely.intersection(fill_union, face_union).area), 3),
+            'fill_only_m2': round(float(fill_only['area_m2'].sum()), 3), 'face_only_m2': round(float(face_only['area_m2'].sum()), 3)}
+    warnings = []
+    if matches.get('invalid fill'):
+        warnings.append(f'{matches["invalid fill"]} invalid hatches are listed but not compared')
+    if summary['invalid_faces']:
+        warnings.append(f'{summary["invalid_faces"]} invalid faces are listed but not compared')
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    layers = {'fills': (fill_frame, 'MultiPolygon'), 'faces': (face_frame, 'MultiPolygon'),
+              'fill_only': (fill_only, 'Polygon'), 'face_only': (face_only, 'Polygon')}
+    with bundle(args.output) as stage:
+        target = stage / 'fill_compare.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, (frame, kind) in layers.items():
+                pyogrio.write_dataframe(frame, target, layer=name, driver='GPKG', geometry_type=kind,
+                                        promote_to_multi=kind == 'MultiPolygon')
+        counts = {name: len(frame) for name, (frame, _) in layers.items()}
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in layers}
+        if back != counts:
+            raise ValueError(f'Readback feature counts {back} differ from {counts}; nothing was published')
+        plot_fill_compare(face_frame, fill_frame[fill_frame['match'] != 'invalid fill'], fill_only, face_only, stage / 'check.png',
+                          f'{fills_path.name} vs {faces_path.name} · {len(fills)} fills, {len(faces)} faces · '
+                          f'fill only {area["fill_only_m2"]:.0f} m², face only {area["face_only_m2"]:.0f} m²', font)
+        manifest = {'manifest': 'cad-fill-compare', 'schema_version': 1,
+                    'faces': {'name': faces_path.name, 'layer': args.faces_layer, 'sha256': digest(faces_path) if faces_path.is_file() else None},
+                    'fills': {'name': fills_path.name, 'layer': args.fills_layer, 'sha256': digest(fills_path) if fills_path.is_file() else None,
+                              'cad_layers': args.cad_layers.split(',') if args.cad_layers else None},
+                    'crs': str(faces.crs) if faces.crs is not None else None, 'face_keys': keys,
+                    'layers': counts, 'summary': summary, 'area': area, 'warnings': warnings,
+                    'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad compare-fills', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
+                                                      'check.png': digest(stage / 'check.png')},
+                                            'warnings': warnings,
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Each fill is matched to the face with the highest IoU; other overlaps are counted, not chosen',
+                                                            'fill_only and face_only are measured on the unions, as drawn; nothing is snapped or repaired']})
     return manifest
 
 
@@ -2506,6 +2755,14 @@ def main():
     faces.add_argument('--min-area', type=float, required=True, help='Faces smaller than this many m² are held as suspected slivers')
     faces.add_argument('--close-gaps', action='store_true', help='Close reported gaps with added lines, kept in added_lines and marked')
     faces.add_argument('--output', required=True, help='New directory for faces.gpkg, check.png, manifest.json and record.json')
+    compare = commands.add_parser('compare-fills', help='Compare hatch areas from extract with polygonized or 湘源 faces')
+    compare.add_argument('faces', help='Faces: faces.gpkg from polygonize, parcels.gpkg from label or xiangyuan')
+    compare.add_argument('--faces-layer', default='faces', help='Polygon layer within faces (default faces; parcels for label / xiangyuan)')
+    compare.add_argument('--fills', required=True, help='raw.gpkg from cad.py extract')
+    compare.add_argument('--fills-layer', default='hatches', help='Hatch layer within --fills (default hatches)')
+    compare.add_argument('--cad-layers', help='Comma-separated CAD layers of the hatches to use (default: all)')
+    compare.add_argument('--exclude-hold', action='store_true', help='Leave out faces whose status is hold (counted)')
+    compare.add_argument('--output', required=True, help='New directory for fill_compare.gpkg, check.png, manifest.json and record.json')
     tag = commands.add_parser('label', help='Attach parcel fields from CAD texts to polygonized faces by rules')
     tag.add_argument('faces', help='faces.gpkg from cad.py polygonize')
     tag.add_argument('--faces-layer', default='faces')
@@ -2583,6 +2840,11 @@ def main():
             manifest = polygonize(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'], 'faces': manifest['faces'],
                               'area': manifest['area']}, ensure_ascii=False))
+            return
+        if args.command == 'compare-fills':
+            manifest = compare_fills(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'summary': manifest['summary'], 'area': manifest['area'],
+                              'warnings': manifest['warnings']}, ensure_ascii=False))
             return
         if args.command == 'label':
             manifest = label(args)

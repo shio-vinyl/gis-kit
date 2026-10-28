@@ -76,7 +76,7 @@ def test_capabilities_no_site_packages_and_version():
     assert {f['name'] for f in doc['features']} == set(gis.FEATURES)
     assert all(not f['available'] and f['reason'].startswith('not importable') for f in doc['features'])
     assert cli('capabilities').returncode == 2
-    manifests = ('cad-inventory', 'cad-convert', 'cad-extract', 'cad-polygonize', 'cad-label', 'cad-xiangyuan', 'cad-overlay',
+    manifests = ('cad-inventory', 'cad-convert', 'cad-extract', 'cad-polygonize', 'cad-label', 'cad-xiangyuan', 'cad-overlay', 'cad-fill-compare',
                  'crs-assignment', 'vector-transform', 'vector-georef-apply', 'esri-package')
     assert doc['contracts'] == {'describe': {'write': [1]}, 'class-scheme': {'write': [1]}, 'display-raster': {'write': [1]}, 'tile-snapshot': {'write': [1]}, 'admin-chain': {'write': [1]}, 'display-vector': {'write': [1]},
                                 **{name: {'write': [1]} for name in manifests},

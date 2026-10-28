@@ -41,7 +41,7 @@ I will keep adding tools as I need them, including some research-oriented featur
 2. CAD planning drawings can be turned into GIS parcels:
    - DWG goes to DXF through an installed LibreDWG or ODA converter.
    - An inventory lists layers, units and stray title blocks, with candidate CRS from coordinate magnitude or a reference layer.
-   - General drawings are extracted, closed into faces with explicit tolerances, and labelled from their texts.
+   - General drawings are extracted, closed into faces with explicit tolerances, and labelled from their texts; hatches become faces and are compared with them.
    - 湘源控规 (Xiangyuan) statutory plans are read straight from the parcels' XDATA attributes, along with the Excel indicator tables embedded in the drawing and its CAD tables.
    - A confirmed CRS is assigned, or local grids are moved to a national grid by control points.
    - The parcels are overlaid on reference layers such as supplied land or renewal areas in a check plot, with the intersections measured.

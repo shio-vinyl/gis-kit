@@ -365,7 +365,7 @@ def test_extract_layers_fields_and_counts_match_inspect(tmp_path):
     manifest = extract(source, tmp_path/'out', '--units', 'header')
     counts = {row['layer']: row['entities'] for row in report['layers']}
     assert {k: sum(v.values()) for k, v in manifest['read'].items()} == counts  # same entities as the inspection
-    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0} and manifest['crs'] is None
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0, 'hatches': 0} and manifest['crs'] is None
     lines, polygons, texts, blocks = (layer(tmp_path/'out', n) for n in ('lines', 'closed_polygons', 'texts', 'blocks'))
     assert lines.crs is None and set(lines['layer']) == {'地块界线', '道路'} and lines['handle'].notna().all()
     assert polygons['valid'].all() and polygons['handle'].iloc[0] == lines.set_index('dxf_type').loc['LWPOLYLINE', 'handle']
@@ -396,7 +396,7 @@ def test_extract_flattens_arcs_within_tolerance(tmp_path):
 def test_extract_explodes_blocks_on_request(tmp_path):
     source = plan_drawing(tmp_path/'plan.dxf')
     manifest = extract(source, tmp_path/'out', '--units', 'm', '--layers', '地块编号', '--include-blocks')
-    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 0, 'texts': 3, 'blocks': 0, 'leaders': 0}
+    assert manifest['layers'] == {'lines': 2, 'closed_polygons': 0, 'texts': 3, 'blocks': 0, 'leaders': 0, 'hatches': 0}
     circles = layer(tmp_path/'out', 'lines')
     assert set(circles['dxf_type']) == {'CIRCLE'} and set(circles['layer']) == {'地块编号'}  # layer 0 takes the reference's
     assert circles['handle'].isna().all() and circles['source_handle'].notna().all() and set(circles['block']) == {'地块标签'}
@@ -441,8 +441,8 @@ def test_extract_then_assign_crs(tmp_path):
                       '--crs', 'EPSG:4526', *CONFIRM)
     assert manifest['crs']['id'] == 'EPSG:4526' and manifest['input']['layers'] == ['closed_polygons']
     every = assign(tmp_path/'raw'/'raw.gpkg', tmp_path/'all', '--inspection', tmp_path/'inspect', '--crs', 'EPSG:4526', *CONFIRM)
-    assert every['input']['layers'] == ['lines', 'closed_polygons', 'texts', 'blocks', 'leaders']
-    assert {k: v['features'] for k, v in every['checks'].items()} == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0}
+    assert every['input']['layers'] == ['lines', 'closed_polygons', 'texts', 'blocks', 'leaders', 'hatches']
+    assert {k: v['features'] for k, v in every['checks'].items()} == {'lines': 2, 'closed_polygons': 1, 'texts': 5, 'blocks': 2, 'leaders': 0, 'hatches': 0}
     for name in every['input']['layers']:
         layer = gpd.read_file(tmp_path/'all'/'raw.gpkg', layer=name)
         assert layer.crs.to_epsg() == 4526  # names kept, empty layers included
@@ -1171,3 +1171,108 @@ def test_overlay_refusals(tmp_path):
     assert 'a reference must carry one' in overlay(parcels, tmp_path/'e', '--reference', f'{loose}:parcels', success=False)
     (tmp_path/'exists').mkdir()
     assert 'Output must be a new directory' in overlay(parcels, tmp_path/'exists', *references, success=False)
+
+
+def square(x, y, size):
+    return [(x, y), (x+size, y), (x+size, y+size), (x, y+size)]
+
+
+def hatch_drawing(path):
+    """Hatches for each style around nested islands, a coloured pattern, an arc edge, a bow tie and a loop drawn twice."""
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    msp = doc.modelspace()
+
+    def add(layer, loops, style=0, **attributes):
+        hatch = msp.add_hatch(dxfattribs={'layer': layer, 'hatch_style': style, **attributes})
+        for loop in loops:
+            hatch.paths.add_polyline_path(loop, is_closed=True)
+        return hatch
+    nested = [square(0, 0, 100), square(20, 20, 20), square(25, 25, 10)]  # 10000 - 400 + 100 under even-odd
+    add('R2_T', nested, 0)
+    add('R2_T', [[(x+200, y) for x, y in loop] for loop in nested], 1)
+    add('R2_T', [[(x+400, y) for x, y in loop] for loop in nested], 2)
+    pattern = msp.add_hatch(dxfattribs={'layer': 'C1_T'})
+    pattern.set_pattern_fill('ANSI31', color=3, scale=2)
+    pattern.rgb = (255, 128, 0)
+    pattern.paths.add_polyline_path([(0, 200, 0), (100, 200, 1), (100, 300, 0), (0, 300, 0)], is_closed=True)  # half disc east
+    add('G1_T', [[(0, 400), (100, 500), (100, 400), (0, 500)]])   # bow tie
+    add('G1_T', [square(200, 400, 50), square(200, 400, 50)])     # the same loop twice
+    doc.saveas(path)
+    return path
+
+
+def test_extract_hatches_fill_by_style_and_keep_pattern(tmp_path):
+    source = hatch_drawing(tmp_path/'fills.dxf')
+    manifest = extract(source, tmp_path/'out', '--units', 'm', '--arc-tolerance', 0.01)
+    assert manifest['layers']['hatches'] == 6 and 'HATCH' not in manifest['skipped']
+    hatches = layer(tmp_path/'out', 'hatches').sort_values('handle').reset_index(drop=True)
+    normal, outer, ignore, pattern, bow, twice = (hatches.iloc[i] for i in range(6))
+    assert (normal.area_m2, outer.area_m2, ignore.area_m2) == (9700.0, 9600.0, 10000.0)
+    assert [h.hatch_style for h in (normal, outer, ignore)] == [0, 1, 2] and normal.loops == 3 and normal.solid
+    assert len(list(normal.geometry.geoms)) == 2  # the frame with a hole, and the island inside the hole
+    assert pattern.pattern == 'ANSI31' and not pattern.solid and pattern.color == 3 and pattern.true_color == '#ff8000'
+    assert pattern.area_m2 == pytest.approx(10000 + math.pi*50**2/2, rel=1e-3)
+    assert not bow.valid and math.isnan(bow.area_m2) and twice.valid and twice.area_m2 == 0
+    assert any('1 hatches have boundary loops that are not simple polygons' in w for w in manifest['warnings'])
+    assert any('1 hatches fill no area' in w for w in manifest['warnings'])
+
+
+def compare(faces, fills, out, *extra, success=True):
+    result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'compare-fills', str(faces), '--fills', str(fills),
+                             '--output', str(out), *map(str, extra)], capture_output=True, text=True)
+    assert (result.returncode == 0) == success, result.stdout+result.stderr
+    return json.loads((out/'manifest.json').read_text()) if success else result.stderr
+
+
+def fill_compare_inputs(tmp_path):
+    """Faces: A matches its fill, B is half covered by a fill that runs past it, C has none, D and E share one fill,
+    and a hold frame encloses everything. A sixth fill lies outside every face."""
+    ezdxf = pytest.importorskip('ezdxf')
+    doc = ezdxf.new('R2018')
+    msp = doc.modelspace()
+    for layer, loop in (('R2_T', square(0, 0, 100)), ('C1_T', [(150, 0), (300, 0), (300, 100), (150, 100)]),
+                        ('DY控制地块', [(0, 200), (200, 200), (200, 300), (0, 300)]), ('图例', square(900, 900, 10))):
+        msp.add_hatch(dxfattribs={'layer': layer}).paths.add_polyline_path(loop, is_closed=True)
+    doc.saveas(tmp_path/'fills.dxf')
+    extract(tmp_path/'fills.dxf', tmp_path/'raw', '--units', 'm')
+    faces = gpd.GeoDataFrame({'face_id': ['A', 'B', 'C', 'D', 'E', 'frame'], 'status': ['pass']*5 + ['hold']},
+                             geometry=[box(0, 0, 100, 100), box(100, 0, 200, 100), box(400, 0, 500, 100),
+                                       box(0, 200, 100, 300), box(100, 200, 200, 300), box(-50, -50, 1000, 1000)])
+    faces.to_file(tmp_path/'faces.gpkg', layer='faces')  # no CRS, like extract output
+    return tmp_path/'faces.gpkg', tmp_path/'raw'/'raw.gpkg'
+
+
+def test_compare_fills_matches_by_iou_and_measures_differences(tmp_path):
+    faces, fills = fill_compare_inputs(tmp_path)
+    manifest = compare(faces, fills, tmp_path/'out', '--exclude-hold')
+    out = tmp_path/'out'/'fill_compare.gpkg'
+    rows = gpd.read_file(out, layer='fills').set_index('layer')
+    assert rows.loc['R2_T', 'match'] == 'one face' and rows.loc['R2_T', 'face_face_id'] == 'A' and rows.loc['R2_T', 'iou'] == 1.0
+    c1 = rows.loc['C1_T']   # 150-300 over B (100-200): 5000 shared, 10000 past B
+    assert c1['match'] == 'one face' and c1['face_face_id'] == 'B' and c1['fill_only_m2'] == 10000.0
+    assert c1['iou'] == pytest.approx(5000/20000)
+    unit = rows.loc['DY控制地块']
+    assert unit['match'] == 'several faces' and unit['faces'] == 2 and unit['fill_only_m2'] == 0.0
+    assert rows.loc['图例', 'match'] == 'no face'
+    faces_out = gpd.read_file(out, layer='faces').set_index('face_id')
+    assert faces_out.loc['A', 'fills'] == 1 and faces_out.loc['C', 'fills'] == 0 and faces_out.loc['C', 'face_only_m2'] == 10000.0
+    assert faces_out.loc['B', 'face_only_m2'] == 5000.0 and faces_out.loc['E', 'fills_overlapping'] == 1
+    assert manifest['summary']['faces_held_out'] == 1 and manifest['summary']['matches'] == {'one face': 2, 'several faces': 1, 'no face': 1}
+    assert manifest['area']['fill_only_m2'] == 10100.0 and manifest['area']['face_only_m2'] == 15000.0
+    assert (tmp_path/'out'/'check.png').stat().st_size > 0
+    # With the hold frame kept, IoU still picks the faces the fills fit, and the legend swatch now falls in the frame.
+    compare(faces, fills, tmp_path/'kept')
+    kept = gpd.read_file(tmp_path/'kept'/'fill_compare.gpkg', layer='fills').set_index('layer')
+    assert kept.loc['R2_T', 'face_face_id'] == 'A' and kept.loc['图例', 'face_face_id'] == 'frame'
+    only = compare(faces, fills, tmp_path/'r2', '--exclude-hold', '--cad-layers', 'R2_T')
+    assert only['summary']['fills'] == 1 and only['area']['fill_only_m2'] == 0.0
+
+
+def test_compare_fills_refusals(tmp_path):
+    faces, fills = fill_compare_inputs(tmp_path)
+    assert 'not a hatches layer' in compare(faces, faces, tmp_path/'a', '--fills-layer', 'faces', success=False)
+    assert 'No hatches on CAD layers X_T' in compare(faces, fills, tmp_path/'b', '--cad-layers', 'X_T', success=False)
+    located = tmp_path/'located.gpkg'
+    gpd.read_file(faces).set_crs('EPSG:4547').to_file(located, layer='faces')
+    assert 'must share a CRS' in compare(located, fills, tmp_path/'c', success=False)
