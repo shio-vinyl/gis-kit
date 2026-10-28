@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- `buffer.py --distances 400,800,1200`：同心圈，每个要素按距离各出一个圆面，带 `buffer_m` 与 `ring`（1 为最内圈）；`--dissolve` 时逐圈合并。供 Composer 的 `rings` 编码块画缓冲圈 / 服务范围图（Composer #8）。
+- 修复：原子写出的 GeoJSON 把随机临时文件名（`.<名>.<随机>.tmp`）写成了图层名，同样的输入每次产出不同字节；现在图层名取输出文件名，重复运行逐字节一致。
 - 新脚本 `display-vector.py`：按一张图的视角（中心、缩放、画布，Web 墨卡托 512 像素瓦片，与 Composer `inspect` 一致）概括面数据：删去几平方像素以下的部件、按半像素共边简化、陆上国界只取相邻单元的公共边、海岸取合并后的外轮廓；`--keep` 保留必须出现的小单元，`--cache` 按源标识、参数与视角缓存。发布 `areas.geojson`、`boundaries.geojson`、`coast.geojson` 与清单 `display-vector` v1，`capabilities` 声明 `contracts.display-vector`（Composer #30）。
 - `admin-chain.md` 的 Composer 用法改为地图清单与分面（原 sheet 组合已在 Composer 中移除）。
 - 新脚本 `admin-chain.py`：按场地点或场地面，在 GADM 式分级 GeoPackage 里逐级找出包含场地的行政区，并取每级下一级的单元作内部界线；按各级范围做共边显示简化，发布 `chain.geojson`、`context.geojson` 与清单 `admin-chain` v1，供 Composer 的 sheet 组合做区位逐级放大图。国界口径用 `--adm0-layer` 显式选择。`capabilities` 声明 `contracts.admin-chain`（Composer #8）。

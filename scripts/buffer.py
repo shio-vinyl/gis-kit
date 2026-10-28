@@ -77,6 +77,11 @@ def main() -> None:
     parser.add_argument("--layer", help="Layer name to read")
     parser.add_argument("--distance", type=float, help="Buffer distance in meters")
     parser.add_argument("--field", help="Field whose values are buffer distances in meters")
+    parser.add_argument(
+        "--distances",
+        help="Comma-separated distances in meters for concentric rings: one feature per input row and distance, "
+        "with the distance in buffer_m and the ring number (1 = innermost) in ring",
+    )
     parser.add_argument("--analysis-crs", help="Projected CRS used for buffer calculations")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output GeoPackage")
     parser.add_argument("--segments", type=int, default=16, help="Circle approximation segments")
@@ -85,14 +90,36 @@ def main() -> None:
     parser.add_argument("--join-style", choices=JOIN_STYLES, default="round")
     args = parser.parse_args()
 
-    if args.distance is None and args.field is None:
-        parser.error("--distance or --field is required")
+    given = [name for name, value in (("--distance", args.distance), ("--field", args.field), ("--distances", args.distances)) if value is not None]
+    if not given:
+        parser.error("--distance, --field or --distances is required")
+    if len(given) > 1:
+        parser.error("give only one of --distance, --field and --distances")
+    rings = None
+    if args.distances is not None:
+        try:
+            rings = [float(part) for part in args.distances.split(",") if part.strip()]
+        except ValueError:
+            parser.error("--distances must be comma-separated numbers")
+        if not rings or any(not math.isfinite(value) or value <= 0 for value in rings):
+            parser.error("--distances must be positive finite numbers")
+        if len(set(rings)) != len(rings):
+            parser.error("--distances must not repeat a distance")
+        rings = sorted(rings)
 
     output = args.output or str(Path(args.input).stem) + "_buffer.gpkg"
     read_kw = {"layer": args.layer} if args.layer else {}
     check_vector(args.input, args.layer)
     gdf = gpd.read_file(args.input, **read_kw)
     original_crs = gdf.crs
+    if rings is not None:
+        clash = [name for name in ("buffer_m", "ring") if name in gdf.columns]
+        if clash:
+            parser.error("Input already has field(s) {}; rename them before buffering rings".format(", ".join(clash)))
+        # One row per input feature and ring, in input order, innermost ring first.
+        gdf = gdf.loc[gdf.index.repeat(len(rings))].reset_index(drop=True)
+        gdf["buffer_m"] = rings * (len(gdf) // len(rings))
+        gdf["ring"] = list(range(1, len(rings) + 1)) * (len(gdf) // len(rings))
 
     try:
         gdf, meters_per_unit = analysis_frame(gdf, args.analysis_crs)
@@ -105,6 +132,8 @@ def main() -> None:
             if args.field not in gdf.columns:
                 raise ValueError("Field does not exist: {}".format(args.field))
             distances_m = [float(value) for value in gdf[args.field]]
+        elif rings is not None:
+            distances_m = [float(value) for value in gdf["buffer_m"]]
         else:
             distances_m = [args.distance] * len(gdf)
         if any(value is None or not math.isfinite(value) for value in distances_m):
@@ -128,7 +157,8 @@ def main() -> None:
         parser.error("Cannot reliably interpret or apply buffer distances: {}".format(exc))
 
     if args.dissolve:
-        gdf = gdf.dissolve()
+        # Rings dissolve per distance: overlapping service areas of several centres merge ring by ring.
+        gdf = gdf.dissolve(by=["ring", "buffer_m"], as_index=False)[["ring", "buffer_m", "geometry"]] if rings is not None else gdf.dissolve()
 
     if reprojected:
         try:

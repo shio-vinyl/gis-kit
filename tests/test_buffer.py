@@ -194,3 +194,63 @@ def test_non_finite_field_distance_fails(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert not output.exists()
+
+
+def test_distances_make_concentric_rings_per_feature(tmp_path: Path) -> None:
+    source, output = tmp_path / "source.gpkg", tmp_path / "rings.gpkg"
+    _source(source, "EPSG:26918", [0, 0])
+
+    result = _run(source, output, "--distances", "800,400,1200")
+
+    assert result.returncode == 0, result.stderr
+    actual = gpd.read_file(output)
+    assert actual["id"].tolist() == [0, 0, 0, 1, 1, 1]
+    assert actual["buffer_m"].tolist() == [400.0, 800.0, 1200.0] * 2
+    assert actual["ring"].tolist() == [1, 2, 3] * 2
+    radii = [(geometry.bounds[2] - geometry.bounds[0]) / 2 for geometry in actual.geometry]
+    assert radii == pytest.approx([400, 800, 1200] * 2, rel=1e-7)
+
+
+def test_distances_dissolve_ring_by_ring(tmp_path: Path) -> None:
+    source, output = tmp_path / "source.gpkg", tmp_path / "rings.gpkg"
+    _source(source, "EPSG:26918", [0, 0])
+
+    result = _run(source, output, "--distances", "400,800", "--dissolve")
+
+    assert result.returncode == 0, result.stderr
+    actual = gpd.read_file(output)
+    assert actual["ring"].tolist() == [1, 2]
+    assert actual["buffer_m"].tolist() == [400.0, 800.0]
+    assert list(actual.columns) == ["ring", "buffer_m", "geometry"]
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (("--distances", "400", "--distance", "100"), "only one of"),
+        (("--distances", "400,0"), "positive finite"),
+        (("--distances", "400,400"), "must not repeat"),
+        (("--distances", "a,b"), "comma-separated numbers"),
+    ],
+)
+def test_distances_reject_bad_input(tmp_path: Path, args: tuple[str, ...], message: str) -> None:
+    source, output = tmp_path / "source.gpkg", tmp_path / "rings.gpkg"
+    _source(source, "EPSG:26918")
+
+    result = _run(source, output, *args)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert not output.exists()
+
+
+def test_geojson_output_is_named_after_the_file_and_repeatable(tmp_path: Path) -> None:
+    source = tmp_path / "source.gpkg"
+    _source(source, "EPSG:26918")
+    outputs = [tmp_path / "a" / "rings.geojson", tmp_path / "b" / "rings.geojson"]
+    for output in outputs:
+        result = _run(source, output, "--distances", "400,800")
+        assert result.returncode == 0, result.stderr
+    first, second = (output.read_bytes() for output in outputs)
+    assert first == second
+    assert b'"name": "rings"' in first

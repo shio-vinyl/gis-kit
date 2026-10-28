@@ -272,6 +272,10 @@ class AtomicVectorOutput:
         kwargs = {"driver": self.driver, "append": append, **options}
         if self.layer is not None:
             kwargs["layer"] = self.layer
+        elif self.driver == "GeoJSON":
+            # GeoJSON stores its layer name in the file; without one GDAL writes the random temporary
+            # name, so the same output would differ from run to run.
+            kwargs["layer"] = self.path.stem
         pyogrio.write_dataframe(frame, self.temp_path, **kwargs)
 
     def commit(
