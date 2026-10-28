@@ -1390,6 +1390,299 @@ def dwg_version(path):
     return magic
 
 
+XIANGYUAN_KEY = '用地代码'   # 湘源控规 writes each parcel attribute as its own XDATA application; this one marks a parcel
+XIANGYUAN_ALIASES = {'parcel_id': '地块编号', 'landuse': '用地代码', 'landuse_name': '用地性质'}
+XIANGYUAN_FIXED = ('parcel_id', 'landuse', 'landuse_name', 'control_type', 'unit_id', 'status', 'reason', 'area_m2', 'area_declared',
+                   'area_diff', 'number_block', 'valid', 'layer', 'handle')
+UNIT_FIELDS = ('unit_id', 'labels', 'status', 'reason', 'area_m2', 'duplicate_of', 'layer', 'handle')
+
+
+def xdata_values(entity):
+    """{application: first 1000-group string} of an entity's XDATA, the way 湘源 stores attributes."""
+    values = {}
+    for app, tags in (entity.xdata.data.items() if entity.xdata else ()):
+        strings = [tag.value for tag in tags if tag.code == 1000]
+        if strings:
+            values[app] = strings[0] if len(strings) == 1 else ' | '.join(strings)
+    return values
+
+
+def plot_xiangyuan(parcels, boundary, path, title, font):
+    import re
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    plt.rcParams['font.sans-serif'] = [font, 'DejaVu Sans']
+    figure, axis = plt.subplots(figsize=(12, 9))
+    colours = matplotlib.colormaps['tab10']
+    land = parcels[parcels['control_type'] == '地块']
+    groups = land['landuse'].fillna('').map(lambda code: (re.match(r'[A-Z]+', code) or [''])[0])
+    handles = []
+    for i, group in enumerate(sorted(set(groups))):
+        land[groups == group].plot(ax=axis, facecolor=colours(i % 10), edgecolor='#4a4a4a', linewidth=0.4, alpha=0.6)
+        handles.append(plt.Rectangle((0, 0), 1, 1, facecolor=colours(i % 10), alpha=0.6, label=group or '(no code)'))
+    units = parcels[parcels['control_type'] == '规划控制单元']
+    if len(units):
+        units.boundary.plot(ax=axis, color='#555555', linewidth=0.6, linestyle='--')
+        handles.append(plt.Line2D([], [], color='#555555', linestyle='--', label='规划控制单元'))
+    if boundary is not None:
+        axis.plot(*boundary.exterior.xy, color='#000000', linewidth=1.2)
+        handles.append(plt.Line2D([], [], color='#000000', label='规划边界'))
+    held = parcels[parcels['status'] == 'hold']
+    if len(held):
+        held.boundary.plot(ax=axis, color='#e67e22', linewidth=1.6)
+        handles.append(plt.Line2D([], [], color='#e67e22', linewidth=2, label='hold'))
+    for _, row in land[land['parcel_id'].fillna('') != ''].iterrows():
+        point = row.geometry.representative_point()
+        axis.annotate(row['parcel_id'], (point.x, point.y), fontsize=5, ha='center', va='center')
+    axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
+    axis.set_aspect('equal', adjustable='datalim')
+    axis.ticklabel_format(useOffset=False, style='plain')
+    axis.tick_params(labelsize=7)
+    axis.set_title(title, fontsize=10)
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
+def xiangyuan(args):
+    """Parcels of a 湘源控规 drawing straight from its closed polylines and their XDATA attributes."""
+    import warnings as python_warnings
+    from collections import Counter
+    import geopandas as gpd
+    import pandas as pd
+    import pyogrio
+    import shapely
+    from ezdxf import path as dxfpath
+    source = Path(args.source)
+    if source.suffix.lower() != '.dxf' or not source.is_file():
+        raise ValueError('Source must be an existing .dxf file (convert DWG first with cad.py convert)')
+    header = read_header(source)
+    doc, audit = read_drawing(source, args.encoding)
+    if doc is None:
+        raise ValueError('cad.py xiangyuan needs ezdxf: the parcel attributes are XDATA, which GDAL does not read')
+    names = [layer.dxf.name for layer in doc.layers]
+    encoding, encoding_report = choose_encoding(source, names, header, args.encoding)
+    if encoding_report['source'] == 'auto':
+        doc, audit = read_drawing(source, encoding)
+    if args.units == 'header':
+        scale = UNITS.get(header.get('insunits'), (None, None))[1]
+        if not scale:
+            raise ValueError(f'Header $INSUNITS is {header.get("units") or "missing"}; pass --units m or --units mm')
+    else:
+        scale = {'m': 1.0, 'mm': 0.001}[args.units]
+
+    def polygon(entity):
+        points = [(p.x*scale, p.y*scale) for p in dxfpath.make_path(entity).flattening(distance=args.arc_tolerance/scale)]
+        return shapely.Polygon(points) if len({pt for pt in points}) >= 3 else None
+
+    model = doc.modelspace()
+    records, skipped, open_marked = [], Counter(), 0
+    for entity in model:
+        values = xdata_values(entity)
+        if XIANGYUAN_KEY not in values:
+            continue
+        kind = entity.dxftype()
+        if kind not in ('LWPOLYLINE', 'POLYLINE'):
+            skipped[kind] += 1
+            continue
+        closed = entity.closed if kind == 'LWPOLYLINE' else entity.is_closed
+        shape = polygon(entity) if closed else None
+        if shape is None:
+            open_marked += 1
+            continue
+        layer = entity.dxf.layer
+        code = values.get(XIANGYUAN_KEY, '')
+        record = {field: values.get(source_field) for field, source_field in XIANGYUAN_ALIASES.items()}
+        record.update(values)
+        reasons = []
+        if layer not in (code, f'{code}_K'):  # 湘源 puts parcel outlines on <code>_K; some drawings drop the suffix
+            reasons.append(f'layer {layer} does not match 用地代码 {code}')
+        if (values.get('删除标记') or '').strip():
+            reasons.append('marked deleted')
+        if not (record['parcel_id'] or '').strip():
+            reasons.append('no 地块编号')
+        valid = bool(shapely.is_valid(shape))
+        if not valid:
+            reasons.append('invalid geometry')
+        area = float(shape.area)
+        try:
+            declared = float(values.get('用地面积') or 'nan')
+        except ValueError:
+            declared = float('nan')
+        diff = (area - declared)/declared if declared == declared and declared else None
+        if diff is not None and args.max_area_diff is not None and abs(diff) > args.max_area_diff:
+            reasons.append(f'area differs from 用地面积 by {diff:+.2%}')
+        record.update(control_type='规划控制单元' if code == 'DY' else '地块', area_m2=round(area, 3),
+                      area_declared=declared if declared == declared else None,
+                      area_diff=round(diff, 6) if diff is not None else None, valid=valid, layer=layer,
+                      handle=entity.dxf.handle, reasons=reasons, geometry=shape)
+        records.append(record)
+    if not records:
+        raise ValueError(f'No closed polylines carry a {XIANGYUAN_KEY} XDATA attribute; this does not look like a 湘源控规 drawing')
+    if args.units == 'header' and scale != 1.0:
+        # 湘源 records each parcel's area: if it fits the drawing as metres but not at the header unit, the header is wrong.
+        pairs = [(r['area_m2'], r['area_declared']) for r in records if r['area_declared']]
+        if pairs:
+            import statistics
+            at_header = statistics.median(abs(a - d)/d for a, d in pairs)
+            as_metres = statistics.median(abs(a/scale**2 - d)/d for a, d in pairs)
+            if as_metres < 0.01 <= at_header:
+                raise ValueError(f'Header says {header.get("units")}, but 用地面积 matches the drawing in metres '
+                                 f'(median difference {as_metres:.4%} vs {at_header:.2%}); pass --units m')
+    counts = Counter((r['control_type'], (r['parcel_id'] or '').strip()) for r in records if (r['parcel_id'] or '').strip())
+    for record in records:
+        if counts[(record['control_type'], (record['parcel_id'] or '').strip())] > 1:
+            record['reasons'].append('duplicate 地块编号')
+
+    # Number blocks: their attributes repeat the parcel's; check each sits in the parcel it names.
+    tree = shapely.STRtree([r['geometry'] for r in records])
+    checks, numbered = [], set()
+    for entity in model.query('INSERT'):
+        attributes = {a.dxf.tag: a.dxf.text for a in entity.attribs}
+        if '地块编号' not in attributes or entity.dxf.layer == args.facility_layer:
+            continue
+        insert = entity.dxf.insert
+        point = shapely.Point(insert.x*scale, insert.y*scale)
+        hits = [int(i) for i in tree.query(point, predicate='intersects')]
+        same = [i for i in hits if (records[i]['parcel_id'] or '') == attributes['地块编号'] and records[i]['control_type'] == '地块']
+        same = same or [i for i in hits if (records[i]['parcel_id'] or '') == attributes['地块编号']]
+        if same:
+            numbered.update(same)
+            continue
+        checks.append({'kind': 'number-block-mismatch' if hits else 'number-block-outside', 'parcel_id': attributes['地块编号'],
+                       'found': ','.join(sorted({records[i]['parcel_id'] or '' for i in hits})) or None,
+                       'layer': entity.dxf.layer, 'handle': entity.dxf.handle, 'geometry': point})
+    # Units: closed outlines on the unit layer, named by the unit labels (TEXT / MTEXT) inside them.
+    units = []
+    if args.unit_layer:
+        labels = []
+        for entity in model:
+            if entity.dxf.layer == args.unit_label_layer and entity.dxftype() in ('TEXT', 'MTEXT'):
+                text = clean_text(entity.plain_text(split=False) if entity.dxftype() == 'MTEXT' else entity.plain_text())
+                insert = entity.dxf.insert
+                labels.append((text, shapely.Point(insert.x*scale, insert.y*scale)))
+        kept = []  # (shape, handle) of outlines seen so far
+        for entity in model:
+            if entity.dxf.layer != args.unit_layer or entity.dxftype() not in ('LWPOLYLINE', 'POLYLINE'):
+                continue
+            if not (entity.closed if entity.dxftype() == 'LWPOLYLINE' else entity.is_closed):
+                continue
+            shape = polygon(entity)
+            if shape is None:
+                continue
+            inside = sorted({text for text, point in labels if shape.covers(point)})
+            # The same outline drawn twice, whatever its start vertex or direction.
+            twin = next((handle for other, handle in kept
+                         if shapely.area(shapely.symmetric_difference(shape, other)) <= 1e-6*shape.area), None)
+            reasons = (['no unit label inside'] if not inside else ['several unit labels inside'] if len(inside) > 1 else [])
+            if twin:
+                reasons.append('duplicate outline')
+            units.append({'unit_id': inside[0] if len(inside) == 1 else None, 'labels': ','.join(inside) or None,
+                          'reason': '; '.join(reasons) or None, 'status': 'hold' if reasons else 'pass',
+                          'area_m2': round(float(shape.area), 3), 'duplicate_of': twin, 'layer': entity.dxf.layer,
+                          'handle': entity.dxf.handle, 'geometry': shape})
+            if not twin:
+                kept.append((shape, entity.dxf.handle))
+    named = [u for u in units if u['unit_id'] and not u['duplicate_of']]
+    for i, record in enumerate(records):
+        record['number_block'] = i in numbered
+        if named and record['control_type'] == '地块':
+            point = shapely.point_on_surface(record['geometry'])
+            ids = sorted({u['unit_id'] for u in named if u['geometry'].covers(point)})
+            record['unit_id'] = ids[0] if len(ids) == 1 else None
+            if len(ids) > 1:
+                record['reasons'].append(f'in several units {",".join(ids)}')
+        record['reason'] = '; '.join(record.pop('reasons')) or None
+        record['status'] = 'hold' if record['reason'] else 'pass'
+
+    facilities = []
+    if args.facility_layer:
+        for entity in model.query('INSERT'):
+            if entity.dxf.layer != args.facility_layer:
+                continue
+            values = {**{a.dxf.tag: a.dxf.text for a in entity.attribs}, **xdata_values(entity)}
+            insert = entity.dxf.insert
+            facilities.append({'block': entity.dxf.name, 'layer': entity.dxf.layer, 'handle': entity.dxf.handle, **values,
+                               'geometry': shapely.Point(insert.x*scale, insert.y*scale)})
+    boundary = None
+    if args.boundary_layer:
+        rings = [polygon(e) for e in model if e.dxf.layer == args.boundary_layer and e.dxftype() in ('LWPOLYLINE', 'POLYLINE')
+                 and (e.closed if e.dxftype() == 'LWPOLYLINE' else e.is_closed)]
+        rings = [r for r in rings if r is not None]
+        boundary = shapely.union_all(rings) if rings else None
+
+    extra = sorted({k for r in records for k in r} - set(XIANGYUAN_FIXED) - {'geometry'})
+    parcels = gpd.GeoDataFrame(pd.DataFrame(records, columns=[*XIANGYUAN_FIXED, *extra, 'geometry']), geometry='geometry')
+    facility_fields = sorted({k for f in facilities for k in f} - {'geometry'})
+    frames = {'parcels': (parcels, 'Polygon'),
+              'facilities': (gpd.GeoDataFrame(pd.DataFrame(facilities, columns=[*facility_fields, 'geometry']), geometry='geometry'), 'Point'),
+              'qa_number_blocks': (gpd.GeoDataFrame(pd.DataFrame(checks, columns=['kind', 'parcel_id', 'found', 'layer', 'handle', 'geometry']),
+                                                    geometry='geometry'), 'Point')}
+    if args.unit_layer:
+        frames['units'] = (gpd.GeoDataFrame(pd.DataFrame(units, columns=[*UNIT_FIELDS, 'geometry']), geometry='geometry'), 'Polygon')
+    if boundary is not None:
+        frames['boundary'] = (gpd.GeoDataFrame({'layer': [args.boundary_layer]}, geometry=[boundary]), 'MultiPolygon'
+                              if boundary.geom_type == 'MultiPolygon' else 'Polygon')
+    land = parcels[parcels['control_type'] == '地块']
+    union = shapely.union_all(land.geometry.to_numpy()) if len(land) else None
+    area = {'parcels_m2': round(float(land['area_m2'].sum()), 3), 'parcels_union_m2': round(float(union.area), 3) if union else 0.0,
+            'units_m2': round(float(parcels.loc[parcels['control_type'] == '规划控制单元', 'area_m2'].sum()), 3)}
+    if named:
+        totals = {}
+        for unit in named:
+            totals[unit['unit_id']] = totals.get(unit['unit_id'], 0.0) + unit['area_m2']
+        area['units_by_id_m2'] = {k: round(v, 3) for k, v in sorted(totals.items())}
+    if boundary is not None:
+        area.update(boundary_m2=round(float(boundary.area), 3),
+                    parcels_inside_boundary_m2=round(float(union.intersection(boundary).area), 3) if union else 0.0)
+    diffs = parcels['area_diff'].dropna().abs()
+    summary = {'parcels': int(len(land)), 'control_units': int(len(parcels) - len(land)),
+               'pass': int((parcels['status'] == 'pass').sum()), 'hold': int((parcels['status'] == 'hold').sum()),
+               'reasons': dict(Counter(r for value in parcels['reason'].dropna() for r in value.split('; ')).most_common()),
+               'number_blocks_checked': len(numbered) + len(checks), 'number_block_problems': len(checks),
+               'area_diff_median': round(float(diffs.median()), 8) if len(diffs) else None,
+               'area_diff_max': round(float(diffs.max()), 6) if len(diffs) else None,
+               'skipped_non_polylines': dict(skipped), 'open_polylines_with_code': open_marked}
+    try:
+        from _theme import get_chinese_font
+        font = get_chinese_font()
+    except ImportError:
+        font = 'DejaVu Sans'
+    with bundle(args.output) as stage:
+        target = stage / 'parcels.gpkg'
+        with python_warnings.catch_warnings():
+            python_warnings.filterwarnings('ignore', message="'crs' was not provided")
+            for name, (frame, kind) in frames.items():
+                pyogrio.write_dataframe(frame, target, layer=name, driver='GPKG', geometry_type=kind)
+        layer_counts = {name: len(frame) for name, (frame, _) in frames.items()}
+        back = {name: int(pyogrio.read_info(target, layer=name, force_feature_count=True)['features']) for name in frames}
+        if back != layer_counts:
+            raise ValueError(f'Readback feature counts {back} differ from {layer_counts}; nothing was published')
+        plot_xiangyuan(parcels, boundary if boundary is not None and boundary.geom_type == 'Polygon' else None, stage / 'check.png',
+                       f'{source.name} · {summary["parcels"]} parcels, {summary["control_units"]} control units · {summary["hold"]} hold', font)
+        manifest = {'manifest': 'cad-xiangyuan', 'schema_version': 1,
+                    'source': {'name': source.name, 'bytes': source.stat().st_size, 'sha256': digest(source)},
+                    'header': header, 'encoding': encoding_report, 'audit': audit,
+                    'parameters': {'units': args.units, 'scale_to_metre': scale, 'arc_tolerance_m': args.arc_tolerance,
+                                   'max_area_diff': args.max_area_diff, 'boundary_layer': args.boundary_layer,
+                                   'unit_layer': args.unit_layer, 'unit_label_layer': args.unit_label_layer,
+                                   'facility_layer': args.facility_layer},
+                    'fields': extra, 'layers': layer_counts, 'summary': summary, 'area': area, 'crs': None,
+                    'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
+        write_json(stage / 'manifest.json', manifest)
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad xiangyuan', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
+                                            'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256'],
+                                                      'check.png': digest(stage / 'check.png')},
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['A parcel is a closed polyline with a 用地代码 XDATA application, as 湘源控规 writes them',
+                                                            'Attribute values are the XDATA strings as stored; nothing is recalculated except area_m2',
+                                                            'No CRS is set; coordinates are only scaled to metres']})
+    return manifest
+
+
 def convert(args):
     """Convert a DWG to DXF with an installed converter and read the result back."""
     import shutil
@@ -1597,6 +1890,17 @@ def main():
     tag.add_argument('--texts-layer', default='texts')
     tag.add_argument('--rules', required=True, help='YAML label rules: fields, combined, landuse_major, road')
     tag.add_argument('--output', required=True, help='New directory for parcels.gpkg, check.png, rules.yaml, manifest.json and record.json')
+    xy = commands.add_parser('xiangyuan', help='Parcels of a 湘源控规 drawing from closed polylines and their XDATA')
+    xy.add_argument('source', help='DXF of a 湘源控规 drawing (convert DWG first)')
+    xy.add_argument('--units', required=True, choices=('m', 'mm', 'header'), help='Drawing unit, as for extract')
+    xy.add_argument('--arc-tolerance', type=float, default=0.05, help='Largest chord-to-arc distance in metres (default 0.05)')
+    xy.add_argument('--max-area-diff', type=float, help='Hold parcels whose area differs from 用地面积 by more than this ratio, e.g. 0.005')
+    xy.add_argument('--boundary-layer', default='----规划边界', help='Layer of the planning boundary (default ----规划边界; empty to skip)')
+    xy.add_argument('--unit-layer', default='DY范围', help='Layer of unit outlines (default DY范围; empty to skip)')
+    xy.add_argument('--unit-label-layer', default='DY编号', help='Layer of the unit labels inside them (default DY编号)')
+    xy.add_argument('--facility-layer', default='配套设施', help='Layer of facility blocks (default 配套设施; empty to skip)')
+    xy.add_argument('--encoding', help='Text encoding overriding the drawing')
+    xy.add_argument('--output', required=True, help='New directory for parcels.gpkg, check.png, manifest.json and record.json')
     dwg = commands.add_parser('convert', help='Convert DWG to DXF with an installed ODA File Converter or LibreDWG')
     dwg.add_argument('source', help='DWG file')
     dwg.add_argument('--tool', choices=('auto', 'oda', 'libredwg'), default='auto', help='auto prefers ODA, then LibreDWG')
@@ -1614,6 +1918,11 @@ def main():
     assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
     args = parser.parse_args()
     try:
+        if args.command == 'xiangyuan':
+            manifest = xiangyuan(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'layers': manifest['layers'],
+                              'summary': manifest['summary'], 'area': manifest['area']}, ensure_ascii=False))
+            return
         if args.command == 'convert':
             manifest = convert(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'tool': manifest['converter']['tool'],
