@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 新子命令 `cad.py label`：按 YAML 规则（单字段、命名分组拆多字段、块属性标签、用地大类最长前缀、道路面规则）把 CAD 文字挂到 polygonize 的面上，输出 `parcels.gpkg`（`parcels`、`label_conflicts`、`unparsed_text`）、`check.png`、规则副本与 `manifest.json`（`cad-label` v1）。多值、面外、公共边上、重复编号、多箭头和未连接引线都列为冲突，不替人选择；不是道路又无用途的面标 hold。
+- `cad.py extract` 读取引线：被 LEADER 标注的文字放到箭头处，MULTILEADER 的文字写入 `texts`，箭头写入新图层 `leaders`；`texts` 新增 `arrows`、`leader_handle`。`cad.py polygonize` 的面新增 `source_layers`。
 - 新子命令 `cad.py polygonize`：把 `cad.py extract` 的线按显式容差围成候选面。`--snap` 内的端点合并、孤立端点移到线上（插入共享顶点）；打断后用 polygonize 围面。`--max-gap` 内的缺口写入 `qa_gaps`，只有加 `--close-gaps` 才补线并标记；悬挂线、切割边写入 `qa_dangles`；小于 `--min-area` 的面与无效面标 hold、不删除；`--boundary` 按规划范围线裁剪并记录面积比；面另经 `topo.py` 检查。输出 `faces.gpkg`、`check.png`、`manifest.json`（`cad-polygonize` v1）。
 - `convert.py` 目录批处理新增识别 `.kmz`、`.gpx`、`.gml`、`.tab`、`.mif`、`.dxf`、`.fgb`、`.geojsonl`（驱动已在 Pyogrio 自带的 GDAL 中，不新增依赖）。行为变化：多图层输入未给 `--layer` 时报错并列出图层，不再静默读取第一层；多个输入映射到同名输出时整批在写出前拒绝。删除未被调用的 `infer_driver`。
 - 新脚本 `cad.py inspect`：清点 DXF 的图层、实体类型、文字样例、图纸单位、离群实体与图纸空间，按坐标量级与 EPSG 适用范围列出候选 CRS（带带号的中国高斯-克吕格 3/6 度带与经纬度；四种基准并列；`--near` 剔除过远的候选）。无带号坐标与城市独立坐标分不开，一律 `hold`、不列 EPSG；不赋 CRS。`--encoding` 处理缺代码页的中文图纸。输出 `cad.json`、`check.png`、`record.json`；DWG 拒绝并提示先转 DXF。说明见 `references/cad-intake.md`。

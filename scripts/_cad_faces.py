@@ -162,8 +162,8 @@ def sources(geometries, lines, labels):
     return result
 
 
-def boundary_handles(face, edges, edge_labels, edge_tree):
-    """Labels of the edges that make up a face's boundary."""
+def boundary_labels(face, edges, edge_labels, edge_tree):
+    """Labels (handles or layers) of the edges that make up a face's boundary."""
     ring = shapely.boundary(face)
     labels = set()
     for k in edge_tree.query(ring, predicate='intersects'):
