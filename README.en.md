@@ -37,7 +37,7 @@ I will keep adding tools as I need them, including some research-oriented featur
 
 ## Tools
 
-1. Vector tools cover clipping, dissolving, merging, spatial joins and buffers, along with field and topology checks and repairs, area calculations and urban metrics. Everyday results can be saved as versioned bundles.
+1. Vector tools cover clipping, dissolving, merging, spatial joins and buffers, along with field and topology checks and repairs, area calculations and urban metrics. Everyday results can be saved as versioned bundles. CAD (DXF) drawings can be inventoried first: layers, units, stray title blocks and candidate CRS from coordinate magnitude.
 2. Raster and terrain tools support zonal statistics, reprojection and COG output, with windowed processing for large rasters. DEM tools calculate slope, aspect, contours and profiles; hydrology, viewsheds and terrain cost can use the optional GRASS backend.
 3. Network tools handle directed road networks, OD and facility coverage scenarios, including demand-weighted coverage. They do not report population coverage without demand weights.
 4. Semantic raster vectorization uses a model to read an image and draw points, lines and polygons. Scripts handle coordinate conversion, version records, geometry checks and export. I mainly use historical maps for this research and currently recommend GPT-6 Astra and GPT-6.1; the workflow and tests are described below.
