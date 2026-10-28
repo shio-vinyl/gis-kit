@@ -13,24 +13,27 @@ import sys
 from pathlib import Path
 
 import geopandas as gpd
+import pyogrio
 from pyproj import CRS
 
 from _budget import check_vector
 from _safe_io import AtomicVectorOutput, stream_vector
 
-SUPPORTED_EXTENSIONS = {".gpkg", ".shp", ".geojson", ".json", ".kml", ".gdb"}
+# Inputs picked up by directory batch mode; single-file mode reads anything GDAL can open.
+# MapInfo .tab/.mif sidecars (.dat/.map/.id/.mid) and the GML .xsd are not listed on purpose.
+SUPPORTED_EXTENSIONS = {
+    ".gpkg", ".shp", ".geojson", ".json", ".geojsonl", ".fgb", ".gdb",
+    ".kml", ".kmz", ".gpx", ".gml", ".tab", ".mif", ".dxf",
+}
 
 
-def infer_driver(path: Path) -> str | None:
-    mapping = {
-        ".gpkg": "GPKG",
-        ".shp": "ESRI Shapefile",
-        ".geojson": "GeoJSON",
-        ".json": "GeoJSON",
-        ".kml": "KML",
-        ".gdb": "OpenFileGDB",
-    }
-    return mapping.get(path.suffix.lower())
+def require_layer(path: Path, layer: str | None) -> None:
+    """Refuse to pick the first layer of a multi-layer source (GPX always has five) without --layer."""
+    if layer:
+        return
+    names = [name for name, _ in pyogrio.list_layers(path)]
+    if len(names) > 1:
+        raise ValueError(f"{path} has {len(names)} layers ({', '.join(names)}); pass --layer to choose one")
 
 
 def read_file(path: Path, layer: str | None, encoding: str | None) -> gpd.GeoDataFrame:
@@ -79,6 +82,7 @@ def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, ove
 
 
 def convert_single(input_path: Path, output_path: Path, layer: str | None, output_layer: str | None, crs: str | None, encoding: str | None, overwrite=False) -> None:
+    require_layer(input_path, layer)
     if stream_convert(input_path, output_path, layer, output_layer or layer, crs, encoding, overwrite):
         return
     gdf = read_file(input_path, layer, encoding)
@@ -126,6 +130,15 @@ def main() -> None:
         if not files:
             files = [f for f in input_path.iterdir() if f.is_dir() and f.suffix.lower() == ".gdb"]
         print(f"Batch mode: {len(files)} files found in {input_path}")
+        # roads.tab and roads.mif would both become roads<ext>; refuse before writing anything.
+        targets: dict[str, list[str]] = {}
+        for f in files:
+            targets.setdefault(f"{f.stem}{out_ext}".lower(), []).append(f.name)
+        clashes = [names for names in targets.values() if len(names) > 1]
+        if clashes:
+            print("ERROR: inputs would write the same output: "
+                  + "; ".join(", ".join(sorted(names)) for names in clashes), file=sys.stderr)
+            sys.exit(1)
         failures = 0
         for f in sorted(files):
             out = output_dir / f"{f.stem}{out_ext}"
