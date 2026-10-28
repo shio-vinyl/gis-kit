@@ -1,4 +1,29 @@
-# CAD 图纸：清点、提取、围面、挂接与赋 CRS
+# CAD 图纸：转换、清点、提取、围面、挂接与赋 CRS
+
+## DWG 转 DXF
+
+`cad.py convert` 调用本机已装的转换器，把 DWG 转成 DXF，再把结果读回来核对。gis-kit 不解析 DWG，也不负责安装转换器。
+
+```bash
+python cad.py convert 法图.dwg --output /work/cad/fatu-dxf            # 自动选择转换器：有 ODA 用 ODA，否则用 LibreDWG
+python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/cad/fatu-dxf
+```
+
+- **转换器**：
+  - ODA File Converter：免费，安装时要接受 ODA 的许可协议；程序会在 PATH 和常见安装位置查找。
+  - LibreDWG 的 `dwg2dxf`：GPL 许可，`brew install libredwg` 即可安装。2026-10 用 0.14 版实测，能转 AutoCAD 2018（AC1032）的 DWG。
+  - 两种都没装时报错，提示安装或在 AutoCAD / 中望 CAD 里另存为 DXF。
+- **原件不动**：转换器读的是临时副本，原始 DWG 只读。`--version` 指定输出的 DXF 版本（r2000–r2018，默认 r2018），`--timeout` 指定超时秒数。
+- **回读核对**：
+  - 从 DWG 文件头读出版本。
+  - 用 ezdxf 读回 DXF，统计模型空间实体数、有实体的图层数、图层表大小、图纸空间实体数和范围。
+  - 转换器的输出、警告和用时都写进清单。
+- **LibreDWG 输出的已知问题**：
+  - 有些 XRECORD 的扩展数据里有组码小于 1000 的标签，ezdxf 的恢复模式会拒绝读取。读取时会在临时副本里去掉这些标签，记下去掉的条数；实体不受影响。
+  - 输出的 DXF 文件头里，`$DWGCODEPAGE` 可能写成 ANSI_936，见下文"文字编码"。
+- **输出**：新目录，含 `<源文件名>.dxf`、`manifest.json`（`manifest: cad-convert` v1：源文件 SHA-256、DWG 版本、转换器与命令、退出码、用时、输出 SHA-256、回读结果、警告）和 `record.json`。
+
+## 清点
 
 `cad.py inspect` 在把 DXF 当 GIS 数据用之前先看清楚它：有哪些图层、各层是什么实体、文字写了什么、图纸单位、范围里有没有离群的图框，以及坐标量级对得上哪些投影坐标系。结果发布到一个新目录。这里只清点，不写几何，也不给数据赋 CRS。
 
@@ -9,11 +34,19 @@ python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 
 python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad/fatu   # 与已知 CRS 的参考图层比对
 ```
 
-- **输入**：只读 ASCII 或二进制 DXF。DWG 直接拒绝，先在 AutoCAD / 中望 CAD 里另存为 DXF，或用 ODA File Converter 转换。读模型空间实体，图纸空间（布局）实体单独计数，不参与范围和 CRS 判断。
+- **输入**：ASCII 或二进制 DXF。DWG 直接拒绝，先用 `cad.py convert` 转换，或在 AutoCAD / 中望 CAD 里另存为 DXF。读模型空间实体，图纸空间（布局）实体单独计数，不参与范围和 CRS 判断。
 - **文件头**：自行解析 `$ACADVER`（换算成 R12、R2000 等版本）、`$INSUNITS`（图纸单位）、`$DWGCODEPAGE`（代码页）和 `$EXTMIN/$EXTMAX`；二进制 DXF 不解析文件头。文件头里的范围常常过时，只照原样记下，不用于判断。
-- **文字编码**：GDAL 和 ezdxf 都按 `$DWGCODEPAGE` 转码，`ANSI_936` 的中文能正确读出。缺代码页或写成 `ANSI_1252` 时，GBK 中文会被当成 Latin-1 读成乱码；检测到这种情况会给出警告，用 `--encoding CP936` 重跑。
+- **文字编码**（结果写在 `cad.json` 的 `encoding` 里）：
+  - 给了 `--encoding` 时，按所给的编码读（`source: option`）。
+  - R2007（AC1021）及以上版本的 DXF 一律是 UTF-8，GDAL 也按 UTF-8 读，不看 `$DWGCODEPAGE`（`source: dxf-version`）。不这样做的话，AutoCAD 或 LibreDWG 写着 ANSI_936 的 R2018 图纸会读成"鍥炬"一类的乱码。
+  - 更早的版本按 `$DWGCODEPAGE` 读（`source: header`）。如果图层名或文字看起来像 GBK 被当成 Latin-1 读了（缺代码页、或者写成 ANSI_1252），就依次用 CP936 和 GB18030 重读，取无法解码的字符串最少的那个（`source: auto`，`tried` 记下各自的条数），并给出警告。
+  - 用 ezdxf 时，`undecodable_strings` 记录最终仍有字节解不出来的图层名和文字条数。
+- **GDAL 读取**：
+  - 取消 GDAL 默认的每个图块 10000 个要素的上限，以免大的图块被截断。
+  - GDAL 把多面网格（POLYFACE）读成 PolyhedralSurface，shapely 读不了这种几何，因此这类几何不进入范围计算，只计数并给出警告。
+  - GDAL 转码时报告的问题也记进警告。
 - **两个读取器**：几何、范围、检查图和 CRS 判断始终来自 GDAL（图块引用展开成几何）。图层清点在装了可选依赖 ezdxf 时由 ezdxf 完成，按 CAD 的口径计数：一个图块引用算一个实体。没装 ezdxf 时清点退回 GDAL，`reader.missing` 列出缺少的能力。ezdxf 读不了而 GDAL 能读时，同样退回 GDAL 并给出警告；ezdxf 修复过文件结构时，警告里记下错误和修复的条数。
-- **清点（ezdxf）**：按图层统计 DXF 实体类型（`LINE`、`ARC`、`TEXT`、`MTEXT`、`INSERT`、`HATCH`、`DIMENSION` 等），多段线分成 `LWPOLYLINE closed` / `open`（`POLYLINE` 同样）。图块引用记下块名和次数，块属性记下标签和至多 5 个取值。TEXT / MTEXT 记录数量和至多 5 条样例，每条同时给原文和清洗后的文字：清洗去掉 MTEXT 格式码、把换行并成空格、全角字母数字转半角。另外记录图层的关闭 / 冻结状态、图层表里有但模型空间没有实体的图层（`unused_layers`，不含 `0` 和 `Defpoints`），以及各布局的实体数和视口数。
+- **清点（ezdxf）**：按图层统计 DXF 实体类型（`LINE`、`ARC`、`TEXT`、`MTEXT`、`INSERT`、`HATCH`、`DIMENSION` 等），多段线分成 `LWPOLYLINE closed` / `open`（`POLYLINE` 同样，多面网格和多边形网格另记为 `POLYLINE polyface` / `mesh`）。图块引用记下块名和次数，块属性记下标签和至多 5 个取值。TEXT / MTEXT 记录数量和至多 5 条样例，每条同时给原文和清洗后的文字：清洗去掉 MTEXT 格式码、把换行并成空格、全角字母数字转半角。另外记录图层的关闭 / 冻结状态、图层表里有但模型空间没有实体的图层（`unused_layers`，不含 `0` 和 `Defpoints`），以及各布局的实体数和视口数。
 - **清点（GDAL 退回）**：按图层统计实体数、几何类型；R2000 及以上版本还统计 SubClasses 实体类型（如 `AcDbPolyline`、`AcDbHatch`，R12 没有这一信息）。文字样例只有原文。图块已展开，不报告块名；块属性、闭合状态、图层状态和布局都没有。
 - **离群实体**：实体中心距中位中心超过中位距离 20 倍的算离群，常见于放在原点的图框或误画的零星对象。按图层列出数量，检查图用红叉标出；范围分别记 `full`（全部）与 `core`（去掉离群），CRS 判断用 `core` 的中位中心。
 
