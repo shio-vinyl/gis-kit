@@ -8,7 +8,12 @@
 #     "pyyaml>=6.0",
 # ]
 # ///
-"""Static map plotting tool with template-based styling."""
+"""Fallback static maps (location, land use) from YAML templates, for use without gis-composer.
+
+Finished maps go through gis-composer; this tool stays for check plots and for installs without it.
+Its templates are frozen: no new styles or visual options (see references/composer-display.md).
+Without --style each category uses its default: location/default, landuse/standard.
+"""
 
 from __future__ import annotations
 
@@ -57,6 +62,7 @@ except ImportError:
 
 
 _LAYER_ORDER = ["province", "city", "district", "highlight"]
+_DEFAULT_STYLE = {"location": "default", "landuse": "standard"}
 
 from _budget import check_vector
 
@@ -357,11 +363,12 @@ def plot_landuse(inputs: list[tuple[str, str | None]], template: dict, args):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="plot", description="Static map plotting with templates")
+    p = argparse.ArgumentParser(prog="plot", description="Fallback static maps from frozen templates; finished maps use gis-composer")
     p.add_argument("--inputs", nargs="+", required=True, help="input files (file.gpkg or file.gpkg:layer)")
     p.add_argument("--output", "-o", required=True, help="output image file (PNG/PDF)")
     p.add_argument("--category", default="location", choices=["location", "landuse"], help="map category")
-    p.add_argument("--style", default="default", help="style name within category")
+    p.add_argument("--style", default=None,
+                   help="frozen template within category (default: location/default, landuse/standard)")
     p.add_argument("--title", default=None, help="map title")
     p.add_argument("--label-field", default=None, help="field for labels")
     p.add_argument("--color-field", default=None, help="field for thematic coloring (landuse)")
@@ -376,7 +383,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    template = load_template(args.category, args.style)
+    template = load_template(args.category, args.style or _DEFAULT_STYLE[args.category])
     inputs = [_parse_input(spec) for spec in args.inputs]
 
     if args.category == "location":

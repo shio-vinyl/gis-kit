@@ -4,6 +4,11 @@
 #   "pyyaml>=6.0",
 # ]
 # ///
+"""Fonts, templates and palettes for gis-kit's matplotlib output (check plots, charts, fallback maps).
+
+Map styling belongs to gis-composer themes; the map templates read here are frozen
+(see references/composer-display.md). Palettes serve plot-chart.py.
+"""
 
 from __future__ import annotations
 
