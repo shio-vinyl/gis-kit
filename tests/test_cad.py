@@ -1276,3 +1276,55 @@ def test_compare_fills_refusals(tmp_path):
     located = tmp_path/'located.gpkg'
     gpd.read_file(faces).set_crs('EPSG:4547').to_file(located, layer='faces')
     assert 'must share a CRS' in compare(located, fills, tmp_path/'c', success=False)
+
+
+def excluded_linework(tmp_path):
+    """Two parcels inside a title-block frame, a legend swatch, a parcel-layer line in the legend box, a line crossing
+    the box edge, a line from an exploded title block and one under an exclusion polygon."""
+    lines = [('地块', 'A', rect(0, 0, 50, 40), None), ('地块', 'B', rect(50, 0, 30, 40), None),
+             ('图框', 'F', rect(-10, -10, 300, 100), None),
+             ('图例', 'S1', rect(250, 60, 10, 5), None), ('地块', 'S2', rect(265, 60, 10, 5), None),
+             ('地块', 'X', [(270, 70), (320, 70)], None),
+             ('地块', None, rect(100, 0, 20, 20), 'tukuang/inner'), ('地块', 'Z', rect(150, 0, 20, 20), None)]
+    frame = gpd.GeoDataFrame({'layer': [l[0] for l in lines], 'handle': [l[1] for l in lines], 'block': [l[3] for l in lines]},
+                             geometry=[LineString(l[2]) for l in lines])
+    with pytest.warns(UserWarning):
+        frame.to_file(tmp_path/'raw.gpkg', layer='lines')
+    rules = tmp_path/'exclude.yaml'
+    rules.write_text('layers: [图框*, 指北针]\nblocks: [tukuang]\nboxes:\n  - [240, 50, 280, 80]\n', encoding='utf-8')
+    with pytest.warns(UserWarning):
+        gpd.GeoDataFrame({'name': ['表格']}, geometry=[box(140, -5, 180, 30)]).to_file(tmp_path/'areas.gpkg', layer='areas')
+    return tmp_path/'raw.gpkg', rules, tmp_path/'areas.gpkg'
+
+
+def test_polygonize_excludes_lines_by_layer_block_box_and_area(tmp_path):
+    source, rules, areas = excluded_linework(tmp_path)
+    plain = polygonize(source, tmp_path/'plain')
+    assert plain['faces']['pass'] + plain['faces']['hold'] > 2 and plain['exclusion']['excluded'] == 0
+    manifest = polygonize(source, tmp_path/'out', '--exclude', rules, '--exclude-area', f'{areas}:areas')
+    assert sorted(faces_of(tmp_path/'out')['area_m2']) == [1200, 2000]
+    exclusion = manifest['exclusion']
+    assert exclusion['excluded'] == 5 and exclusion['by_rule'] == {'box:1': 2, 'layer:图框*': 1, 'block:tukuang': 1, 'area:0': 1}
+    assert exclusion['by_layer'] == {'地块': 3, '图框': 1, '图例': 1}
+    assert exclusion['crossing_kept'] == 1 and exclusion['unmatched'] == ['layer:指北针']
+    assert exclusion['rules']['layers'] == ['图框*', '指北针'] and exclusion['areas']['features'] == 1
+    assert any('matched no line: layer:指北针' in n for n in manifest['notes'])
+    assert any('1 lines cross an exclusion area' in n for n in manifest['notes'])
+    assert manifest['lines']['used'] == 3 and manifest['layers']['excluded'] == 5
+    excluded = faces_of(tmp_path/'out', 'excluded').set_index('rule')
+    assert excluded.loc['block:tukuang', 'block'] == 'tukuang/inner' and excluded.loc['area:0', 'handle'] == 'Z'
+
+
+def test_polygonize_exclusion_refusals(tmp_path):
+    source, rules, areas = excluded_linework(tmp_path)
+    assert 'cannot be excluded' in polygonize(source, tmp_path/'a', '--boundary', '图框', '--exclude', rules, success=False)
+    bad = tmp_path/'bad.yaml'
+    bad.write_text('layer: [图框]\n', encoding='utf-8')
+    assert 'only layers, blocks, boxes' in polygonize(source, tmp_path/'b', '--exclude', bad, success=False)
+    bad.write_text('boxes:\n  - [10, 0, 0, 10]\n', encoding='utf-8')
+    assert 'min < max' in polygonize(source, tmp_path/'c', '--exclude', bad, success=False)
+    located = tmp_path/'located.gpkg'
+    gpd.read_file(areas).set_crs('EPSG:4547').to_file(located)
+    assert 'must share the lines' in polygonize(source, tmp_path/'d', '--exclude-area', located, success=False)
+    bad.write_text('layers: ["*"]\n', encoding='utf-8')
+    assert 'Every line was excluded' in polygonize(source, tmp_path/'e', '--exclude', bad, success=False)
