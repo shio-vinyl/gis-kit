@@ -321,8 +321,17 @@ python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --i
   - 只在按 `$INSUNITS` 换算后才对得上的坐标系（例如毫米图纸），加了 `--outside-candidates` 也拒绝：坐标要先换算成米，这一步还不能代劳。
 - **输入**：矢量文件。默认给其中所有图层一起赋 CRS，图层名不变，空图层也照样赋上，例如 `cad.py xiangyuan` 输出的 `parcels.gpkg` 一次就能处理完；只想处理一个图层时用 `--layer`。每个图层的范围都要落在体检记录的范围内；已经有 CRS 的图层直接拒绝，要换坐标系应当做重投影。
 - **CRS**：必须是以米为单位的投影坐标系。
+- **要素核对（证据）**：体检只比外包框，整体平移几十米也能通过，所以下面两种情况赋值前必须核对：
+  - CRS 不带带号（东偏移不到 1,000,000，例如 EPSG:4547 的 500,000）——深圳独立坐标这类城市坐标最容易和它混淆；
+  - 用了 `--outside-candidates`。
+  
+  带带号的坐标（例如 EPSG:4527 的 39,500,000）可以不核对；给了核对参数就照样核对。阈值必须自己给，没有默认值。两种证据任选其一，都给了就两个都要通过；不通过时整个结果不发布。
+  - **边界重合**：`--check-reference 文件[:图层] --tolerance 米 --min-share 比例`。取源文件线、面图层的全部顶点（`--check-layer` 可以指定图层），量到参考图层边界的最近距离，落在 `--tolerance` 以内的比例要达到 `--min-share`。参考图层必须有 CRS，只读图纸周围的部分，CRS 不同时先换算到赋值的 CRS。参考图层要和图纸共用边界，例如旧版控规、同一片区的规划地块；宗地、建筑等边界本来就不同的图层重合比例低，不适合拿来核对。和平移方向平行的直线检测不出这个平移，参考里要有不同方向的边。
+  - **控制点**：`--check-points 点.csv --max-check-error 米`。CSV 格式和 `vector-georef.py` 相同（`id`、`src_x`、`src_y`、`dst_x`、`dst_y`，`role` 可有可无）：`src` 是图上坐标，`dst` 是同一点在所赋 CRS 下的已知坐标。坐标不做任何变换，逐点量两者的距离，最大误差不能超过阈值。
+  - 清单的 `evidence` 记下是否必须核对和原因，以及每种证据的输入、哈希、阈值和实测值：边界重合给出重合比例、距离中位数、第 10 百分位、分图层比例；控制点给出逐点误差、最大误差和 RMSE。`zone_prefix` 记下 CRS 是否带带号。
+  - 妈湾法图（EPSG:4547，不带带号）：不核对时拒绝执行。对照 `大前海详细规划`，`--tolerance 0.05 --min-share 0.3` 通过：68.6% 的顶点在 5 cm 以内，地块层 79.6%，距离中位数 0.4 mm。对照 `国有已供用地`，同样的阈值只有 10.2%，被拒绝。
 - **回读核对**：写出 `<输入名>.gpkg` 后逐层重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一层有一项不一致，整个结果都不发布。输入文件不会被改动。
-- **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、SHA-256 与图层列表，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`，`checks`（逐层的要素数、范围和回读核对结果），输出的 SHA-256）和 `record.json`。
+- **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、SHA-256 与图层列表，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`、`zone_prefix`、`evidence`，`checks`（逐层的要素数、范围和回读核对结果），输出的 SHA-256）和 `record.json`。
 
 ## 叠图质检
 

@@ -34,6 +34,8 @@ listed, never resolved by choice; road faces come only from the road rule.
 `cad.py assign-crs` labels a CRS-less layer converted from an inspected drawing with a CRS someone has
 confirmed: --confirmed-by and --basis are required, the CRS must be an inspection candidate as drawn
 (or --outside-candidates), and geometry WKB and attributes are compared on readback before publishing.
+A grid without the zone prefix, or a CRS outside the candidates, also needs a feature check against declared
+thresholds: vertices on a reference layer's edges (--check-reference) or known points (--check-points).
 
 `cad.py overlay` puts parcels (in a projected CRS) over reference layers in one check plot: hold parcels outlined,
 QA layers of the same file (qa_*, label_conflicts) marked. References are read within the parcels' extent plus a
@@ -2480,6 +2482,92 @@ def load_inspection(path):
     return path, report
 
 
+PREFIX_EASTING = 1_000_000  # a false easting this large carries the zone number, as in 39500000
+
+
+def false_easting(crs):
+    operation = crs.coordinate_operation
+    return next((float(p.value) for p in operation.params if p.name == 'False easting'), None) if operation else None
+
+
+def check_points(path, limit):
+    """Distances between each point's drawing coordinates (src_x, src_y) and its known coordinates in the assigned
+    CRS (dst_x, dst_y), with nothing transformed: the vector-georef control-point CSV, every row used as a check."""
+    import csv
+    with open(path, encoding='utf-8-sig', newline='') as stream:
+        rows = list(csv.DictReader(stream))
+    missing = {'id', 'src_x', 'src_y', 'dst_x', 'dst_y'} - set(rows[0] if rows else [])
+    if not rows or missing:
+        raise ValueError(f'--check-points {path} needs rows with id, src_x, src_y, dst_x, dst_y ({", ".join(sorted(missing)) or "no rows"})')
+    try:
+        errors = [{'id': r['id'], 'error_m': round(math.hypot(float(r['dst_x'])-float(r['src_x']), float(r['dst_y'])-float(r['src_y'])), 4)}
+                  for r in rows]
+    except ValueError as error:
+        raise ValueError(f'--check-points {path}: coordinates must be numbers ({error})') from error
+    worst = max(e['error_m'] for e in errors)
+    return {'path': str(Path(path).absolute()), 'sha256': digest(path), 'points': len(errors), 'max_check_error_m': limit,
+            'max_error_m': worst, 'rmse_m': round(math.sqrt(sum(e['error_m']**2 for e in errors)/len(errors)), 4),
+            'errors': errors, 'passed': worst <= limit}
+
+
+def check_reference(frames, crs, spec, tolerance, min_share, layers):
+    """Share of the drawing's vertices (line and polygon layers) within tolerance of a reference layer's edges, read
+    around the drawing and reprojected to the assigned CRS when it has another. A right CRS puts shared boundaries
+    on top of each other; a shift of a few metres, which an extent comparison cannot see, does not."""
+    import geopandas as gpd
+    import numpy as np
+    import pyogrio
+    import shapely
+    from pyproj import CRS, Transformer
+    path, layer = spec.rsplit(':', 1) if ':' in spec and not Path(spec).exists() else (spec, None)
+    info = pyogrio.read_info(path, layer=layer)
+    if not info.get('crs'):
+        raise ValueError(f'--check-reference {spec} has no CRS')
+    ref_crs = CRS.from_user_input(info['crs'])
+    names = layers or [n for n, f in frames.items() if hasattr(f, 'geometry') and
+                       f.geometry.geom_type.isin(['LineString', 'MultiLineString', 'Polygon', 'MultiPolygon']).any()]
+    if not names:
+        raise ValueError('The source has no line or polygon layer to check against --check-reference')
+    vertices, per_layer = [], {}
+    for name in names:
+        if name not in frames:
+            raise ValueError(f'--check-layer {name} is not a layer of the source ({", ".join(frames)})')
+        coords = np.unique(np.round(shapely.get_coordinates(frames[name].geometry.dropna().to_numpy()), 3), axis=0)
+        per_layer[name] = coords
+        vertices.append(coords)
+    vertices = np.unique(np.concatenate(vertices), axis=0)
+    if not len(vertices):
+        raise ValueError('The checked layers have no vertices')
+    bounds = [*vertices.min(axis=0), *vertices.max(axis=0)]
+    pad = max(tolerance*10, 1.0)
+    box = (bounds[0]-pad, bounds[1]-pad, bounds[2]+pad, bounds[3]+pad)
+    if not ref_crs.equals(crs):
+        box = Transformer.from_crs(crs, ref_crs, always_xy=True).transform_bounds(*box, densify_pts=21)
+    check_vector(path, layer)
+    reference = gpd.read_file(path, layer=layer, bbox=box, engine='pyogrio')
+    reference = reference[reference.geometry.notna() & reference.geom_type.str.contains('LineString|Polygon')]
+    if not ref_crs.equals(crs):
+        reference = reference.to_crs(crs)
+    edges = shapely.force_2d(reference.geometry.boundary.where(reference.geom_type.str.contains('Polygon'), reference.geometry).to_numpy())
+    edges = edges[~shapely.is_empty(edges)]
+    if not len(edges):
+        raise ValueError(f'--check-reference {spec} has no lines or polygons around the drawing')
+    tree = shapely.STRtree(edges)
+
+    def distances(coords):
+        _, found = tree.query_nearest(shapely.points(coords), return_distance=True, all_matches=False)
+        return found
+    near = distances(vertices)
+    share = float(np.mean(near <= tolerance))
+    return {'path': str(Path(path).absolute()), 'layer': layer, 'sha256': digest(path) if Path(path).is_file() else None,
+            'crs': ref_crs.to_string(), 'reprojected': not ref_crs.equals(crs), 'features_read': int(len(reference)),
+            'layers_checked': names, 'vertices': int(len(vertices)), 'tolerance_m': tolerance, 'min_share': min_share,
+            'share_within_tolerance': round(share, 4), 'median_distance_m': round(float(np.median(near)), 4),
+            'p10_distance_m': round(float(np.percentile(near, 10)), 4),
+            'share_by_layer': {n: round(float(np.mean(distances(c) <= tolerance)), 4) for n, c in per_layer.items() if len(c)},
+            'passed': share >= min_share}
+
+
 def assign_crs(args):
     """Label CRS-less layers converted from an inspected drawing with a confirmed CRS; coordinates are not touched.
     Every layer of the source is labelled unless --layer names one; layer names are kept."""
@@ -2528,11 +2616,38 @@ def assign_crs(args):
     if outside and not args.outside_candidates:
         raise ValueError(f'{code or crs.name} is not among the inspection candidates as drawn '
                          f'({", ".join(sorted(as_drawn)) or "none"}); pass --outside-candidates to assign it anyway')
+    if args.check_reference and (args.tolerance is None or args.min_share is None):
+        raise ValueError('--check-reference needs --tolerance (metres) and --min-share (0-1); there are no defaults')
+    if args.check_reference and not (args.tolerance > 0 and 0 < args.min_share <= 1):
+        raise ValueError('--tolerance must be positive and --min-share in (0, 1]')
+    if args.check_points and (args.max_check_error is None or args.max_check_error <= 0):
+        raise ValueError('--check-points needs a positive --max-check-error (metres); there is no default')
+    easting = false_easting(crs)
+    prefixed = easting is not None and easting >= PREFIX_EASTING
+    needed = not prefixed or outside
+    if needed and not (args.check_reference or args.check_points):
+        why = ('it is outside the inspection candidates' if outside else
+               f'it has no zone prefix (false easting {easting:g}), the grids a city or project grid is most easily mistaken for'
+               if easting is not None else 'its false easting is unknown')
+        raise ValueError(f'Assigning {code or crs.name} needs a feature check, since {why}: --check-reference with --tolerance '
+                         'and --min-share (shared boundaries), or --check-points with --max-check-error (known points)')
 
     frames = {}
     for name in names:
         check_vector(source, name)
         frames[name] = pyogrio.read_dataframe(source, layer=name)
+    evidence = {'required': needed, 'reason': None if not needed else 'outside candidates' if outside else 'no zone prefix'}
+    if args.check_reference:
+        evidence['reference'] = check_reference(frames, crs, args.check_reference, args.tolerance, args.min_share,
+                                                [n.strip() for n in args.check_layer.split(',')] if args.check_layer else None)
+    if args.check_points:
+        evidence['points'] = check_points(args.check_points, args.max_check_error)
+    failed = [kind for kind in ('reference', 'points') if kind in evidence and not evidence[kind]['passed']]
+    if failed:
+        detail = {'reference': lambda e: f'{e["share_within_tolerance"]:.1%} of {e["vertices"]} vertices within {e["tolerance_m"]} m '
+                                         f'of the reference edges, below --min-share {e["min_share"]:.1%}',
+                  'points': lambda e: f'largest check-point error {e["max_error_m"]} m exceeds --max-check-error {e["max_check_error_m"]}'}
+        raise ValueError('The feature check failed, nothing was published: ' + '; '.join(detail[k](evidence[k]) for k in failed))
     stat = source.stat()
     with bundle(args.output) as stage:
         target = stage / f'{source.stem}.gpkg'
@@ -2565,7 +2680,8 @@ def assign_crs(args):
                     'inspection': {'path': str(inspection_path.absolute()), 'sha256': digest(inspection_path),
                                    'drawing': inspection['source']['name'], 'drawing_sha256': inspection['source']['sha256'],
                                    'crs_status': inspection['crs']['status'], 'candidates_as_drawn': sorted(as_drawn)},
-                    'outside_candidates': outside, 'checks': checks, 'crs_readback': code or crs.name,
+                    'outside_candidates': outside, 'zone_prefix': prefixed, 'evidence': evidence,
+                    'checks': checks, 'crs_readback': code or crs.name,
                     'output': {'path': target.name, 'sha256': digest(target)}}
         write_json(stage / 'manifest.json', manifest)
         write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad assign-crs', 'version': VERSION,
@@ -2573,7 +2689,9 @@ def assign_crs(args):
                                             'files': {'manifest.json': digest(stage / 'manifest.json'), target.name: manifest['output']['sha256']},
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                             'assumptions': ['Only the CRS label changes; geometry WKB and attributes are compared on readback',
-                                                            'The confirmation and its basis are the user\'s; the tool does not verify them']})
+                                                            'The confirmation and its basis are the user\'s; the tool does not verify them',
+                                                            'A feature check (evidence) is measured against thresholds the user declared; '
+                                                            'it is required for grids without a zone prefix and outside candidates']})
     return manifest
 
 
@@ -2889,6 +3007,12 @@ def main():
     assign.add_argument('--confirmed-by', required=True, help='Who confirmed the CRS')
     assign.add_argument('--basis', required=True, help='What the confirmation rests on, e.g. provider statement, control-point check')
     assign.add_argument('--outside-candidates', action='store_true', help='Allow a CRS the inspection did not list; recorded')
+    assign.add_argument('--check-reference', help='Layer (file or file:layer) sharing boundaries with the drawing, in a known CRS')
+    assign.add_argument('--check-layer', help='Comma-separated source layers whose vertices are checked (default: line and polygon layers)')
+    assign.add_argument('--tolerance', type=float, help='Metres: a vertex within this of a reference edge counts as on it')
+    assign.add_argument('--min-share', type=float, help='Share of vertices (0-1) that must lie within --tolerance')
+    assign.add_argument('--check-points', help='CSV of known points (id, src_x, src_y, dst_x, dst_y), dst in --crs')
+    assign.add_argument('--max-check-error', type=float, help='Largest acceptable distance in metres between src and dst of a point')
     assign.add_argument('--output', required=True, help='New directory for <source>.gpkg, manifest.json and record.json')
     lay = commands.add_parser('overlay', help='Parcels over reference layers in one check plot, intersections measured')
     lay.add_argument('source', help='Vector file with parcels in a projected CRS, e.g. parcels.gpkg after assign-crs')
@@ -2947,7 +3071,9 @@ def main():
             manifest = assign_crs(args)
             print(json.dumps({'output': str(Path(args.output).absolute()), 'crs': manifest['crs']['id'],
                               'features': {k: v['features'] for k, v in manifest['checks'].items()},
-                              'outside_candidates': manifest['outside_candidates']},
+                              'outside_candidates': manifest['outside_candidates'],
+                              'evidence': {k: {f: v[f] for f in ('share_within_tolerance', 'median_distance_m', 'max_error_m', 'passed') if f in v}
+                                           for k, v in manifest['evidence'].items() if isinstance(v, dict)}},
                              ensure_ascii=False))
             return
         if args.near_km <= 0:
