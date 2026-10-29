@@ -1037,7 +1037,78 @@ FACE_LAYERS = {
     'qa_dangles': ('LineString', ('kind', 'length_m', 'handles')),
     'qa_topology': ('Unknown', ('check', 'detail', 'area_m2', 'face_a', 'face_b')),
     'added_lines': ('LineString', ('length_m', 'handles_a', 'handles_b')),
+    'excluded': ('LineString', ('layer', 'handle', 'block', 'rule')),
 }
+EXCLUDE_KEYS = ('layers', 'blocks', 'boxes')
+
+
+def load_exclusions(path):
+    """Exclusion rules from YAML: layers and blocks are fnmatch patterns on CAD layer and block names, boxes are
+    [minx, miny, maxx, maxy] in metres."""
+    import yaml
+    text = Path(path).read_text(encoding='utf-8')
+    rules = yaml.safe_load(text) or {}
+    if not isinstance(rules, dict) or set(rules) - set(EXCLUDE_KEYS):
+        raise ValueError(f'--exclude {path} must be a mapping with only {", ".join(EXCLUDE_KEYS)}')
+    for key in ('layers', 'blocks'):
+        if not isinstance(rules.get(key, []), list) or not all(isinstance(v, str) and v for v in rules.get(key, [])):
+            raise ValueError(f'--exclude {path}: {key} must be a list of name patterns')
+    boxes = rules.get('boxes', [])
+    if not isinstance(boxes, list) or not all(isinstance(b, list) and len(b) == 4 and all(isinstance(v, (int, float)) for v in b)
+                                              and b[0] < b[2] and b[1] < b[3] for b in boxes):
+        raise ValueError(f'--exclude {path}: boxes must be [minx, miny, maxx, maxy] lists with min < max')
+    return {key: rules.get(key, []) for key in EXCLUDE_KEYS}, text
+
+
+def exclusions(rows, args, crs):
+    """(rule matched by each line or None, report): the first of layer patterns, block patterns (any name in an exploded
+    block path), boxes and --exclude-area polygons. A line counts as inside an area only when wholly within it; lines
+    crossing an area's edge are kept and counted, never clipped."""
+    from fnmatch import fnmatchcase
+    import geopandas as gpd
+    import shapely
+    from pyproj import CRS
+    rules, text = load_exclusions(args.exclude) if args.exclude else ({key: [] for key in EXCLUDE_KEYS}, None)
+    if args.boundary and any(fnmatchcase(args.boundary, pattern) for pattern in rules['layers']):
+        raise ValueError(f'--exclude matches the boundary layer {args.boundary}; the planning boundary cannot be excluded')
+    areas = [(f'box:{i}', shapely.box(*b)) for i, b in enumerate(rules['boxes'], 1)]
+    area_report = None
+    if args.exclude_area:
+        path, layer = (args.exclude_area.rsplit(':', 1) if ':' in args.exclude_area and not Path(args.exclude_area).exists()
+                       else (args.exclude_area, None))
+        check_vector(path, layer)
+        polygons = gpd.read_file(path, layer=layer, engine='pyogrio')
+        if (polygons.crs is None) != (crs is None) or (crs is not None and not CRS.from_user_input(crs).equals(polygons.crs)):
+            raise ValueError(f'--exclude-area must share the lines\' CRS (or both have none); got {polygons.crs} and {crs}')
+        polygons = polygons[polygons.geometry.notna() & polygons.geom_type.isin(['Polygon', 'MultiPolygon'])]
+        if not len(polygons):
+            raise ValueError(f'--exclude-area {args.exclude_area} has no polygons')
+        areas += [(f'area:{i}', g) for i, g in zip(polygons.index, polygons.geometry)]
+        area_report = {'path': str(Path(path).absolute()), 'layer': layer, 'features': int(len(polygons)),
+                       'sha256': digest(path) if Path(path).is_file() else None}
+    blocks = rows['block'] if 'block' in rows else [None]*len(rows)
+    matched, crossing, used = [], 0, set()
+    for layer, block, line in zip(rows['layer'], blocks, rows.geometry):
+        rule = next((f'layer:{p}' for p in rules['layers'] if fnmatchcase(str(layer), p)), None)
+        names = block.split('/') if isinstance(block, str) and block else []
+        rule = rule or next((f'block:{p}' for p in rules['blocks'] if any(fnmatchcase(n, p) for n in names)), None)
+        if rule is None:
+            for label, area in areas:
+                if area.covers(line):
+                    rule = label
+                    break
+            else:
+                crossing += any(area.intersects(line) for _, area in areas)
+        used.add(rule)
+        matched.append(rule)
+    unmatched = [f'layer:{p}' for p in rules['layers'] if f'layer:{p}' not in used] + \
+                [f'block:{p}' for p in rules['blocks'] if f'block:{p}' not in used] + \
+                [label for label, _ in areas if label not in used and label.startswith('box:')]
+    if rules['blocks'] and 'block' not in rows:
+        unmatched.append('blocks: the line layer has no block field (cad.py extract --include-blocks writes one)')
+    report = {'rules': {'path': str(Path(args.exclude).absolute()), 'sha256': digest(args.exclude), **rules} if text else None,
+              'areas': area_report, 'crossing_kept': crossing, 'unmatched': unmatched}
+    return matched, report
 
 
 def plot_faces(frames, path, title, font):
@@ -1051,6 +1122,8 @@ def plot_faces(frames, path, title, font):
         part = faces[faces['status'] == status]
         if len(part):
             part.plot(ax=axis, facecolor=colour, edgecolor='#4a4a4a', linewidth=0.4)
+    if len(frames.get('excluded', [])):
+        frames['excluded'].plot(ax=axis, color='#9e9e9e', linewidth=0.5, linestyle='--')
     for name, colour, width in (('qa_dangles', '#8e44ad', 1.0), ('added_lines', '#27ae60', 1.6), ('qa_gaps', '#d62728', 1.6)):
         if len(frames[name]):
             frames[name].plot(ax=axis, color=colour, linewidth=width)
@@ -1060,6 +1133,8 @@ def plot_faces(frames, path, title, font):
                for c, l in (('#cfe3f5', 'face pass'), ('#f6b26b', 'face hold'))]
     handles += [plt.Line2D([], [], color=c, linewidth=2, label=l)
                 for c, l in (('#d62728', 'gap'), ('#8e44ad', 'dangle / cut edge'), ('#27ae60', 'added by --close-gaps'))]
+    if len(frames.get('excluded', [])):
+        handles.append(plt.Line2D([], [], color='#9e9e9e', linestyle='--', label=f'excluded ({len(frames["excluded"])})'))
     axis.legend(handles=handles, loc='center left', bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False)
     axis.set_aspect('equal', adjustable='datalim')
     axis.ticklabel_format(useOffset=False, style='plain')
@@ -1103,6 +1178,14 @@ def polygonize(args):
     if unknown:
         raise ValueError(f'No lines on CAD layers {", ".join(unknown)}; layers present: {", ".join(present)}')
     rows = frame[frame['layer'].isin(wanted)].reset_index(drop=True)
+    from collections import Counter
+    matched, exclusion = exclusions(rows, args, frame.crs)
+    dropped = rows[[rule is not None for rule in matched]].assign(rule=[r for r in matched if r is not None])
+    rows = rows[[rule is None for rule in matched]].reset_index(drop=True)
+    exclusion.update(excluded=int(len(dropped)), by_rule=dict(Counter(dropped['rule']).most_common()),
+                     by_layer=dict(Counter(dropped['layer']).most_common()))
+    if not len(rows):
+        raise ValueError('Every line was excluded; nothing is left to polygonize')
     labels = [h if isinstance(h, str) and h else (s if isinstance(s, str) and s else None)
               for h, s in zip(rows.get('handle', [None]*len(rows)), rows.get('source_handle', [None]*len(rows)))]
 
@@ -1180,6 +1263,12 @@ def polygonize(args):
     frames = {'faces': face_frame}
     for name, rows_ in (('qa_gaps', gap_rows), ('qa_dangles', dangle_rows), ('qa_topology', topology), ('added_lines', added_rows)):
         frames[name] = gpd.GeoDataFrame(rows_, columns=[*FACE_LAYERS[name][1], 'geometry'], geometry='geometry', crs=out_crs)
+    frames['excluded'] = gpd.GeoDataFrame(dropped.reindex(columns=[*FACE_LAYERS['excluded'][1], 'geometry']), geometry='geometry',
+                                          crs=out_crs)
+    if exclusion['unmatched']:
+        notes.append(f'Exclusion rules that matched no line: {", ".join(exclusion["unmatched"])}')
+    if exclusion['crossing_kept']:
+        notes.append(f'{exclusion["crossing_kept"]} lines cross an exclusion area\'s edge and were kept, not clipped')
     counts = {name: len(f) for name, f in frames.items()}
     hold = int((face_frame['status'] == 'hold').sum()) if len(face_frame) else 0
     total = float(face_frame['area_m2'].sum()) if len(face_frame) else 0.0
@@ -1215,7 +1304,7 @@ def polygonize(args):
                              'endpoints_moved_to_line': sum(1 for m in moves if m[0] == 'to-line'),
                              'largest_move_m': round(max(moved), 6) if moved else 0.0},
                     'layers': counts, 'faces': {'pass': counts['faces']-hold, 'hold': hold, 'outside_boundary': outside},
-                    'area': coverage, 'notes': notes,
+                    'exclusion': exclusion, 'area': coverage, 'notes': notes,
                     'output': {'path': target.name, 'sha256': digest(target)}, 'plot': 'check.png'}
         write_json(stage / 'manifest.json', manifest)
         write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'cad polygonize', 'version': VERSION,
@@ -1227,7 +1316,8 @@ def polygonize(args):
                                             'assumptions': ['Coordinates are in metres (cad.py extract output or a projected CRS in metres)',
                                                             'Endpoints within --snap are merged and free ends within --snap are moved onto the nearest line',
                                                             'Gaps up to --max-gap are reported; they are closed only with --close-gaps, and marked',
-                                                            'Faces are candidates: no face is dropped for size, small and invalid ones are held']})
+                                                            'Faces are candidates: no face is dropped for size, small and invalid ones are held',
+                                                            'Excluded lines (--exclude, --exclude-area) are left out before snapping and listed in excluded']})
     return manifest
 
 
@@ -2753,6 +2843,8 @@ def main():
     faces.add_argument('--snap', type=float, required=True, help='Merge endpoints, and move free ends onto lines, within this many metres')
     faces.add_argument('--max-gap', type=float, required=True, help='Report gaps up to this many metres (must exceed --snap)')
     faces.add_argument('--min-area', type=float, required=True, help='Faces smaller than this many m² are held as suspected slivers')
+    faces.add_argument('--exclude', help='YAML rules leaving lines out: layers / blocks (name patterns), boxes ([minx, miny, maxx, maxy])')
+    faces.add_argument('--exclude-area', help='Polygons (file or file:layer) whose lines are left out, e.g. title blocks and legends')
     faces.add_argument('--close-gaps', action='store_true', help='Close reported gaps with added lines, kept in added_lines and marked')
     faces.add_argument('--output', required=True, help='New directory for faces.gpkg, check.png, manifest.json and record.json')
     compare = commands.add_parser('compare-fills', help='Compare hatch areas from extract with polygonized or 湘源 faces')

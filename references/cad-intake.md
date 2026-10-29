@@ -191,6 +191,19 @@ python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,�
 ```
 
 - **输入**：`cad.py extract` 的 `raw.gpkg`（默认读 `lines` 图层，可用 `--lines-layer` 改），或任何带 `layer` 字段、单位为米的线图层。带 CRS 时必须是以米为单位的投影坐标系，输出沿用它；没有 CRS 时按 extract 的约定视为米。`--cad-layers` 选择参与的 CAD 图层，不给时用全部。
+- **剔除图框、图例、表格**：在吸附之前把这些线拿掉，免得它们围出假面。
+  - `--exclude 规则.yaml`，只认三个键：
+    ```yaml
+    layers: [图框_*, 图例*, 指北针]       # CAD 图层名，通配符（fnmatch，区分大小写）
+    blocks: [tukuang, TK*]               # 炸开的图块名（extract --include-blocks 写的 block 路径里任一段）
+    boxes:                               # [minx, miny, maxx, maxy]，米
+      - [488100, 2489800, 489600, 2491900]
+    ```
+  - `--exclude-area 文件[:图层]`：范围多边形，CRS 要和线相同，或者都没有。
+  - 按图层、图块、范围框、范围多边形的顺序，取第一条命中的规则。线要整条落在范围框或多边形里才剔除；跨过范围边界的线保留、不裁剪，个数记在清单里，并写一条说明。
+  - 被剔除的线写入 `excluded` 图层（`layer`、`handle`、`block`、`rule`），检查图里画成灰色虚线。清单的 `exclusion` 记规则文件的路径、SHA-256 和内容，范围多边形的来源和个数，剔除总数，按规则和按图层的计数，跨边界保留的线数，以及一条线也没命中的规则（同时写进说明）。
+  - 规则命中了 `--boundary` 规划范围线所在的图层时报错；全部线都被剔除时也报错。
+  - 妈湾法图：把 `_K` 地块线和 `图框_*` 各层一起提取，不剔除时围出 168 个面、共 867 公顷；用 `layers: [图框_*]` 剔除 71 条线（图例 40、图框 22、指北针 6、单元划分图 3）后剩 107 个面，面积 1,218,800 m²，和湘源直取的地块（去掉误标的图框面）一致。
 - **吸附（`--snap`，米，必填）**：
   - 距离在 `--snap` 以内的端点合并到它们的平均位置。一条线首尾相距不到 `--snap` 时，因此会被闭合。
   - 合并后仍然孤立的端点，如果离别的线在 `--snap` 以内，就移到那条线上最近的点，并在那条线上插入同一个顶点，处理 T 形接头差一点没碰上的情况。
@@ -206,7 +219,7 @@ python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,�
   - 这一步不判断面的性质，道路面留给文字挂接一步判定。
 - **规划范围线（`--boundary`）**：给出范围线所在的 CAD 图层，它的线参与打断（自动加入 `--cad-layers`），并且单独围成范围面；范围外的面不输出，个数记为 `outside_boundary`；清单记录面总面积、范围面积和两者的比值。范围线围不成面时报错。不给时不裁剪，清单注明面积未按规划范围限定。
 - **拓扑检查**：对面调用 `topo.py` 的检查（缺口、重叠、碎面、无效几何、重复），碎面阈值取 `--min-area`，结果写入 `qa_topology`。没有 CRS 时，在一个只代表图纸平面的米制坐标系里计算，清单注明。
-- **输出**：新目录，含 `faces.gpkg`（`faces`、`qa_gaps`、`qa_dangles`、`qa_topology`、`added_lines` 五个图层；空图层也保留字段结构）、`check.png`（通过的面浅蓝、hold 的面橙色，缺口红色、悬挂线紫色、补线绿色）、`manifest.json`（`manifest: cad-polygonize` v1：参数、用到的线数、吸附统计、各图层要素数、面的通过 / hold / 范围外个数、面积、说明）和 `record.json`。写出后回读核对各图层要素数。
+- **输出**：新目录，含 `faces.gpkg`（`faces`、`qa_gaps`、`qa_dangles`、`qa_topology`、`added_lines`、`excluded` 六个图层；空图层也保留字段结构）、`check.png`（通过的面浅蓝、hold 的面橙色，缺口红色、悬挂线紫色、补线绿色、剔除的线灰色虚线）、`manifest.json`（`manifest: cad-polygonize` v1：参数、用到的线数、吸附统计、各图层要素数、面的通过 / hold / 范围外个数、`exclusion`、面积、说明）和 `record.json`。写出后回读核对各图层要素数。
 
 ## 填充与面对比
 
