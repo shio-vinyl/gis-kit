@@ -1717,11 +1717,19 @@ ODA_PATHS = ('/Applications/ODAFileConverter.app/Contents/MacOS/ODAFileConverter
 
 
 def find_converters():
-    """Installed DWG-to-DXF converters: {'oda': path, 'libredwg': path}; nothing is installed here."""
+    """Installed DWG-to-DXF converters: {'oda': path, 'libredwg': path}; nothing is installed here. GIS_KIT_ODA names
+    the ODA File Converter executable to use, or, set empty, leaves ODA out; unset, PATH and the usual install
+    locations are searched."""
     import glob
+    import os
     import shutil
     found = {}
-    oda = shutil.which('ODAFileConverter') or next((hit for pattern in ODA_PATHS for hit in sorted(glob.glob(pattern))), None)
+    if 'GIS_KIT_ODA' in os.environ:
+        oda = os.environ['GIS_KIT_ODA'] or None
+        if oda and not (Path(oda).is_file() and os.access(oda, os.X_OK)):
+            raise ValueError(f'GIS_KIT_ODA={oda} is not an executable file')
+    else:
+        oda = shutil.which('ODAFileConverter') or next((hit for pattern in ODA_PATHS for hit in sorted(glob.glob(pattern))), None)
     if oda:
         found['oda'] = oda
     if shutil.which('dwg2dxf'):
@@ -2431,13 +2439,16 @@ def convert(args):
         if tool == 'libredwg':
             command = [found[tool], '-y', '--as', as_libredwg, '-o', str(target), str(copy)]
         else:
-            command = [found[tool], str(given), str(out), as_oda, 'DXF', '0', '1', source.name]
+            # ODA takes a wildcard filter, not a name: brackets in a name such as 法图[妈湾片区].dwg would match nothing.
+            # The input folder holds only the copy, so every DWG in it is the one wanted.
+            command = [found[tool], str(given), str(out), as_oda, 'DXF', '0', '1', '*.DWG']
         started = time.monotonic()
         run = subprocess.run(command, capture_output=True, text=True, errors='replace', timeout=args.timeout)
         seconds = round(time.monotonic() - started, 2)
         messages = [line for line in (run.stdout + run.stderr).splitlines() if line.strip()]
         if run.returncode != 0 or not target.is_file() or target.stat().st_size == 0:
-            raise ValueError(f'{tool} failed (exit {run.returncode}): ' + ' | '.join(messages[-5:]))
+            written = sorted(p.name for p in out.iterdir())
+            raise ValueError(f'{tool} failed (exit {run.returncode}, wrote {", ".join(written) or "nothing"}): ' + ' | '.join(messages[-5:]))
         header = read_header(target)
         doc, audit = read_drawing(target, None)
         readback = {'header': header}

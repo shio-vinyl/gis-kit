@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 修复 `cad.py convert --tool oda`：文件名带 `[ ]` 等通配符字符时（例如 `[妈湾片区]`），ODA 什么都不转换，却以 0 退出。现在过滤条件改为 `*.DWG`（输入目录里只有那一份副本）。新增环境变量 `GIS_KIT_ODA`：指定 ODA 的路径，设为空值则不用 ODA。转换失败时报告转换器实际写出了哪些文件。
 - `cad.py assign-crs` 增加要素核对（需求第 9 节第 6 项，选丁）：不带带号的坐标系（东偏移不到 1,000,000）和 `--outside-candidates` 必须先通过核对才能赋值，阈值由用户给，没有默认值。可以用 `--check-reference` 加 `--tolerance`、`--min-share` 核对与参考图层边界的重合比例，也可以用 `--check-points` 加 `--max-check-error` 核对已知点；没通过时不发布。清单新增 `zone_prefix` 和 `evidence`。
 - `cad.py polygonize` 可以剔除图框、图例、表格线（需求 R9）：`--exclude 规则.yaml` 按图层名、炸开的图块名（通配符）和范围框剔除，`--exclude-area` 按范围多边形剔除；线要整条落在范围内才剔除，跨边界的保留并计数。剔除的线写入 `excluded` 图层，清单 `exclusion` 按规则和图层计数，并列出没命中的规则；规则命中规划范围线图层时报错。
 - `cad.py extract` 新增 `hatches` 图层（需求 R8）：每个 HATCH 按边界路径和填充样式生成它填充的面，孤岛成洞，保留图案名、ACI 颜色、真彩色和样式；边界自相交的不填充、不修复，标 `valid = false`。新子命令 `cad.py compare-fills`：把填充面按 IoU 配给 polygonize / label / xiangyuan 的面，报告重叠、IoU，以及只在填充或只在面里的面积（`fill_only`、`face_only` 图层），可用 `--exclude-hold`。运行清单 `cad-fill-compare` v1 已加入 capabilities。

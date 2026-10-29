@@ -727,9 +727,11 @@ def fake_dwg2dxf(folder, body):
     return folder
 
 
-def run_convert(source, out, *extra, path, success=True):
+def run_convert(source, out, *extra, path, oda='', success=True):
+    """cad.py convert with only `path` on PATH and ODA left out (GIS_KIT_ODA empty) unless `oda` names a stand-in."""
     result = subprocess.run([sys.executable, str(SCRIPTS/'cad.py'), 'convert', str(source), '--output', str(out), *map(str, extra)],
-                            capture_output=True, text=True, env={**os.environ, 'PATH': str(path), 'PYTHONDONTWRITEBYTECODE': '1'})
+                            capture_output=True, text=True,
+                            env={**os.environ, 'PATH': str(path), 'GIS_KIT_ODA': str(oda), 'PYTHONDONTWRITEBYTECODE': '1'})
     assert (result.returncode == 0) == success, result.stdout+result.stderr
     return json.loads((out/'manifest.json').read_text()) if success else result.stderr
 
@@ -759,12 +761,40 @@ def test_convert_refusals(tmp_path):
     assert 'No ODA File Converter or LibreDWG' in run_convert(source, tmp_path/'a', path=empty, success=False)
     failing = fake_dwg2dxf(tmp_path/'bin', "print('Error: bad DWG section', file=sys.stderr)\nsys.exit(1)\n")
     message = run_convert(source, tmp_path/'b', path=failing, success=False)
-    assert 'libredwg failed (exit 1)' in message and 'bad DWG section' in message
+    assert 'libredwg failed (exit 1, wrote nothing)' in message and 'bad DWG section' in message
     assert 'No oda found' in run_convert(source, tmp_path/'c', '--tool', 'oda', path=failing, success=False)
     fake = tmp_path/'fake.dwg'
     fake.write_bytes(b'not a drawing')
     assert 'does not start like a DWG' in run_convert(fake, tmp_path/'d', path=failing, success=False)
-    assert not any((tmp_path/name).exists() for name in 'abcd')
+    assert 'is not an executable file' in run_convert(source, tmp_path/'e', path=failing, oda=tmp_path/'nowhere', success=False)
+    assert not any((tmp_path/name).exists() for name in 'abcde')
+
+
+def fake_oda(folder, prepared):
+    """An ODAFileConverter stand-in: input folder, output folder, version, type, recurse, audit, filter; the filter is
+    a wildcard as in ODA (brackets are a character class, case ignored), and each match becomes a copy of `prepared`."""
+    folder.mkdir()
+    script = folder/'ODAFileConverter'
+    script.write_text(f'#!{sys.executable}\nimport fnmatch, pathlib, shutil, sys\n'
+                      'given, out, version, kind, recurse, audit, pattern = sys.argv[1:8]\n'
+                      'for p in pathlib.Path(given).iterdir():\n'
+                      '    if fnmatch.fnmatch(p.name.lower(), pattern.lower()):\n'
+                      f'        shutil.copy({str(prepared)!r}, pathlib.Path(out)/(p.stem + ".dxf"))\n', encoding='utf-8')
+    script.chmod(0o755)
+    return script
+
+
+def test_convert_with_oda_takes_names_with_brackets(tmp_path):
+    prepared = dxf(tmp_path/'prepared.dxf', site(39_500_000, 3_400_000))
+    oda = fake_oda(tmp_path/'oda', prepared)
+    source = tmp_path/'法图[妈湾片区]（带编号）.dwg'
+    source.write_bytes(b'AC1032' + bytes(200))
+    empty = tmp_path/'empty'
+    empty.mkdir()
+    manifest = run_convert(source, tmp_path/'out', '--tool', 'oda', path=empty, oda=oda)
+    assert manifest['converter']['tool'] == 'oda' and manifest['converter']['command'][-1] == '*.DWG'
+    assert manifest['converter']['command'][3:6] == ['ACAD2018', 'DXF', '0']
+    assert (tmp_path/'out'/'法图[妈湾片区]（带编号）.dxf').read_bytes() == prepared.read_bytes()
 
 
 @pytest.mark.skipif(shutil.which('dwg2dxf') is None or shutil.which('dxf2dwg') is None, reason='LibreDWG not installed')

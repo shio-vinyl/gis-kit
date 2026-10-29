@@ -10,7 +10,10 @@ python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/
 ```
 
 - **转换器**：
-  - ODA File Converter：免费，安装时要接受 ODA 的许可协议；程序会在 PATH 和常见安装位置查找。
+  - ODA File Converter：免费，安装时要接受 ODA 的许可协议。程序先在 PATH 里找，再找常见安装位置（例如 `/Applications/ODAFileConverter.app`）。
+    - 环境变量 `GIS_KIT_ODA` 设成可执行文件路径时，只用这一个；设成空值时不用 ODA。
+    - ODA 的最后一个参数是通配符过滤，不是文件名，所以程序传 `*.DWG`（输入目录里只有那一份副本）。文件名带 `[ ]` 时（例如 `[妈湾片区]`），按文件名过滤会什么都匹配不上，ODA 照样以 0 退出。
+    - 2026-10 用 27.9 版（macOS arm64）实测，转 AutoCAD 2018（AC1032）的 DWG。
   - LibreDWG 的 `dwg2dxf`：GPL 许可，`brew install libredwg` 即可安装。2026-10 用 0.14 版实测，能转 AutoCAD 2018（AC1032）的 DWG。
   - 两种都没装时报错，提示安装或在 AutoCAD / 中望 CAD 里另存为 DXF。
 - **原件不动**：转换器读的是临时副本，原始 DWG 只读。`--version` 指定输出的 DXF 版本（r2000–r2018，默认 r2018），`--timeout` 指定超时秒数。
@@ -21,6 +24,11 @@ python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/
 - **LibreDWG 输出的已知问题**：
   - 有些 XRECORD 的扩展数据里有组码小于 1000 的标签，ezdxf 的恢复模式会拒绝读取。读取时会在临时副本里去掉这些标签，记下去掉的条数；实体不受影响。
   - 输出的 DXF 文件头里，`$DWGCODEPAGE` 可能写成 ANSI_936，见下文"文字编码"。
+  - `ACAD_TABLE` 只剩一行 `0/ACAD_TABLE`，表格和 `*T` 块的对应关系丢失；`OLE2FRAME` 的组码 10/11 是占位值。
+- **两种转换器的对照**（妈湾法图，2026-10-29）：
+  - 湘源直取的结果完全一样：99 个面句柄相同，顶点最大差 1.5×10⁻⁹ m；各项统计、面积、填充、设施配对也一样。4 个嵌入工作簿逐字节相同。
+  - 只有 ODA 保住了 `ACAD_TABLE`：`*T58` 对应 `tukuang` 块里的表格 5B592；ODA 也把 OLE 框的真实角点写在了 10/11。
+  - 314 个格式不对的 XDATA 标签两种输出都有，问题出在原 DWG 本身。
 - **输出**：新目录，含 `<源文件名>.dxf`、`manifest.json`（`manifest: cad-convert` v1：源文件 SHA-256、DWG 版本、转换器与命令、退出码、用时、输出 SHA-256、回读结果、警告）和 `record.json`。
 
 ## 清点
