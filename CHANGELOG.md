@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- `cad.py assign-crs` 增加要素核对（需求第 9 节第 6 项，选丁）：不带带号的坐标系（东偏移不到 1,000,000）和 `--outside-candidates` 必须先通过核对才能赋值，阈值由用户给，没有默认值。可以用 `--check-reference` 加 `--tolerance`、`--min-share` 核对与参考图层边界的重合比例，也可以用 `--check-points` 加 `--max-check-error` 核对已知点；没通过时不发布。清单新增 `zone_prefix` 和 `evidence`。
 - `cad.py polygonize` 可以剔除图框、图例、表格线（需求 R9）：`--exclude 规则.yaml` 按图层名、炸开的图块名（通配符）和范围框剔除，`--exclude-area` 按范围多边形剔除；线要整条落在范围内才剔除，跨边界的保留并计数。剔除的线写入 `excluded` 图层，清单 `exclusion` 按规则和图层计数，并列出没命中的规则；规则命中规划范围线图层时报错。
 - `cad.py extract` 新增 `hatches` 图层（需求 R8）：每个 HATCH 按边界路径和填充样式生成它填充的面，孤岛成洞，保留图案名、ACI 颜色、真彩色和样式；边界自相交的不填充、不修复，标 `valid = false`。新子命令 `cad.py compare-fills`：把填充面按 IoU 配给 polygonize / label / xiangyuan 的面，报告重叠、IoU，以及只在填充或只在面里的面积（`fill_only`、`face_only` 图层），可用 `--exclude-hold`。运行清单 `cad-fill-compare` v1 已加入 capabilities。
 - `cad.py xiangyuan` 取出嵌入对象：`OLE2FRAME` 写入 `ole_frames` 图层（位置取二进制头部的角点，LibreDWG 的 10/11 组码是占位值），嵌入的文件原样另存到 `ole/`（Excel 2007+ 为 xlsx），列出工作表和框里显示的那张，各工作簿同名表内容不同时报告并警告；`*T` 表格块的单元格按位置排行列写到 `tables/`；LibreDWG 转丢内容的 `ACAD_TABLE` 给出警告。编号图块只补面上为空的字段（`filled_from_block`），不覆盖已有值。新增可选依赖 olefile（`gis.py capabilities` 的 `cad-ole`）。

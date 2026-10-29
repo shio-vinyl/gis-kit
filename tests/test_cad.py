@@ -305,8 +305,14 @@ def test_assign_crs_refusals(tmp_path):
     assert 'must not be blank' in assign(gpkg, tmp_path/'a', *base, '--crs', 'EPSG:4527', '--confirmed-by', ' ', '--basis', 'x', success=False)
     assert 'not among the inspection candidates' in assign(gpkg, tmp_path/'b', *base, '--crs', 'EPSG:4547', *CONFIRM, success=False)
     assert 'projected CRS in metres' in assign(gpkg, tmp_path/'c', *base, '--crs', 'EPSG:4490', *CONFIRM, success=False)
-    outside = assign(gpkg, tmp_path/'d', *base, '--crs', 'EPSG:4547', *CONFIRM, '--outside-candidates')
+    unchecked = assign(gpkg, tmp_path/'d', *base, '--crs', 'EPSG:4547', *CONFIRM, '--outside-candidates', success=False)
+    assert 'needs a feature check, since it is outside the inspection candidates' in unchecked
+    points = tmp_path/'points.csv'
+    points.write_text('id,src_x,src_y,dst_x,dst_y\nP1,39500010,3400010,39500010.2,3400010\n', encoding='utf-8')
+    outside = assign(gpkg, tmp_path/'d', *base, '--crs', 'EPSG:4547', *CONFIRM, '--outside-candidates',
+                     '--check-points', points, '--max-check-error', 0.5)
     assert outside['outside_candidates'] is True and outside['inspection']['candidates_as_drawn'][0] == 'EPSG:2363'
+    assert outside['evidence']['reason'] == 'outside candidates' and outside['evidence']['points']['max_error_m'] == 0.2
     labelled = tmp_path/'d'/'drawing.gpkg'
     assert 'already has a CRS' in assign(labelled, tmp_path/'e', *base, '--crs', 'EPSG:4527', *CONFIRM, success=False)
     moved = tmp_path/'moved.gpkg'
@@ -1328,3 +1334,48 @@ def test_polygonize_exclusion_refusals(tmp_path):
     assert 'must share the lines' in polygonize(source, tmp_path/'d', '--exclude-area', located, success=False)
     bad.write_text('layers: ["*"]\n', encoding='utf-8')
     assert 'Every line was excluded' in polygonize(source, tmp_path/'e', '--exclude', bad, success=False)
+
+
+def unprefixed(tmp_path):
+    """A drawing in CGCS2000 CM 114E without the zone prefix, inspected against a range layer, and converted."""
+    source = dxf(tmp_path/'qianhai.dxf', site(495_000, 2_490_000))
+    inspect(source, tmp_path/'inspect', '--reference', reference(tmp_path/'range.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000)))
+    gpkg = tmp_path/'qianhai.gpkg'
+    run = subprocess.run([sys.executable, str(SCRIPTS/'convert.py'), str(source), '--output', str(gpkg)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stdout+run.stderr
+    return gpkg, tmp_path/'inspect'
+
+
+def shared_boundaries(path, crs, dx=0.0):
+    """Reference lines on the drawing's roads and building outline, optionally shifted dx metres, in EPSG:4547 then crs."""
+    x0, y0 = 495_000 + dx, 2_490_000
+    lines = [LineString([(x0, y0), (x0+100, y0+50)]), LineString([(x0, y0+80), (x0+120, y0+80)]),
+             LineString([(x0+10, y0+10), (x0+30, y0+10), (x0+30, y0+30), (x0+10, y0+10)])]
+    gpd.GeoDataFrame({'name': ['路', '路', '楼']}, geometry=lines, crs='EPSG:4547').to_crs(crs).to_file(path, layer='edges')
+    return path
+
+
+def test_assign_crs_without_zone_prefix_needs_a_feature_check(tmp_path):
+    gpkg, inspection = unprefixed(tmp_path)
+    base = ('--inspection', inspection, '--crs', 'EPSG:4547', *CONFIRM)
+    assert 'it has no zone prefix (false easting 500000)' in assign(gpkg, tmp_path/'a', *base, success=False)
+    on = shared_boundaries(tmp_path/'on.gpkg', 'EPSG:4547')
+    assert 'needs --tolerance' in assign(gpkg, tmp_path/'b', *base, '--check-reference', on, success=False)
+    manifest = assign(gpkg, tmp_path/'c', *base, '--check-reference', on, '--tolerance', 0.05, '--min-share', 0.05)
+    reference_check = manifest['evidence']['reference']
+    assert manifest['zone_prefix'] is False and manifest['evidence']['required'] and reference_check['passed']
+    assert reference_check['share_within_tolerance'] >= 0.05  # roads and the building; the tree circles are on no edge
+    assert not reference_check['reprojected'] and reference_check['sha256']
+    geographic = shared_boundaries(tmp_path/'geo.gpkg', 'EPSG:4490')  # reprojected to the assigned CRS before measuring
+    again = assign(gpkg, tmp_path/'d', *base, '--check-reference', f'{geographic}:edges', '--tolerance', 0.05, '--min-share', 0.05)
+    assert again['evidence']['reference']['reprojected'] and again['evidence']['reference']['passed']
+    shifted = shared_boundaries(tmp_path/'shifted.gpkg', 'EPSG:4547', dx=5)  # extents still overlap; boundaries do not
+    message = assign(gpkg, tmp_path/'e', *base, '--check-reference', shifted, '--tolerance', 0.05, '--min-share', 0.05, success=False)
+    assert 'nothing was published' in message and 'below --min-share 5.0%' in message and not (tmp_path/'e').exists()
+    points = tmp_path/'points.csv'
+    points.write_text('id,src_x,src_y,dst_x,dst_y\nA,495010,2490010,495010.1,2490010\nB,495030,2490030,495032,2490030\n', encoding='utf-8')
+    failed = assign(gpkg, tmp_path/'f', *base, '--check-points', points, '--max-check-error', 0.5, success=False)
+    assert 'largest check-point error 2.0 m exceeds --max-check-error 0.5' in failed
+    loose = assign(gpkg, tmp_path/'g', *base, '--check-points', points, '--max-check-error', 2.5)
+    assert loose['evidence']['points']['rmse_m'] == pytest.approx(math.sqrt((0.1**2 + 2**2)/2), abs=1e-4)
+    assert 'needs a positive --max-check-error' in assign(gpkg, tmp_path/'h', *base, '--check-points', points, success=False)
