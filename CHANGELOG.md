@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 出图模块重新定位（#9 第 4 项）：gis-kit 出检查图，Composer 出成果图。`plot.py` 的区位图、用地图模板冻结，作为没有 Composer 时的兜底出图，不再新增样式；`tests/test_plot_frozen.py` 锁定模板名单。`plot.py --category landuse` 不带 `--style` 时改用 `landuse/standard`，原来会因为找不到 `landuse/default.yaml` 而报错。分工写在 `references/composer-display.md` 的"检查图与成果图"一节，SKILL.md 和 `vector-workflows.md` 同步更新。
 - 修复 `cad.py convert --tool oda`：文件名带 `[ ]` 等通配符字符时（例如 `[妈湾片区]`），ODA 什么都不转换，却以 0 退出。现在过滤条件改为 `*.DWG`（输入目录里只有那一份副本）。新增环境变量 `GIS_KIT_ODA`：指定 ODA 的路径，设为空值则不用 ODA。转换失败时报告转换器实际写出了哪些文件。
 - `cad.py assign-crs` 增加要素核对（需求第 9 节第 6 项，选丁）：不带带号的坐标系（东偏移不到 1,000,000）和 `--outside-candidates` 必须先通过核对才能赋值，阈值由用户给，没有默认值。可以用 `--check-reference` 加 `--tolerance`、`--min-share` 核对与参考图层边界的重合比例，也可以用 `--check-points` 加 `--max-check-error` 核对已知点；没通过时不发布。清单新增 `zone_prefix` 和 `evidence`。
 - `cad.py polygonize` 可以剔除图框、图例、表格线（需求 R9）：`--exclude 规则.yaml` 按图层名、炸开的图块名（通配符）和范围框剔除，`--exclude-area` 按范围多边形剔除；线要整条落在范围内才剔除，跨边界的保留并计数。剔除的线写入 `excluded` 图层，清单 `exclusion` 按规则和图层计数，并列出没命中的规则；规则命中规划范围线图层时报错。

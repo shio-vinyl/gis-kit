@@ -10,6 +10,24 @@
 
 两份约定都由 gis-kit 产出、维护，并在 `gis.py capabilities --json` 的 `contracts` 中声明写出版本；gis-composer 声明读取版本，gis-plugin 的 doctor 负责配对。读取方遇到不认识的 `schema_version` 会拒绝。
 
+## 检查图与成果图
+
+gis-kit 出**检查图**，用来核对分析做得对不对；Composer 出**成果图**，用于正式交付。正式交付统一走 Composer。gis-kit 仍保留独立出图能力，因为用户可能只装了 gis-kit。
+
+| 类别 | 模块 | 定位 |
+|---|---|---|
+| 诊断 / 检查图 | 各分析脚本的叠加图、配准对照图、统计图，`cad.py overlay` | 保留，随分析一起维护 |
+| Composer 没有的能力 | `cartographic-map.py`（毫米版面、1:N 比例尺、实际文字框审核）、`atlas.py`（逐对象图册）、`plot-chart.py`（统计图表） | 保留 |
+| 与 Composer 重叠 | `plot.py` 的区位图和用地图模板（`templates/location/`、`templates/landuse/`） | 冻结，作为没有 Composer 时的兜底出图 |
+
+冻结的含义：
+- 不再新增模板或样式，也不给 `plot.py` 加新的视觉参数。新的视觉需求做进 Composer 的主题。
+- 不指定 `--style` 时，每类用一个默认模板：区位图用 `location/default`（省市浅灰、区县浅蓝、高亮红色），用地图用 `landuse/standard`（GB 50137 配色）。其余现有样式保留兼容，不删除。
+- 修缺陷、调整字体回退这类不改变样式的修改照常进行。
+- `tests/test_plot_frozen.py` 锁定模板名单。要改这份名单，需要先说明 Composer 为什么做不到。
+
+`templates/chart/` 和 `templates/colors/` 的色板服务于 `plot-chart.py`，`_theme.py` 的字体所有 matplotlib 出图共用，都不在冻结范围内。
+
 ## 矢量与机读探查
 
 ```sh

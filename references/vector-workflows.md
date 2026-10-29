@@ -35,7 +35,7 @@ python3 gis-kit/scripts/benchmark.py \
 
 ## 模板与配置
 
-`plot.py --category ... --style ...` 使用 YAML 模板：`templates/location/`、`landuse/`、`chart/`，共用色板在 `templates/colors/`。用户没有指定样式时可用默认模板；需要特定图式时再确认。模板定义颜色、线宽、字号和标注规则。
+`plot.py --category ... --style ...` 使用 YAML 模板：`templates/location/`、`landuse/`；`plot-chart.py` 使用 `chart/` 和 `templates/colors/` 中的色板。模板定义颜色、线宽、字号和标注规则。`plot.py` 的地图模板已冻结，只作为没有 gis-composer 时的兜底出图：不指定 `--style` 时，区位图用 `location/default`，用地图用 `landuse/standard`；正式地图交给 Composer（见 [Composer 显示交付](composer-display.md)）。
 
 `config/user.yaml` 保存默认 CRS、字体、配色和输出格式；不得用默认 CRS 覆盖来源已明确的坐标参考。
 

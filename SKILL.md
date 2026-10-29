@@ -5,7 +5,7 @@ description: 处理 GIS 矢量与栅格数据、空间分析、DEM 地形、路�
 
 # GIS 数据处理与空间分析
 
-强模型负责理解任务、搜索资料、选择工具和组合调用；gis-kit 提供确定性计算、文件契约与验证，不建设独立调度平台。正式地图、Scene / Storyboard 和地图视频使用可用的 `gis-composer` skill；已有诊断图可独立使用。
+强模型负责理解任务、搜索资料、选择工具和组合调用；gis-kit 提供确定性计算、文件契约与验证，不建设独立调度平台。gis-kit 出检查图，正式地图（成果图）、Scene / Storyboard 和地图视频使用可用的 `gis-composer` skill；`plot.py` 的地图模板已冻结，只作为没有 Composer 时的兜底，分工见 [Composer 显示交付](references/composer-display.md)。
 
 ## 发现与调用
 
