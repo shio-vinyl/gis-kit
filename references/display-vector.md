@@ -47,4 +47,4 @@ python display-vector.py --source plots.gpkg --layer plots --fields landuse --pr
 
 显式给出的 `--tolerance-px`、`--min-area-px` 优先于档位，例如 `--profile print --min-area-px 1` 把最小面积定为 1 平方像素，容差仍取印刷档。容差越细保留的顶点越多，印刷档的包比屏幕档大。印刷图的 `inspect` 报告的 `view` 仍是 CSS 像素，原样传入即可，dpi 另用 `--dpi` 给出。
 
-**与 Composer lint 的差异**：Composer 的 `VECTOR_DETAIL_TOO_FINE` 按屏幕档判断，量的是渲染缩放级别下的 CSS 像素，不看 dpi：至少 2000 个顶点且平均线段短于 0.5 px，或至少 20 个面块小于 4 px² 时警告。印刷档有意保留 0.41–4 px² 之间的面块、线段也更短，小地块多的包会触发这条警告。印刷图上这是预期结果，警告可以不理会；若要两边口径一致，需要 Composer 按画布的 `pixelRatio` 缩放判据，这里没有改动 Composer。
+**与 Composer lint 一致**：Composer 的 `VECTOR_DETAIL_TOO_FINE` 用的也是这组阈值，并按画布的 `pixelRatio`（按厘米出图时为 dpi/96）缩放：同一 dpi 的厘米图配印刷档的包不会触发警告，比印刷档还细的数据仍会。
