@@ -34,22 +34,22 @@ def fake_lyr(folder_name, dataset, label):
 def package_tree(root, with_data=True):
     (root/'esriinfo').mkdir(parents=True)
     (root/'esriinfo'/'item.pkinfo').write_text(
-        "<?xml version='1.0' encoding='utf-8' ?><pkinfo Culture='zh-CN'><ID>X1</ID><name>前海拆除类</name>"
+        "<?xml version='1.0' encoding='utf-8' ?><pkinfo Culture='zh-CN'><ID>X1</ID><name>示例拆除类</name>"
         "<version>10.5</version><type>Layer Package</type></pkinfo>", encoding='utf-8')
     (root/'esriinfo'/'iteminfo.xml').write_text(
-        "<?xml version='1.0' encoding='utf-8' ?><ESRI_ItemInformation><name>前海拆除类</name><title>前海拆除类</title>"
+        "<?xml version='1.0' encoding='utf-8' ?><ESRI_ItemInformation><name>示例拆除类</name><title>示例拆除类</title>"
         "<typekeywords><typekeyword>Layer Package</typekeyword></typekeywords>"
         "<extent><xmin>113.8</xmin><ymin>22.5</ymin><xmax>113.9</xmax><ymax>22.6</ymax></extent></ESRI_ItemInformation>",
         encoding='utf-8')
     for version in ('v10', 'v105'):
         (root/version).mkdir()
-        (root/version/'0000拆除类.lyr').write_bytes(fake_lyr('宝安十五五', '拆除类', '[项目名]'))
+        (root/version/'0000拆除类.lyr').write_bytes(fake_lyr('示例规划', '拆除类', '[项目名]'))
     if with_data:
-        shp = root/'commondata'/'宝安十五五'
+        shp = root/'commondata'/'示例规划'
         shp.mkdir(parents=True)
-        gpd.GeoDataFrame({'项目名': ['海虹工业区']}, geometry=[box(489000, 2490000, 489100, 2490100)], crs='EPSG:4547').to_file(
+        gpd.GeoDataFrame({'项目名': ['示例工业区']}, geometry=[box(489000, 2490000, 489100, 2490100)], crs='EPSG:4547').to_file(
             shp/'拆除类.shp', encoding='utf-8')
-        gpd.GeoDataFrame({'name': ['妈湾大道']}, geometry=[LineString([(0, 0), (1, 1)])], crs='EPSG:4547').to_file(
+        gpd.GeoDataFrame({'name': ['示例大道']}, geometry=[LineString([(0, 0), (1, 1)])], crs='EPSG:4547').to_file(
             root/'commondata'/'roads.gdb', layer='roads', driver='OpenFileGDB')
         (root/'p20').mkdir()
         (root/'p20'/'roads.lyrx').write_text(json.dumps({'type': 'CIMLayerDocument', 'layerDefinitions': [{
@@ -57,7 +57,7 @@ def package_tree(root, with_data=True):
             'featureTable': {'dataConnection': {'workspaceConnectionString': 'DATABASE=..\\commondata\\roads.gdb', 'dataset': 'roads'},
                              'definitionExpression': "name <> ''"},
             'renderer': {'type': 'CIMUniqueValueRenderer', 'fields': ['name'],
-                         'groups': [{'classes': [{'label': '妈湾大道', 'values': [{'fieldValues': ['妈湾大道']}]}]}]},
+                         'groups': [{'classes': [{'label': '示例大道', 'values': [{'fieldValues': ['示例大道']}]}]}]},
             'labelClasses': [{'expression': '$feature.name'}]}]}, ensure_ascii=False), encoding='utf-8')
     return root
 
@@ -69,24 +69,24 @@ def seven_zip(tree, archive):
 
 @needs_bsdtar
 def test_unpack_lists_data_and_links_layers(tmp_path):
-    package = seven_zip(package_tree(tmp_path/'tree'), tmp_path/'前海拆除类.lpk')
+    package = seven_zip(package_tree(tmp_path/'tree'), tmp_path/'示例拆除类.lpk')
     manifest = cli('unpack', package, '--output', tmp_path/'out')
-    assert manifest['source']['archive'] == '7z' and manifest['package']['name'] == '前海拆除类'
+    assert manifest['source']['archive'] == '7z' and manifest['package']['name'] == '示例拆除类'
     assert manifest['item']['extent'] == [113.8, 22.5, 113.9, 22.6] and manifest['layer_versions'] == ['v10', 'v105']
     paths = {d['path']: d for d in manifest['datasets']}
-    assert set(paths) == {'commondata/宝安十五五/拆除类.shp', 'commondata/roads.gdb'}
-    assert paths['commondata/宝安十五五/拆除类.shp']['card']['layers'][0]['crs']['id'] == 'EPSG:4547'
+    assert set(paths) == {'commondata/示例规划/拆除类.shp', 'commondata/roads.gdb'}
+    assert paths['commondata/示例规划/拆除类.shp']['card']['layers'][0]['crs']['id'] == 'EPSG:4547'
     lyr = next(l for l in manifest['layers'] if l['file'].endswith('.lyr'))
     assert lyr['file'] == 'v105/0000拆除类.lyr'  # the newest version folder only
-    assert lyr['data'] == ['commondata/宝安十五五/拆除类.shp'] and lyr['label_expressions'] == ['[项目名]']
-    assert lyr['data_sources'] == ['..\\commondata\\宝安十五五'] and lyr['symbology'] == 'not read: binary .lyr'
+    assert lyr['data'] == ['commondata/示例规划/拆除类.shp'] and lyr['label_expressions'] == ['[项目名]']
+    assert lyr['data_sources'] == ['..\\commondata\\示例规划'] and lyr['symbology'] == 'not read: binary .lyr'
     lyrx = next(l for l in manifest['layers'] if l['file'].endswith('.lyrx'))
     assert lyrx['data'] == ['commondata/roads.gdb:roads']
     roads = lyrx['layers'][0]
     assert roads['renderer'] == 'CIMUniqueValueRenderer' and roads['renderer_fields'] == ['name']
-    assert roads['classes'] == [{'label': '妈湾大道', 'values': ['妈湾大道']}] and roads['label_expressions'] == ['$feature.name']
+    assert roads['classes'] == [{'label': '示例大道', 'values': ['示例大道']}] and roads['label_expressions'] == ['$feature.name']
     assert roads['definition_query'] == "name <> ''" and manifest['warnings'] == []
-    assert gpd.read_file(tmp_path/'out'/'package'/'commondata'/'宝安十五五'/'拆除类.shp')['项目名'].tolist() == ['海虹工业区']
+    assert gpd.read_file(tmp_path/'out'/'package'/'commondata'/'示例规划'/'拆除类.shp')['项目名'].tolist() == ['示例工业区']
 
 
 @needs_bsdtar
@@ -130,7 +130,7 @@ def test_unpack_a_zip_package_and_refusals(tmp_path):
 def test_unescape_bsdtar_names():
     sys.path.insert(0, str(SCRIPTS))
     from package import unescape
-    assert unescape('commondata/\\345\\256\\235\\345\\256\\211/a.shp') == 'commondata/宝安/a.shp'
+    assert unescape('commondata/\\347\\244\\272\\344\\276\\213/a.shp') == 'commondata/示例/a.shp'
     assert unescape('a\\\\b') == 'a\\b'
 
 
