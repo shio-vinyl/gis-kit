@@ -11,8 +11,9 @@ import os
 import sys
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
-from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsMapRendererParallelJob,  # noqa: E402
-                       QgsMapSettings, QgsPointXY, QgsProject, QgsRasterLayer, QgsReferencedRectangle, QgsVectorLayer)
+from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFontUtils,  # noqa: E402
+                       QgsMapRendererParallelJob, QgsMapSettings, QgsPointXY, QgsProject, QgsRasterLayer, QgsReferencedRectangle,
+                       QgsVectorLayer)
 from qgis.PyQt.QtCore import QSize  # noqa: E402
 from qgis.PyQt.QtGui import QColor  # noqa: E402
 
@@ -42,15 +43,28 @@ def renderer_summary(layer):
     return row
 
 
+def font_summary(settings):
+    """The font a label setting asks for, its style, and whether this system has that family."""
+    text = settings.format()
+    family = text.font().family()
+    return {'family': family, 'style': text.namedStyle(), 'installed': QgsFontUtils.fontFamilyOnSystem(family),
+            'buffer': text.buffer().enabled(), 'background': text.background().enabled()}
+
+
+def labeling_summary(labeling):
+    if labeling.type() == 'simple':
+        return [font_summary(labeling.settings())]
+    return [{'filter': rule.filterExpression(), **font_summary(rule.settings())} for rule in labeling.rootRule().children() if rule.settings()]
+
+
 def layer_summary(layer):
     row = {'name': layer.name(), 'valid': layer.isValid(), 'crs': layer.crs().authid(), 'source': layer.source()}
     if isinstance(layer, QgsVectorLayer):
         row.update(features=layer.featureCount(), labels=layer.labelsEnabled(), opacity=layer.opacity(),
                    labeling=layer.labeling().type() if layer.labeling() else None, **renderer_summary(layer))
-        if layer.labeling() and layer.labeling().type() == 'simple':
-            settings = layer.labeling().settings()
-            row['label_font'] = settings.format().font().family()
-            row['label_buffer'] = settings.format().buffer().enabled()
+        if layer.labeling():
+            row['label_settings'] = labeling_summary(layer.labeling())
+        row['subset'] = layer.subsetString()
     elif isinstance(layer, QgsRasterLayer):
         row.update(renderer=layer.renderer().type(), opacity=layer.renderer().opacity(), width=layer.width(), height=layer.height())
     return row
@@ -69,7 +83,11 @@ def main():
               'panel_order': [l.layerId() for l in root.findLayers()],
               'drawing_order_top_first': [l.id() for l in root.layerOrder()],
               'checked': {l.layerId(): l.isVisible() for l in root.findLayers()},
-              'layers': {lid: layer_summary(layer) for lid, layer in project.mapLayers().items()}}
+              'layers': {lid: layer_summary(layer) for lid, layer in project.mapLayers().items()},
+              'background': project.backgroundColor().name(),
+              'themes': {name: sorted(project.mapThemeCollection().mapThemeVisibleLayerIds(name))
+                         for name in project.mapThemeCollection().mapThemes()},
+              'bookmarks': [b.name() for b in project.bookmarkManager().bookmarks()]}
     tables = {}
     for layer in project.mapLayers().values():
         if isinstance(layer, QgsVectorLayer):
@@ -87,7 +105,7 @@ def main():
     extent = QgsReferencedRectangle(view, view.crs()) if not view.isEmpty() else project.mapLayers()[report['panel_order'][-1]].extent()
     settings.setExtent(extent)
     settings.setOutputSize(QSize(800, 800))
-    settings.setBackgroundColor(QColor(255, 255, 255))
+    settings.setBackgroundColor(project.backgroundColor())
     job = QgsMapRendererParallelJob(settings)
     job.start()
     job.waitForFinished()

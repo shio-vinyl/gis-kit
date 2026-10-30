@@ -411,6 +411,7 @@ def unpack(args):
 # --- pack: map-style -> GeoPackage with QGIS styles -----------------------------------------------------------------
 
 RESERVED_TABLES = {'layer_styles', 'qgis_projects', 'map_labels', 'map_label_leaders'}
+TILE_KINDS = {'vectorTiles', 'rasterTiles'}
 GPKG_RASTER_TYPES = {'uint8', 'int16', 'uint16', 'float32'}
 LARGE_BYTES = 500 * 2**20
 DIMENSIONS = {'point': 0, 'line': 1, 'polygon': 2}
@@ -673,31 +674,85 @@ def pack_raster(entry, gpkg, stage, scope, bbox):
                                               f'{" with nodata" if nodata is not None else ""} is not lossless as GeoPackage tiles; written to {file}']}
 
 
-def placement_tables(document, gpkg):
-    """labelPlacements as a point table (map_labels) and their leaders as a line table (map_label_leaders)."""
+def placement_tables(document, gpkg, fonts):
+    """labelPlacements as a point table (map_labels) and their leaders as a line table (map_label_leaders).
+
+    Each label carries the panel of the layer it belongs to and a style_id (its text style among the distinct ones),
+    each leader a stroke_id (its leaderStroke, or the text colour at 1 px); QGIS draws one rule per style and stroke.
+    """
     import geopandas as gpd
+    import pyogrio
     from shapely.geometry import LineString, Point
     from _qgis_style import QUADRANTS
-    labels, leaders = [], []
+    panels = {layer['id']: layer.get('panel') for layer in document['layers']}
+    labels, leaders, styles, strokes = [], [], [], []
+
+    def index_of(items, value):
+        if value not in items:
+            items.append(value)
+        return items.index(value) + 1
+
     for index, item in enumerate(document.get('labelPlacements') or []):
         style = item['style']
         halo = style.get('halo')
-        labels.append({'label_id': index + 1, 'layer': item.get('layer'), 'feature_id': None if item.get('featureId') is None else str(item['featureId']),
-                       'text': item['text'], 'font': style.get('font'), 'size_px': float(style['size']), 'size_mm': _map_style.mm(style['size']),
-                       'color': style['color'], 'halo_color': halo['color'] if halo else None,
-                       'halo_px': float(halo['width']) if halo else None, 'halo_mm': _map_style.mm(halo['width']) if halo else None,
+        family, named = fonts.get(style.get('font'), (style.get('font'), ''))
+        panel = panels.get(item.get('layer'))
+        labels.append({'label_id': index + 1, 'panel': panel, 'layer': item.get('layer'),
+                       'feature_id': None if item.get('featureId') is None else str(item['featureId']), 'text': item['text'],
+                       'style_id': index_of(styles, style), 'font': family, 'font_style': named or None, 'font_name': style.get('font'),
+                       'size_px': float(style['size']), 'size_mm': _map_style.mm(style['size']), 'color': style['color'],
+                       'halo_color': halo['color'] if halo else None, 'halo_px': float(halo['width']) if halo else None,
                        'anchor': item.get('anchor', 'center'), 'quadrant': QUADRANTS[item.get('anchor', 'center')],
                        'rotation': float(item.get('rotation', 0)), 'has_leader': bool(item.get('leader')),
                        'geometry': Point(item['position'])})
         if item.get('leader'):
-            leaders.append({'label_id': index + 1, 'layer': item.get('layer'), 'text': item['text'], 'color': style['color'],
-                            'geometry': LineString(item['leader'])})
-    import pyogrio
+            stroke = item.get('leaderStroke') or {'color': style['color'], 'width': 1}
+            leaders.append({'label_id': index + 1, 'panel': panel, 'layer': item.get('layer'), 'text': item['text'],
+                            'stroke_id': index_of(strokes, stroke), 'geometry': LineString(item['leader'])})
     if labels:
         pyogrio.write_dataframe(gpd.GeoDataFrame(labels, crs='EPSG:4326'), gpkg, layer='map_labels', driver='GPKG', **gpkg_version(gpkg))
     if leaders:
         pyogrio.write_dataframe(gpd.GeoDataFrame(leaders, crs='EPSG:4326'), gpkg, layer='map_label_leaders', driver='GPKG', **gpkg_version(gpkg))
-    return len(labels), len(leaders)
+    return {'labels': labels, 'leaders': leaders, 'styles': styles, 'strokes': strokes}
+
+
+def panel_order(document):
+    """Panel ids, main first: extent.panels in order, then any other panel a layer names."""
+    order = [p['id'] for p in (document.get('extent') or {}).get('panels') or []]
+    for layer in document['layers']:
+        if layer.get('panel') and layer['panel'] not in order:
+            order.append(layer['panel'])
+    return order
+
+
+def layer_tree(rows, panels):
+    """Tree nodes for _qgis_style.project, top first: a group per panel (the main panel checked, the others not),
+    inside it a group per map-style group; layers without a panel follow in their groups."""
+    def groups(members):
+        nodes, seen = [], {}
+        for row in reversed(members):
+            group = row['layer'].get('group')
+            if group is None:
+                nodes.append(('layer', row['id']))
+                continue
+            if group not in seen:
+                seen[group] = []
+                nodes.append(('group', group, True, seen[group]))
+            seen[group].append(('layer', row['id']))
+        return nodes
+    tree = [('group', panel, index == 0, groups([r for r in rows if r['layer'].get('panel') == panel])) for index, panel in enumerate(panels)]
+    return tree + groups([r for r in rows if not r['layer'].get('panel')])
+
+
+def map_themes(rows, panels):
+    """One map theme per panel: its layers (as the map-style shows them) and the layers without a panel."""
+    themes = []
+    for panel in panels:
+        visible = {r['id'] for r in rows if r['layer'].get('panel') in (panel, None) and r['layer'].get('visible') is not False}
+        groups = {r['layer'].get('group') for r in rows if r['layer'].get('panel') == panel} - {None}
+        loose = {r['layer'].get('group') for r in rows if not r['layer'].get('panel')} - {None}
+        themes.append((panel, visible, [panel] + [f'{panel}/{g}' for g in sorted(groups)] + sorted(loose)))
+    return themes
 
 
 def project_crs(layers, datasets):
@@ -738,9 +793,17 @@ def pack(args):
         renderer = layer.get('renderer') or {}
         for rule in renderer.get('rules', []) if renderer.get('type') == 'rule' else []:
             _map_style.check_filter(rule['filter'], where)
-    datasets, taken = {}, set()
+    fonts = _map_style.font_names(document)
+    for row in _map_style.fonts_used(document):
+        if row.get('unresolved') and row['used_by']:
+            notes.append({'layer': ', '.join(row['used_by']), 'item': 'font',
+                          'reason': f'{row["name"]!r} has no fonts[] entry with names; QGIS is given it as written'})
+    datasets, taken, tiles = {}, set(), []
     for layer in document['layers']:
         data = layer['data']
+        if data.get('kind') in TILE_KINDS:  # tiles cannot be cut to the map extent or stored as a table
+            tiles.append({'ref': data['path'], 'layers': [layer['id']], 'reason': f'{data["kind"]}: tiles are not packed'})
+            continue
         path, root = roots.resolve(data['path'])
         dataset_key = (str(path.resolve()), data.get('layer'))
         layer['_key'] = dataset_key
@@ -762,6 +825,12 @@ def pack(args):
         name = re.sub(r'[^\w.-]+', '_', args.name or document['id']).strip('._') or 'map'
         gpkg = stage / f'{name}.gpkg'
         not_packed, warnings = [], []
+        for row in tiles:
+            known = next((r for r in not_packed if r['ref'] == row['ref']), None)
+            if known:
+                known['layers'] += row['layers']
+            else:
+                not_packed.append(row)
         for entry in datasets.values():
             entry['table'] = table_name(entry['path'], entry['data_layer'], taken)
             try:
@@ -780,16 +849,17 @@ def pack(args):
         packed = {k: v for k, v in datasets.items() if not v.get('failed')}
         if not packed:
             raise ValueError('None of the map-style data could be packed: ' + '; '.join(f'{r["ref"]}: {r["reason"]}' for r in not_packed))
-        label_count, leader_count = placement_tables(document, gpkg)
+        placed = placement_tables(document, gpkg, fonts)
+        label_count, leader_count = len(placed['labels']), len(placed['leaders'])
         project_layers, style_rows, layer_rows = [], [], []
         defaults = set()
         for layer in document['layers']:
-            entry = packed.get(layer['_key'])
+            entry = packed.get(layer.get('_key'))
             if entry is None:
                 continue
             title = layer.get('title') or (layer.get('legend') or {}).get('title') or layer['id']
             row = {'id': layer['id'], 'name': title, 'layer': layer, 'kind': entry['kind'], 'crs': entry['crs']}
-            manifest_row = {'id': layer['id'], 'title': title, 'group': layer.get('group'),
+            manifest_row = {'id': layer['id'], 'title': title, 'panel': layer.get('panel'), 'group': layer.get('group'),
                             'table': None if entry.get('storage') == 'geotiff' else entry['table'],
                             'map_style_renderer': (layer['renderer'] or {}).get('type')}
             if entry['kind'] == 'raster':
@@ -798,7 +868,7 @@ def pack(args):
                 manifest_row['qgis_renderer'] = {'pseudocolor': 'singlebandpseudocolor', 'palette': 'paletted', 'rgb': 'multibandcolor'}[layer['renderer']['type']]
                 manifest_row['style'] = 'project only (QGIS keeps layer_styles for vector tables)'
             else:
-                text, kind = qgis.qml(layer, notes)
+                text, kind = qgis.qml(layer, notes, fonts)
                 default = entry['table'] not in defaults
                 defaults.add(entry['table'])
                 style_rows.append({'table': entry['table'], 'geometry_column': entry['geometry_column'], 'name': layer['id'], 'qml': text,
@@ -812,34 +882,45 @@ def pack(args):
             layer_rows.append(manifest_row)
         crs = project_crs(document['layers'], packed)
         placement_crs = pyproj.CRS.from_epsg(4326)
-        placements = (('map_label_leaders', leader_count, 'leaders', 'line', 'LineString'),  # leaders draw under their labels
-                      ('map_labels', label_count, 'labels', 'point', 'Point'))
-        for table, count, placement, geometry, wkb in placements:
-            if not count:
+        panels = panel_order(document)
+        taken_ids = {l['id'] for l in document['layers']}
+        for table, rows, placement, geometry, wkb in (('map_label_leaders', placed['leaders'], 'leaders', 'line', 'LineString'),
+                                                       ('map_labels', placed['labels'], 'labels', 'point', 'Point')):
+            if not rows:
                 continue
-            layer_id = table if table not in {l['id'] for l in document['layers']} else f'{table}_placements'
-            pseudo = {'id': layer_id, 'geometry': geometry, 'group': 'labels'}
-            text, kind = qgis.qml(pseudo, notes, placement)
-            style_rows.append({'table': table, 'geometry_column': 'geom', 'name': layer_id, 'qml': text, 'default': True,
+            title = 'labels (placed)' if placement == 'labels' else 'label leaders'
+            extra = {'_styles': placed['styles']} if placement == 'labels' else {'_strokes': placed['strokes']}
+            base_id = table if table not in taken_ids else f'{table}_placements'
+            pseudo = {'id': base_id, 'geometry': geometry, 'group': 'labels', '_placement': placement, **extra}
+            text, kind = qgis.qml(pseudo, notes, fonts)
+            style_rows.append({'table': table, 'geometry_column': 'geom', 'name': base_id, 'qml': text, 'default': True,
                                'description': 'labels placed by the map-style producer' if placement == 'labels' else 'label leader lines'})
-            project_layers.append({'id': layer_id, 'name': 'labels (placed)' if placement == 'labels' else 'label leaders', 'layer': pseudo,
-                                   'kind': 'vector', 'crs': placement_crs, 'provider': 'ogr', 'wkb': wkb, 'placement': placement,
-                                   'source': f'./{gpkg.name}|layername={table}'})
-            layer_rows.append({'id': layer_id, 'title': project_layers[-1]['name'], 'group': 'labels', 'table': table,
-                               'map_style_renderer': None, 'qgis_renderer': kind, 'default_style': True,
-                               'labels': 'on' if placement == 'labels' else None, 'filter': None})
+            # one QGIS layer per panel, filtered on the panel field, so an inset's labels sit with the inset
+            for panel in [p for p in panels if any(r['panel'] == p for r in rows)] + ([None] if any(r['panel'] is None for r in rows) else []):
+                layer_id = base_id if not panels else f'{base_id}.{panel or "none"}'
+                subset = '' if not panels else '|subset=' + ('"panel" IS NULL' if panel is None else f'"panel" = {qgis.literal(panel)}')
+                project_layers.append({'id': layer_id, 'name': title, 'layer': {**pseudo, 'id': layer_id, 'panel': panel},
+                                       'kind': 'vector', 'crs': placement_crs, 'provider': 'ogr', 'wkb': wkb,
+                                       'source': f'./{gpkg.name}|layername={table}{subset}'})
+                layer_rows.append({'id': layer_id, 'title': title, 'panel': panel, 'group': 'labels', 'table': table,
+                                   'map_style_renderer': None, 'qgis_renderer': kind, 'default_style': True,
+                                   'labels': 'on' if placement == 'labels' else None,
+                                   'filter': None if panel is None and not panels else subset.removeprefix('|subset=') or None,
+                                   'features': sum(r['panel'] == panel for r in rows)})
         if bbox is not None and crs is not None:
             extent = tuple(extent_in(bbox, crs).bounds)
         else:
             extent = project_extent(packed, crs)
-        tree, seen = [], {}
-        for row in reversed(project_layers):  # QGIS lists groups and layers top first
-            group = row['layer'].get('group')
-            if group not in seen:
-                seen[group] = []
-                tree.append((group, seen[group]))
-            seen[group].append(row['id'])
-        qgs = qgis.project(name, document.get('title') or document['id'], project_layers, tree, crs, extent, notes)
+        bookmarks = []
+        if crs is not None:
+            for item in (document.get('extent') or {}).get('panels') or []:
+                bookmarks.append((item['id'], tuple(extent_in(item['bbox'], crs).bounds)))
+        background = document.get('background')
+        if background and background.get('opacity', 1) < 1:
+            notes.append({'layer': None, 'item': 'background.opacity', 'reason': 'the QGIS canvas colour is opaque'})
+        qgs = qgis.project(name, document.get('title') or document['id'], project_layers, layer_tree(project_layers, panels), crs, extent,
+                           notes, fonts, background=(background or {}).get('color'), themes=map_themes(project_layers, panels),
+                           bookmarks=bookmarks)
         qgis.write_styles(gpkg, style_rows)
         qgis.write_project(gpkg, name, qgs)
         unique, notes_out = set(), []
@@ -851,9 +932,13 @@ def pack(args):
         size = gpkg.stat().st_size + sum(f.stat().st_size for f in stage.glob('rasters/*'))
         if size > LARGE_BYTES:
             warnings.append(f'The package is {size / 2**20:.0f} MiB; --clip keeps less, or check what the map really needs')
-        fonts = _map_style.fonts_used(document)
-        if fonts:
-            warnings.append(f'The map uses the fonts {", ".join(f["family"] for f in fonts)}; QGIS substitutes another font where they are not installed')
+        font_rows = [row for row in _map_style.fonts_used(document) if row['used_by']]
+        if font_rows:
+            families = sorted({' '.join(filter(None, (row['family'], row['style']))) for row in font_rows})
+            warnings.append(f'The map uses the fonts {", ".join(families)}; QGIS substitutes another font where they are not installed')
+        producer_notes = document.get('notes') or []
+        if producer_notes:
+            warnings.append(f'The map-style producer reports {len(producer_notes)} thing(s) it could not express exactly (see producer_notes)')
         if any(entry['root'].startswith('@') for entry in packed.values()):
             warnings.append('Some data comes from external data roots (see datasets[].root); check its licence before sending the package')
         manifest = {
@@ -863,14 +948,18 @@ def pack(args):
             'scope': scope, 'margin': margin, 'extent': {'bbox': bbox, 'map_style_bbox': (document.get('extent') or {}).get('bbox')},
             'geopackage': {'file': gpkg.name, 'bytes': gpkg.stat().st_size, 'project': name,
                            'tables': sorted({e['table'] for e in packed.values() if e.get('storage') != 'geotiff'}
-                                            | {table for table, count, *_ in placements if count})},
+                                            | ({'map_labels'} if label_count else set()) | ({'map_label_leaders'} if leader_count else set()))},
             'project': {'name': name, 'crs': crs_label(crs), 'extent': [float(v) for v in extent] if extent else None,
                         'open': f'QGIS: Project > Open From > GeoPackage, or open {gpkg.name} in the Browser and double-click project {name}'},
             'datasets': [dataset_row(entry, scope) for entry in packed.values()],
             'layers': layer_rows,
+            'panels': [{'id': panel, 'shown': index == 0, 'bookmark': any(b[0] == panel for b in bookmarks)} for index, panel in enumerate(panels)],
+            'background': (background or {}).get('color'),
             'label_placements': {'labels': label_count, 'leaders': leader_count, 'table': 'map_labels' if label_count else None,
-                                 'leader_table': 'map_label_leaders' if leader_count else None},
-            'fonts': fonts,
+                                 'leader_table': 'map_label_leaders' if leader_count else None,
+                                 'text_styles': len(placed['styles']), 'leader_strokes': len(placed['strokes'])},
+            'fonts': font_rows,
+            'producer_notes': producer_notes,
             'not_packed': not_packed,
             'unsupported': notes_out,
             'bytes': size,

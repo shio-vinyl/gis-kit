@@ -1,6 +1,7 @@
 """A made-up map for package.py pack: a project with a gis-project.json, an external data root and a map-style.
 
-Everything is invented: open ocean near (10.05 E, 0.45 N), UTM zone 32N for the analysis data.
+Everything is invented: open ocean near (10.05 E, 0.45 N), UTM zone 32N for the analysis data. The map has a main
+panel and an inset panel (as a hero map does), a background colour, a tile layer and producer notes.
 """
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ import numpy as np
 from shapely.geometry import LineString, Point, box
 
 BBOX = [10.00, 0.40, 10.10, 0.50]
+INSET = [10.03, 0.43, 10.06, 0.46]
 
 
 def utm_box(lon0, lat0, lon1, lat1):
@@ -105,16 +107,36 @@ def build(root: Path, *, with_raster=True):
         layers.insert(1, {'id': 'height', 'group': 'ground', 'geometry': 'raster', 'data': {'path': 'inputs/analysis/height.tif'}, 'opacity': 0.6,
                           'renderer': {'type': 'pseudocolor', 'band': 1, 'interpolation': 'linear', 'stretch': {'method': 'minmax'},
                                        'stops': [{'value': 0, 'color': '#2C7BB6'}, {'value': 70, 'color': '#FFFFBF'}, {'value': 138, 'color': '#D7191C'}]}})
+    for layer in layers:
+        layer['panel'] = 'main'
+    layers.insert(0, {'id': 'tiles', 'panel': 'main', 'group': 'ground', 'geometry': 'raster',
+                      'data': {'path': '@basemap/tiles', 'kind': 'rasterTiles'}, 'renderer': {'type': 'rgb', 'bands': [1, 2, 3]}})
+    layers.append({'id': 'site-marks', 'panel': 'main', 'group': 'points', 'geometry': 'point', 'data': {'path': 'inputs/analysis/sites.geojson'},
+                   'renderer': {'type': 'single', 'symbol': {'marker': {'shape': 'x', 'size': 8, 'rotation': 10}, 'stroke': {'color': '#000000', 'width': 1}}}})
+    layers.append({'id': 'inset.parcels', 'panel': 'inset', 'group': 'fills', 'geometry': 'polygon',
+                   'data': {'path': 'inputs/analysis/parcels.gpkg', 'layer': 'parcels'},
+                   'renderer': {'type': 'single', 'symbol': {'fill': {'color': '#00AA00'}}}})
     document = {'contract': 'map-style', 'schema_version': 1, 'id': 'demo-map', 'title': 'Demo map',
                 'producer': {'engine': 'test', 'version': '0'}, 'units': {'size': 'px'}, 'dataRoot': 'project',
-                'extent': {'bbox': BBOX, 'print': {'widthCm': 10, 'heightCm': 10, 'dpi': 300}},
-                'fonts': [{'family': 'Demo Sans', 'file': 'assets/fonts/demo.ttf'}],
+                'background': {'color': '#B4D6E2'},
+                'extent': {'bbox': BBOX, 'panels': [{'id': 'main', 'bbox': BBOX}, {'id': 'inset', 'bbox': INSET}],
+                           'print': {'widthCm': 10, 'heightCm': 10, 'dpi': 300}},
+                # a theme alias whose installed font is Arial Bold (present wherever QGIS checks run on macOS)
+                'fonts': [{'family': 'Demo Sans', 'file': 'assets/fonts/demo.ttf',
+                           'names': {'family': 'Arial', 'subfamily': 'Bold', 'fullName': 'Arial Bold', 'postScriptName': 'Arial-BoldMT',
+                                     'localized': [{'language': 'zh-CN', 'family': 'Arial', 'fullName': 'Arial Bold'}]}}],
+                'notes': [{'kind': 'approximated', 'layer': 'roads', 'property': 'line-blur', 'reason': 'a made-up note'}],
                 'layers': layers,
                 'labelPlacements': [
                     {'layer': 'names', 'featureId': 1, 'text': 'Site 1', 'position': [10.021, 0.421], 'anchor': 'left',
-                     'style': {'font': 'Demo Sans', 'size': 13.4, 'color': '#333333', 'halo': {'color': '#FFFFFF', 'width': 2}}},
+                     'style': {'font': 'Demo Sans', 'size': 13.4, 'color': '#333333', 'opacity': 0.9, 'letterSpacing': 0.1,
+                               'halo': {'color': '#FFFFFF', 'width': 2, 'opacity': 0.78, 'blur': 0.6},
+                               'box': {'fill': {'color': '#FFFFCC'}, 'stroke': {'color': '#333333', 'width': 0.5}, 'padding': 2}}},
                     {'layer': 'names', 'text': 'Site 2\nsecond line', 'position': [10.07, 0.47], 'anchor': 'bottom-right', 'rotation': 15,
-                     'leader': [[10.05, 0.45], [10.07, 0.47]], 'style': {'size': 12, 'color': '#C00000'}}]}
+                     'leader': [[10.05, 0.45], [10.07, 0.47]], 'leaderStroke': {'color': '#0000FF', 'width': 1.5, 'dash': [3, 2]},
+                     'style': {'size': 12, 'color': '#C00000'}},
+                    {'layer': 'inset.parcels', 'text': 'Inset', 'position': [10.045, 0.445], 'leader': [[10.04, 0.44], [10.045, 0.445]],
+                     'style': {'font': 'Plain Alias', 'size': 10, 'color': '#000000'}}]}
     style = project / 'maps' / 'demo-map.map-style.json'
     style.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding='utf-8')
     return {'project': project, 'basemap': basemap, 'style': style, 'document': document}

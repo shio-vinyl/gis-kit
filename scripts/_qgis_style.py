@@ -27,7 +27,13 @@ DOCTYPE = "<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>"
 NAMESPACE = uuid.UUID('6f1b8d1c-4b0e-4a59-9a43-7d2b6c0e2f10')
 CAPS = {'butt': 'flat', 'round': 'round', 'square': 'square'}
 JOINS = {'miter': 'miter', 'round': 'round', 'bevel': 'bevel'}
-MARKERS = {'circle': 'circle', 'square': 'square', 'triangle': 'triangle', 'diamond': 'diamond', 'ring': 'circle'}
+# map-style marker shape -> (QGIS SimpleMarker name, extra clockwise rotation, drawn with lines only). QGIS's
+# arrowheads point right, map-style's arrow and chevron point up; cross and x are filled shapes when the symbol
+# has a fill and lines (the stroke) when it has none.
+MARKERS = {'circle': ('circle', 0, False), 'square': ('square', 0, False), 'triangle': ('triangle', 0, False),
+           'diamond': ('diamond', 0, False), 'ring': ('circle', 0, False), 'arrow': ('filled_arrowhead', -90, False),
+           'chevron': ('arrowhead', -90, True), 'cross': ('cross', 0, True), 'x': ('cross2', 0, True)}
+FILLED_CROSSES = {'cross': ('cross_fill', 0), 'x': ('cross_fill', 45)}
 SYMBOL_TYPES = {'polygon': 'fill', 'line': 'line', 'point': 'marker'}
 GEOMETRY_TYPES = {'point': ('Point', 0), 'line': ('Line', 1), 'polygon': ('Polygon', 2)}
 # QGIS label quadrants: where the text sits relative to the point. map-style anchors name the side of the text at the point.
@@ -129,7 +135,7 @@ def structured(spec):
     """
     if 'expression' in spec:
         if str(spec.get('dialect')).lower() != 'qgis':
-            raise Unusable(f'dialect {spec.get("dialect")!r} is not QGIS; treated as no filter: {spec["expression"]}')
+            raise Unusable(f'dialect {spec.get("dialect")!r} is not QGIS ({spec["expression"]})')
         return f'({spec["expression"]})'
     for joiner in ('all', 'any'):
         if joiner in spec:
@@ -152,17 +158,19 @@ def structured(spec):
     return f'({name} IS NOT NULL AND {name} {OPS[op]} {literal(value)})'
 
 
-def expression(spec, where, notes):
+def expression(spec, where, notes, rule=False):
     """A QGIS expression for a map-style filter, or None when it cannot be used (reported).
 
-    `dialect: "qgis"` is used as written; any other dialect makes the whole filter unusable, and it is reported.
+    `dialect: "qgis"` is used as written; any other dialect makes the whole filter unusable. As the contract says,
+    a layer filter then filters nothing, and a rule's filter skips the rule (it matches nothing).
     """
     if spec is None:
         return None
     try:
         text = structured(spec)
     except Unusable as error:
-        notes.append({**where, 'item': 'filter', 'reason': str(error)})
+        effect = 'the rule is skipped (it matches nothing)' if rule else 'treated as no filter'
+        notes.append({**where, 'item': 'filter', 'reason': f'{error}: {effect}'})
         return None
     return text[1:-1] if 'expression' in spec else text
 
@@ -215,14 +223,22 @@ def symbol(parent, spec, geometry, name, where, notes, size=None):
         if not marker:
             notes.append({**where, 'item': 'symbol.marker', 'reason': f'point symbol without a marker: drawn as a {DEFAULT_MARKER_PX} px circle'})
             marker = {'shape': 'circle', 'size': DEFAULT_MARKER_PX}
-        ring = marker['shape'] == 'ring'
-        outline = stroke or ({'color': fill['color'], 'width': 1, 'opacity': fill.get('opacity', 1)} if ring and fill else None)
-        values = {'name': MARKERS[marker['shape']], 'size': number(mm(marker['size'])), 'size_unit': 'MM', 'scale_method': 'diameter',
-                  'color': '0,0,0,0' if ring or not fill else color(fill['color'], fill.get('opacity', 1)),
+        shape = marker['shape']
+        qgis_name, turn, lines_only = MARKERS[shape]
+        if shape in FILLED_CROSSES and fill:
+            (qgis_name, turn), lines_only = FILLED_CROSSES[shape], False
+        ring = shape == 'ring'
+        outline = stroke
+        if outline is None and (ring or lines_only) and fill:  # a hollow or line-only shape takes the fill colour for its lines
+            width = 1 if ring else max(1.0, float(marker['size']) * (0.19 if shape == 'chevron' else 0.12))
+            outline = {'color': fill['color'], 'width': width, 'opacity': fill.get('opacity', 1)}
+        values = {'name': qgis_name, 'size': number(mm(marker['size'])), 'size_unit': 'MM', 'scale_method': 'diameter',
+                  'color': '0,0,0,0' if ring or lines_only or not fill else color(fill['color'], fill.get('opacity', 1)),
                   'outline_style': 'solid' if outline else 'no',
                   'outline_color': color(outline['color'], outline.get('opacity', 1)) if outline else '0,0,0,0',
                   'outline_width': number(mm(outline['width'])) if outline else '0', 'outline_width_unit': 'MM',
-                  'joinstyle': JOINS[(outline or {}).get('join', 'miter')], 'angle': '0', 'offset': '0,0', 'offset_unit': 'MM',
+                  'joinstyle': JOINS[(outline or {}).get('join', 'miter')], 'cap_style': CAPS[(outline or {}).get('cap', 'butt')],
+                  'angle': number((float(marker.get('rotation', 0)) + turn) % 360), 'offset': '0,0', 'offset_unit': 'MM',
                   'horizontal_anchor_point': '1', 'vertical_anchor_point': '1'}
         if outline and outline.get('dash'):
             notes.append({**where, 'item': 'symbol.stroke.dash', 'reason': 'dashed marker outlines are drawn solid'})
@@ -343,9 +359,9 @@ def write_rules(parent, symbols, rules, layer, notes, size_expr, counter):
         elif isinstance(rule['filter'], str):
             this = rule['filter']
         else:
-            this = expression(rule['filter'], {**where, 'rule': rule.get('label', index)}, notes)
-        # a filter QGIS cannot read counts as no filter (map-style contract): the rule takes every feature left,
-        # and expression() has reported it
+            this = expression(rule['filter'], {**where, 'rule': rule.get('label', index)}, notes, rule=True)
+            if this is None:
+                continue  # skipped, and reported by expression()
         parts = ([f'coalesce({this}, FALSE)'] if this else []) + [f'NOT coalesce({e}, FALSE)' for e in earlier]
         if this:
             earlier.append(this)
@@ -393,37 +409,54 @@ def template_expression(template):
     return parts[0] if len(parts) == 1 else 'concat(' + ', '.join(parts) + ')'
 
 
-def text_style(parent, style, field_name, is_expression):
-    attrs = {'fontFamily': style.get('font') or '', 'namedStyle': '', 'fontSize': number(mm(style['size'])), 'fontSizeUnit': 'MM',
-             'textColor': color(style['color']), 'textOpacity': 1, 'fieldName': field_name, 'isExpression': int(is_expression),
-             'fontWeight': 50, 'fontItalic': 0, 'fontKerning': 1, 'multilineHeight': 1, 'multilineHeightUnit': 'Percentage',
+def text_style(parent, style, field_name, is_expression, fonts, where, notes):
+    """<text-style>: the font is the installed family and style a theme alias resolves to (fonts: {alias: (family,
+    style)}); letter spacing in em becomes mm at the text size; halo blur is a blur effect on the buffer."""
+    alias = style.get('font') or ''
+    family, named = fonts.get(alias, (alias, ''))
+    size = mm(style['size'])
+    attrs = {'fontFamily': family, 'namedStyle': named, 'fontSize': number(size), 'fontSizeUnit': 'MM',
+             'textColor': color(style['color']), 'textOpacity': number(style.get('opacity', 1)), 'fieldName': field_name,
+             'isExpression': int(is_expression), 'fontLetterSpacing': number(float(style.get('letterSpacing', 0)) * size),
+             'fontWordSpacing': 0, 'fontWeight': 50, 'fontItalic': 0, 'fontKerning': 1, 'multilineHeight': 1, 'multilineHeightUnit': 'Percentage',
              'blendMode': 0, 'capitalization': 0, 'allowHtml': 0, 'textOrientation': 'horizontal', 'previewBkgrdColor': '255,255,255,255'}
     node = sub(parent, 'text-style', attrs)
     sub(node, 'families')
     halo = style.get('halo')
-    sub(node, 'text-buffer', {'bufferDraw': int(bool(halo)), 'bufferSize': number(mm(halo['width'])) if halo else '1',
-                              'bufferSizeUnits': 'MM', 'bufferColor': color(halo['color']) if halo else '255,255,255,255',
-                              'bufferOpacity': 1, 'bufferNoFill': 1, 'bufferJoinStyle': 128, 'bufferBlendMode': 0})
-    sub(node, 'background', {'shapeDraw': 0})
+    buffer = sub(node, 'text-buffer', {'bufferDraw': int(bool(halo)), 'bufferSize': number(mm(halo['width'])) if halo else '1',
+                                       'bufferSizeUnits': 'MM', 'bufferColor': color(halo['color']) if halo else '255,255,255,255',
+                                       'bufferOpacity': number(halo.get('opacity', 1)) if halo else 1, 'bufferNoFill': 1,
+                                       'bufferJoinStyle': 128, 'bufferBlendMode': 0})
+    if halo and halo.get('blur'):
+        effect = sub(buffer, 'effect', {'type': 'blur'})
+        options(effect, {'blend_mode': '0', 'blur_level': number(mm(halo['blur'])), 'blur_method': '0', 'blur_unit': 'MM',
+                         'draw_mode': '2', 'enabled': '1', 'opacity': '1'})
+    box = style.get('box')
+    if box:
+        fill, stroke = box.get('fill'), box.get('stroke')
+        padding = number(mm(box.get('padding', 0)))
+        sub(node, 'background', {'shapeDraw': 1, 'shapeType': 0, 'shapeSizeType': 0, 'shapeSizeX': padding, 'shapeSizeY': padding,
+                                 'shapeSizeUnit': 'MM', 'shapeOpacity': 1, 'shapeBlendMode': 0, 'shapeJoinStyle': 64,
+                                 'shapeFillColor': color(fill['color'], fill.get('opacity', 1)) if fill else '0,0,0,0',
+                                 'shapeBorderColor': color(stroke['color'], stroke.get('opacity', 1)) if stroke else '0,0,0,0',
+                                 'shapeBorderWidth': number(mm(stroke['width'])) if stroke else 0, 'shapeBorderWidthUnit': 'MM'})
+        if stroke and stroke.get('dash'):
+            notes.append({**where, 'item': 'text.box.stroke.dash', 'reason': 'a label box border is drawn solid'})
+    else:
+        sub(node, 'background', {'shapeDraw': 0})
     sub(node, 'shadow', {'shadowDraw': 0})
     properties(node, 'dd_properties')
     return node
 
 
-def labeling(spec, geometry, condition=None, rule_key=''):
-    """<labeling> for a layer's own labels (platform-placed): simple, or one rule when the layer has a filter."""
-    if condition is None:
-        node = ET.Element('labeling', {'type': 'simple'})
-        settings = sub(node, 'settings', {'calloutType': 'simple'})
-    else:
-        node = ET.Element('labeling', {'type': 'rule-based'})
-        rule = sub(sub(node, 'rules', {'key': key(rule_key, 'label-rules')}), 'rule', {'key': key(rule_key, 'label-rule'), 'filter': condition})
-        settings = sub(rule, 'settings', {'calloutType': 'simple'})
+def label_settings(parent, spec, geometry, fonts, where, notes):
+    """<settings> for a layer's own labels (platform-placed)."""
+    settings = sub(parent, 'settings', {'calloutType': 'simple'})
     if spec.get('template'):
         text, is_expression = template_expression(spec['template']), True
     else:
         text, is_expression = spec['field'], False
-    text_style(settings, spec['text'], text, is_expression)
+    text_style(settings, spec['text'], text, is_expression, fonts, where, notes)
     sub(settings, 'text-format', {'wrapChar': '', 'multilineAlign': 3, 'formatNumbers': 0, 'decimals': 3, 'plussign': 0})
     placement = spec.get('placement', 'auto')
     mode = {'point': {'auto': 0, 'point': 1}, 'line': {'auto': 2, 'line': 3}, 'polygon': {'auto': 1, 'polygon-center': 1}}[geometry].get(placement)
@@ -438,35 +471,53 @@ def labeling(spec, geometry, condition=None, rule_key=''):
                                 'scaleVisibility': 0, 'upsidedownLabels': 0, 'labelPerPart': 0, 'mergeLines': 0, 'zIndex': 0,
                                 'limitNumLabels': 0, 'maxNumLabels': 2000, 'fontLimitPixelSize': 0, 'minFeatureSize': 0})
     properties(settings, 'dd_properties')
+    return settings
+
+
+def labeling(spec, geometry, fonts, notes, condition=None, rule_key=''):
+    """<labeling> for a layer's own labels: simple, or one rule when the layer has a filter."""
+    where = {'layer': rule_key}
+    if condition is None:
+        node = ET.Element('labeling', {'type': 'simple'})
+        label_settings(node, spec, geometry, fonts, where, notes)
+    else:
+        node = ET.Element('labeling', {'type': 'rule-based'})
+        rule = sub(sub(node, 'rules', {'key': key(rule_key, 'label-rules')}), 'rule', {'key': key(rule_key, 'label-rule'), 'filter': condition})
+        label_settings(rule, spec, geometry, fonts, where, notes)
     return node
 
 
-def placement_labeling():
-    """Labels exactly where the map-style put them: text, font, size, colour, halo, anchor and rotation from fields."""
-    node = ET.Element('labeling', {'type': 'simple'})
-    settings = sub(node, 'settings', {'calloutType': 'simple'})
-    text_style(settings, {'font': '', 'size': 12, 'color': '#000000', 'halo': None}, 'text', False)
-    sub(settings, 'text-format', {'wrapChar': '', 'multilineAlign': 3, 'formatNumbers': 0, 'decimals': 3, 'plussign': 0})
-    sub(settings, 'placement', {'placement': 1, 'quadOffset': 4, 'dist': 0, 'distUnits': 'MM', 'offsetType': 0, 'xOffset': 0,
-                                'yOffset': 0, 'offsetUnits': 'MM', 'overlapHandling': 'AllowOverlapWithoutPenalty', 'allowDegraded': 1,
-                                'priority': 10, 'rotationAngle': 0, 'rotationUnit': 'AngleDegrees', 'preserveRotation': 1, 'placementFlags': 10})
-    sub(settings, 'rendering', {'drawLabels': 1, 'obstacle': 0, 'obstacleFactor': 1, 'obstacleType': 1, 'unplacedVisibility': 1,
-                                'scaleVisibility': 0, 'upsidedownLabels': 2, 'labelPerPart': 0, 'mergeLines': 0, 'zIndex': 0,
-                                'limitNumLabels': 0, 'maxNumLabels': 2000, 'fontLimitPixelSize': 0, 'minFeatureSize': 0})
-    properties(settings, 'dd_properties', {
-        'Family': ('field', 'font'), 'Size': ('field', 'size_mm'), 'Color': ('field', 'color'),
-        'BufferDraw': ('expression', '"halo_color" IS NOT NULL'), 'BufferSize': ('field', 'halo_mm'), 'BufferColor': ('field', 'halo_color'),
-        'OffsetQuad': ('field', 'quadrant'), 'LabelRotation': ('expression', 'coalesce("rotation", 0)')})
+def placement_labeling(styles, fonts, notes, name):
+    """Labels exactly where the map-style put them: one rule per distinct text style (field style_id), so font,
+    size, colours, halo, spacing and box are static settings; anchor (quadrant) and rotation come from fields.
+    They may overlap and always show, as in the PNG."""
+    node = ET.Element('labeling', {'type': 'rule-based'})
+    rules = sub(node, 'rules', {'key': key(name, 'placement-rules')})
+    for index, style in enumerate(styles, 1):
+        rule = sub(rules, 'rule', {'key': key(name, 'placement-rule', index), 'filter': f'"style_id" = {index}', 'description': f'style {index}'})
+        settings = sub(rule, 'settings', {'calloutType': 'simple'})
+        text_style(settings, style, 'text', False, fonts, {'layer': 'labelPlacements', 'style': index}, notes)
+        sub(settings, 'text-format', {'wrapChar': '', 'multilineAlign': 3, 'formatNumbers': 0, 'decimals': 3, 'plussign': 0})
+        sub(settings, 'placement', {'placement': 1, 'quadOffset': 4, 'dist': 0, 'distUnits': 'MM', 'offsetType': 0, 'xOffset': 0,
+                                    'yOffset': 0, 'offsetUnits': 'MM', 'overlapHandling': 'AllowOverlapWithoutPenalty', 'allowDegraded': 1,
+                                    'priority': 10, 'rotationAngle': 0, 'rotationUnit': 'AngleDegrees', 'preserveRotation': 1, 'placementFlags': 10})
+        sub(settings, 'rendering', {'drawLabels': 1, 'obstacle': 0, 'obstacleFactor': 1, 'obstacleType': 1, 'unplacedVisibility': 1,
+                                    'scaleVisibility': 0, 'upsidedownLabels': 2, 'labelPerPart': 0, 'mergeLines': 0, 'zIndex': 0,
+                                    'limitNumLabels': 0, 'maxNumLabels': 2000, 'fontLimitPixelSize': 0, 'minFeatureSize': 0})
+        properties(settings, 'dd_properties', {'OffsetQuad': ('field', 'quadrant'), 'LabelRotation': ('expression', 'coalesce("rotation", 0)')})
     return node
 
 
-def leader_symbol():
-    node = ET.Element('renderer-v2', {'type': 'singleSymbol', 'forceraster': 0, 'symbollevels': 0, 'referencescale': -1, 'enableorderby': 0})
-    symbols = sub(node, 'symbols')
-    holder = sub(symbols, 'symbol', {'type': 'line', 'name': '0', 'alpha': 1, 'clip_to_extent': 1, 'force_rhr': 0})
-    properties(holder, 'data_defined_properties')
-    symbol_layer(holder, 'SimpleLine', line_options({'color': '#000000', 'width': 1, 'cap': 'round', 'join': 'round'}), 'leader',
-                 {'outlineColor': ('field', 'color')})
+def leader_renderer(strokes, notes, name):
+    """Leader lines: one rule per distinct leader stroke (field stroke_id)."""
+    node = ET.Element('renderer-v2', {'type': 'RuleRenderer', 'forceraster': 0, 'symbollevels': 0, 'referencescale': -1, 'enableorderby': 0})
+    rules = sub(node, 'rules', {'key': key(name, 'leader-rules')})
+    symbols = ET.Element('symbols')
+    for index, stroke in enumerate(strokes, 1):
+        sub(rules, 'rule', {'key': key(name, 'leader-rule', index), 'filter': f'"stroke_id" = {index}', 'symbol': index - 1,
+                            'label': f'leader {index}'})
+        symbol(symbols, {'stroke': stroke}, 'line', str(index - 1), {'layer': 'labelPlacements', 'leader': index}, notes)
+    node.append(symbols)
     properties(node, 'data-defined-properties')
     return node
 
@@ -525,21 +576,22 @@ def raster_renderer(spec, stats, opacity, notes, layer):
 
 # --- layer styles --------------------------------------------------------------------------------------------------
 
-def style_elements(layer, notes, placement=None):
+def style_elements(layer, notes, fonts):
     """The style children shared by a QML document and a project <maplayer>, and the QGIS renderer type.
 
-    placement: 'labels' or 'leaders' for the two layers written from labelPlacements.
+    A layer written from labelPlacements carries `_placement` ('labels' or 'leaders') with its `_styles` or `_strokes`.
     """
     elements = []
     labels_enabled = False
+    placement = layer.get('_placement')
     if placement == 'labels':
         null = ET.Element('renderer-v2', {'type': 'nullSymbol'})
         properties(null, 'data-defined-properties')
-        elements += [null, placement_labeling()]
+        elements += [null, placement_labeling(layer['_styles'], fonts, notes, layer['id'])]
         kind, labels_enabled = 'nullSymbol', True
     elif placement == 'leaders':
-        elements.append(leader_symbol())
-        kind = 'singleSymbol'
+        elements.append(leader_renderer(layer['_strokes'], notes, layer['id']))
+        kind = 'RuleRenderer'
     else:
         # a layer filter becomes a parent rule around the renderer's classes (and around the labels), so the style
         # alone shows the same features in the project and when the table is added on its own
@@ -548,7 +600,7 @@ def style_elements(layer, notes, placement=None):
         elements.append(renderer)
         labels = layer.get('labels')
         if labels:
-            elements.append(labeling(labels, layer['geometry'], condition, layer['id']))
+            elements.append(labeling(labels, layer['geometry'], fonts, notes, condition, layer['id']))
             labels_enabled = labels.get('enabled', True)
         elif condition is not None and not layer.get('renderer'):
             notes.append({'layer': layer['id'], 'item': 'filter', 'reason': 'a layer that draws nothing and has no labels: the filter has no effect'})
@@ -558,9 +610,9 @@ def style_elements(layer, notes, placement=None):
     return elements, kind, labels_enabled
 
 
-def qml(layer, notes, placement=None):
+def qml(layer, notes, fonts):
     """A complete QML document for one vector layer, and the QGIS renderer type."""
-    elements, kind, labels_enabled = style_elements(layer, notes, placement)
+    elements, kind, labels_enabled = style_elements(layer, notes, fonts)
     root = ET.Element('qgis', {'version': QGIS_VERSION, 'styleCategories': 'AllStyleCategories', 'labelsEnabled': int(labels_enabled),
                                'hasScaleBasedVisibilityFlag': 0, 'minScale': 100000000, 'maxScale': 0, 'readOnly': 0})
     root.extend(elements)
@@ -585,12 +637,28 @@ def spatialrefsys(parent, crs):
     return node
 
 
-def project(name, title, layers, tree, crs, extent, notes):
+def tree_nodes(parent, nodes, by_id):
+    """Layer tree: nodes are ('group', name, checked, children) or ('layer', id), top first."""
+    for node in nodes:
+        if node[0] == 'group':
+            _, name, checked, children = node
+            group = sub(parent, 'layer-tree-group', {'name': name, 'checked': 'Qt::Checked' if checked else 'Qt::Unchecked', 'expanded': 1})
+            sub(sub(group, 'customproperties'), 'Option')
+            tree_nodes(group, children, by_id)
+        else:
+            row = by_id[node[1]]
+            sub(parent, 'layer-tree-layer', {'id': layer_id(row['id']), 'name': row['name'], 'source': row['source'], 'providerKey': row['provider'],
+                                             'checked': 'Qt::Unchecked' if row['layer'].get('visible') is False else 'Qt::Checked',
+                                             'expanded': 1})
+
+
+def project(name, title, layers, tree, crs, extent, notes, fonts, background=None, themes=(), bookmarks=()):
     """The .qgs XML.
 
-    layers: [{id, name, layer (map-style layer), source, provider, kind ('vector'|'raster'), crs, wkb, placement, raster}]
-    in drawing order, bottom first; tree: [(group name or None, [layer ids])] top first; extent: (xmin, ymin, xmax, ymax)
-    in crs.
+    layers: [{id, name, layer (map-style layer or a placement layer), source, provider, kind ('vector'|'raster'), crs,
+    wkb, raster}] in drawing order, bottom first; tree: tree_nodes() nodes, top first; extent: (xmin, ymin, xmax, ymax)
+    in crs; background: '#RRGGBB'; themes: [(name, visible layer ids, checked group paths)]; bookmarks: [(name,
+    (xmin, ymin, xmax, ymax) in crs)].
     """
     root = ET.Element('qgis', {'version': QGIS_VERSION, 'projectname': title or name, 'saveUser': 'gis-kit'})
     sub(root, 'homePath', {'path': ''})
@@ -599,14 +667,7 @@ def project(name, title, layers, tree, crs, extent, notes):
     ordered = list(reversed(layers))  # QGIS lists the top layer first
     group = sub(root, 'layer-tree-group')
     sub(sub(group, 'customproperties'), 'Option')
-    by_id = {row['id']: row for row in layers}
-    for name_, ids in tree:
-        parent = group if name_ is None else sub(group, 'layer-tree-group', {'name': name_, 'checked': 'Qt::Checked', 'expanded': 1})
-        for name_id in ids:
-            row = by_id[name_id]
-            sub(parent, 'layer-tree-layer', {'id': layer_id(row['id']), 'name': row['name'], 'source': row['source'], 'providerKey': row['provider'],
-                                             'checked': 'Qt::Unchecked' if row['layer'].get('visible') is False else 'Qt::Checked',
-                                             'expanded': 1})
+    tree_nodes(group, tree, {row['id']: row for row in layers})
     order = sub(group, 'custom-order', {'enabled': 1})
     for row in ordered:
         sub(order, 'item', text=layer_id(row['id']))
@@ -635,7 +696,7 @@ def project(name, title, layers, tree, crs, extent, notes):
             node.append(raster_renderer(layer['renderer'], row.get('raster', {}).get('stats', {}), layer.get('opacity', 1), notes, layer['id']))
             sub(node, 'blendMode', text=0)
         else:
-            elements, _, labels_enabled = style_elements(layer, [], row.get('placement'))  # notes were collected by qml()
+            elements, _, labels_enabled = style_elements(layer, [], fonts)  # notes were collected by qml()
             node.set('labelsEnabled', int(labels_enabled))
             node.extend(elements)
     legacy = sub(root, 'layerorder')
@@ -645,6 +706,23 @@ def project(name, title, layers, tree, crs, extent, notes):
     sub(sub(props, 'Paths'), 'Absolute', {'type': 'bool'}, 'false')
     if crs is not None:  # QGIS reads <projectCrs> only when projections are enabled
         sub(sub(props, 'SpatialRefSys'), 'ProjectionsEnabled', {'type': 'int'}, 1)
+    if background:
+        gui = sub(props, 'Gui')
+        for part, value in zip(('Red', 'Green', 'Blue'), color(background).split(',')[:3]):
+            sub(gui, f'CanvasColor{part}Part', {'type': 'int'}, value)
+    presets = sub(root, 'visibility-presets')
+    for theme, visible, checked in themes:
+        preset = sub(presets, 'visibility-preset', {'name': theme, 'has-checked-group-info': 1, 'has-expanded-info': 0})
+        for row in ordered:
+            sub(preset, 'layer', {'id': layer_id(row['id']), 'visible': int(row['id'] in visible), 'style': 'default', 'expanded': 1})
+        nodes = sub(preset, 'checked-group-nodes')
+        for path in checked:
+            sub(nodes, 'checked-group-node', {'id': path})
+    marks = sub(root, 'Bookmarks')
+    for mark, (xmin, ymin, xmax, ymax) in bookmarks:
+        node = sub(marks, 'Bookmark', {'id': key(name, 'bookmark', mark), 'name': mark, 'group': '', 'rotation': 0,
+                                       'extent': f'Polygon (({xmin!r} {ymin!r}, {xmax!r} {ymin!r}, {xmax!r} {ymax!r}, {xmin!r} {ymax!r}, {xmin!r} {ymin!r}))'})
+        spatialrefsys(node, crs)
     settings = sub(root, 'ProjectViewSettings', {'UseProjectScales': 0, 'rotation': 0})
     sub(settings, 'Scales')
     view = sub(settings, 'DefaultViewExtent', dict(zip(('xmin', 'ymin', 'xmax', 'ymax'), map(repr, map(float, extent)))))

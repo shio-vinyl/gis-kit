@@ -17,6 +17,7 @@ PROJECT_FILE = 'gis-project.json'
 ROOT_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')
 ROOT_REFERENCE = re.compile(r'^@([A-Za-z0-9][A-Za-z0-9_-]*)/(.*)$')
 GEOMETRIES = {'polygon', 'line', 'point', 'raster'}
+DATA_KINDS = {'vector', 'raster', 'vectorTiles', 'rasterTiles'}
 VECTOR_RENDERERS = {'single', 'categorized', 'graduated', 'rule'}
 RASTER_RENDERERS = {'pseudocolor', 'palette', 'rgb'}
 COMPARISONS = {'==', '!=', '<', '<=', '>', '>='}
@@ -46,6 +47,7 @@ def load(path):
     if not isinstance(layers, list) or not layers:
         raise ValueError(f'{path.name}: layers must be a non-empty list')
     seen = set()
+    panels = {p.get('id') for p in (document.get('extent') or {}).get('panels') or [] if isinstance(p, dict)}
     for index, layer in enumerate(layers):
         where = f'{path.name}: layers[{index}]'
         if not isinstance(layer, dict) or not layer.get('id'):
@@ -58,6 +60,10 @@ def load(path):
         if not isinstance(layer.get('data'), dict) or not layer['data'].get('path'):
             raise ValueError(f'{where} ({layer["id"]}): data.path is required')
         check_reference(layer['data']['path'], f'{where} ({layer["id"]})')
+        if layer['data'].get('kind') is not None and layer['data']['kind'] not in DATA_KINDS:
+            raise ValueError(f'{where} ({layer["id"]}): data.kind must be one of {", ".join(sorted(DATA_KINDS))}')
+        if layer.get('panel') is not None and panels and layer['panel'] not in panels:
+            raise ValueError(f'{where} ({layer["id"]}): panel {layer["panel"]!r} is not one of extent.panels ({", ".join(sorted(panels))})')
         if 'renderer' not in layer:
             raise ValueError(f'{where} ({layer["id"]}): renderer is required (null for a label-only layer)')
         renderer = layer['renderer']
@@ -224,8 +230,22 @@ def check_filter(spec, where):
         raise ValueError(f'{where}: "{op}" needs a string, number or boolean value')
 
 
+def font_names(document):
+    """{name used in a text style: (family, style)} from fonts[]: a theme alias resolves through its entry's `names`
+    (the installed family and its subfamily). An alias with several entries (weights) takes the first; one
+    without `names` stays as written and is reported by fonts_used."""
+    resolved = {}
+    for entry in document.get('fonts') or []:
+        if not isinstance(entry, dict) or not entry.get('family') or entry['family'] in resolved:
+            continue
+        names = entry.get('names') or {}
+        if names.get('family'):
+            resolved[entry['family']] = (names['family'], names.get('subfamily') or '')
+    return resolved
+
+
 def fonts_used(document):
-    """Font families named by layer labels, label placements and fonts[], with who uses each."""
+    """Fonts named by layer labels, label placements and fonts[]: who uses each, and the installed name QGIS is given."""
     used = {}
     for layer in document['layers']:
         font = ((layer.get('labels') or {}).get('text') or {}).get('font')
@@ -235,16 +255,30 @@ def fonts_used(document):
         font = (placement.get('style') or {}).get('font')
         if font:
             used.setdefault(font, set()).add('labelPlacements')
-    declared = {f.get('family'): f for f in document.get('fonts') or [] if isinstance(f, dict) and f.get('family')}
+    entries = {}
+    for entry in document.get('fonts') or []:
+        if isinstance(entry, dict) and entry.get('family'):
+            entries.setdefault(entry['family'], []).append(entry)
+    resolved = font_names(document)
     rows = []
-    for family in sorted(set(used) | set(declared)):
-        entry = declared.get(family, {})
-        row = {'family': family, 'used_by': sorted(used.get(family, []))}
+    for alias in sorted(set(used) | set(entries)):
+        entry = (entries.get(alias) or [{}])[0]
+        names = entry.get('names') or {}
+        row = {'name': alias, 'used_by': sorted(used.get(alias, []))}
+        if alias in resolved:
+            row['family'], row['style'] = resolved[alias]
+            localized = [n['family'] for n in names.get('localized') or [] if n.get('family')]
+            if localized:
+                row['localized_family'] = localized
+            if names.get('postScriptName'):
+                row['postScriptName'] = names['postScriptName']
+        else:
+            row['family'], row['style'] = alias, ''
+            row['unresolved'] = True
+        if len(entries.get(alias, [])) > 1:
+            row['entries'] = len(entries[alias])
         for key in ('file', 'sha256'):
             if entry.get(key):
                 row[key] = entry[key]
-        names = entry.get('names') or {}
-        if names.get('postScriptName'):
-            row['postScriptName'] = names['postScriptName']
         rows.append(row)
     return rows

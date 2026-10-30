@@ -109,10 +109,10 @@ def test_one_table_per_dataset_and_one_style_per_layer(packs):
     tables = {row[0] for row in pyogrio.list_layers(gpkg)}
     assert {'land', 'parcels', 'roads', 'sites', 'map_labels', 'map_label_leaders'} <= tables
     parcels = next(d for d in manifest['datasets'] if d['table'] == 'parcels')
-    assert parcels['layers'] == ['parcels', 'far', 'parcels-outline']
+    assert parcels['layers'] == ['parcels', 'far', 'parcels-outline', 'inset.parcels']
     found = styles(gpkg)
     assert {name: (s['table'], s['default']) for name, s in found.items() if s['table'] == 'parcels'} == {
-        'parcels': ('parcels', True), 'far': ('parcels', False), 'parcels-outline': ('parcels', False)}
+        'parcels': ('parcels', True), 'far': ('parcels', False), 'parcels-outline': ('parcels', False), 'inset.parcels': ('parcels', False)}
     defaults = [s['table'] for s in found.values() if s['default']]
     assert len(defaults) == len(set(defaults))  # exactly one default style per table
 
@@ -141,10 +141,9 @@ def test_renderers_in_qml(packs):
     assert outline.get('labelsEnabled') == '0' and outline.find('labeling').get('type') == 'simple'  # enabled: false
     roads = found['roads']['qml']
     rules = roads.findall('renderer-v2/rules/rule')
-    assert [r.get('label') for r in rules] == ['主干', '次干', '长路', '其他方言']
+    assert [r.get('label') for r in rules] == ['主干', '次干', '长路']  # the rule in an unknown dialect is skipped, not a catch-all
     assert rules[1].get('filter') == ('coalesce(("等级" IN (\'主干\', \'次干\')), FALSE) AND NOT coalesce(("等级" IS NOT NULL AND "等级" = \'主干\'), FALSE)')
     assert rules[2].get('filter').startswith('coalesce(length($geometry) > 100, FALSE) AND NOT')  # dialect qgis used as written
-    assert 'len(name)' not in rules[3].get('filter')  # unknown dialect = no filter, reported
     assert roads.get('labelsEnabled') == '1'
     assert roads.find('labeling/settings/text-style').get('fieldName') == 'concat("name", \'（\', "等级", \'）\')'
     sites = found['sites']['qml']
@@ -153,6 +152,10 @@ def test_renderers_in_qml(packs):
     assert size == '2 * 0.26458333333333334 * (3 + 7 * max(0, min(1, (sqrt("规模") - 0) / 4)))'
     assert sites.find('renderer-v2').get('enableorderby') == '1' and sites.find('renderer-v2/orderby/orderByClause').get('asc') == '0'
     assert found['names']['qml'].find('renderer-v2').get('type') == 'nullSymbol'
+    names = found['names']['qml'].find('labeling/settings/text-style')  # the theme alias resolved through fonts[].names
+    assert (names.get('fontFamily'), names.get('namedStyle')) == ('Arial', 'Bold')
+    marks = {o.get('name'): o.get('value') for o in found['site-marks']['qml'].find(".//layer[@class='SimpleMarker']/Option")}
+    assert (marks['name'], marks['angle'], marks['color'], marks['outline_color']) == ('cross2', '10', '0,0,0,0', '0,0,0,255')
     assert found['ground']['qml'].find('renderer-v2').get('type') == 'singleSymbol'
 
 
@@ -160,18 +163,39 @@ def test_label_placements_become_a_point_layer_with_leaders(packs):
     out, manifest = packs[1], packs[2]['extent']
     gpkg = out['extent'] / 'demo-map.gpkg'
     labels = gpd.read_file(gpkg, layer='map_labels')
-    assert labels.crs.to_epsg() == 4326 and list(labels['text']) == ['Site 1', 'Site 2\nsecond line']
-    assert list(labels['quadrant']) == [5, 0]  # anchor left -> text to the right; bottom-right -> above left
+    assert labels.crs.to_epsg() == 4326 and list(labels['text']) == ['Site 1', 'Site 2\nsecond line', 'Inset']
+    assert list(labels['quadrant']) == [5, 0, 4]  # anchor left -> text to the right; bottom-right -> above left; center
+    assert list(labels['panel']) == ['main', 'main', 'inset'] and list(labels['style_id']) == [1, 2, 3]
     assert labels['size_mm'][0] == pytest.approx(13.4 * 25.4 / 96) and labels['halo_color'][0] == '#FFFFFF'
-    assert labels['halo_color'].isna()[1] and labels['rotation'][1] == 15 and labels['font'][0] == 'Demo Sans'
+    assert (labels['font'][0], labels['font_style'][0], labels['font_name'][0]) == ('Arial', 'Bold', 'Demo Sans')
+    assert labels['halo_color'].isna()[1] and labels['rotation'][1] == 15 and labels['font'][2] == 'Plain Alias'
     assert labels.geometry[0].coords[0] == (10.021, 0.421)
     leaders = gpd.read_file(gpkg, layer='map_label_leaders')
-    assert len(leaders) == 1 and leaders['label_id'][0] == 2 and list(leaders.geometry[0].coords) == [(10.05, 0.45), (10.07, 0.47)]
+    assert list(leaders['label_id']) == [2, 3] and list(leaders['stroke_id']) == [1, 2]
+    assert list(leaders.geometry[0].coords) == [(10.05, 0.45), (10.07, 0.47)]
     style = styles(gpkg)['map_labels']['qml']
     assert style.get('labelsEnabled') == '1' and style.find('renderer-v2').get('type') == 'nullSymbol'
-    defined = {o.get('name') for o in style.find('labeling/settings/dd_properties/Option/Option[@name="properties"]')}
-    assert defined == {'Family', 'Size', 'Color', 'BufferDraw', 'BufferSize', 'BufferColor', 'OffsetQuad', 'LabelRotation'}
-    assert manifest['label_placements'] == {'labels': 2, 'leaders': 1, 'table': 'map_labels', 'leader_table': 'map_label_leaders'}
+    rules = style.findall('labeling/rules/rule')  # one rule per distinct text style, static settings
+    assert [r.get('filter') for r in rules] == ['"style_id" = 1', '"style_id" = 2', '"style_id" = 3']
+    first = rules[0].find('settings/text-style')
+    size = 13.4 * 25.4 / 96
+    assert (first.get('fontFamily'), first.get('namedStyle'), first.get('textOpacity')) == ('Arial', 'Bold', '0.9')
+    assert float(first.get('fontLetterSpacing')) == pytest.approx(0.1 * size)
+    buffer = first.find('text-buffer')
+    assert buffer.get('bufferOpacity') == '0.78'
+    blur = {o.get('name'): o.get('value') for o in buffer.find('effect').iter('Option')}
+    assert float(blur['blur_level']) == pytest.approx(0.6 * 25.4 / 96) and blur['blur_unit'] == 'MM'
+    box = first.find('background')
+    assert (box.get('shapeDraw'), box.get('shapeFillColor'), box.get('shapeBorderColor')) == ('1', '255,255,204,255', '51,51,51,255')
+    assert float(box.get('shapeSizeX')) == pytest.approx(2 * 25.4 / 96) and float(box.get('shapeBorderWidth')) == pytest.approx(0.5 * 25.4 / 96)
+    defined = {o.get('name') for o in rules[0].find('settings/dd_properties/Option/Option[@name="properties"]')}
+    assert defined == {'OffsetQuad', 'LabelRotation'}
+    leader_style = styles(gpkg)['map_label_leaders']['qml']
+    lines = [{o.get('name'): o.get('value') for o in layer.iter('Option')} for layer in leader_style.iter('layer')]
+    assert (lines[0]['line_color'], lines[0]['use_custom_dash']) == ('0,0,255,255', '1')  # leaderStroke
+    assert (lines[1]['line_color'], lines[1]['line_width']) == ('0,0,0,255', qgis.number(25.4 / 96))  # text colour, 1 px
+    assert manifest['label_placements'] == {'labels': 3, 'leaders': 2, 'table': 'map_labels', 'leader_table': 'map_label_leaders',
+                                            'text_styles': 3, 'leader_strokes': 2}
 
 
 def test_embedded_project(packs):
@@ -181,11 +205,21 @@ def test_embedded_project(packs):
     assert project.find('projectCrs/spatialrefsys/authid').text == 'EPSG:32632' == manifest['project']['crs']
     assert project.find('properties/SpatialRefSys/ProjectionsEnabled').text == '1'
     order = [item.text.rsplit('_', 5)[0] for item in project.findall('layer-tree-group/custom-order/item')]
-    assert order == ['map_labels', 'map_label_leaders', 'names', 'sites', 'roads', 'parcels_outline', 'far', 'parcels', 'cover', 'height', 'ground']
-    groups = [g.get('name') for g in project.findall('layer-tree-group/layer-tree-group')]
-    assert groups == ['labels', 'points', 'lines', 'fills', 'ground']
+    assert order == ['map_labels_inset', 'map_labels_main', 'map_label_leaders_inset', 'map_label_leaders_main', 'inset_parcels', 'site_marks',
+                     'names', 'sites', 'roads', 'parcels_outline', 'far', 'parcels', 'cover', 'height', 'ground']
+    panels = project.findall('layer-tree-group/layer-tree-group')  # a group per panel first, then the map-style groups
+    assert [(g.get('name'), g.get('checked')) for g in panels] == [('main', 'Qt::Checked'), ('inset', 'Qt::Unchecked')]
+    assert [g.get('name') for g in panels[0].findall('layer-tree-group')] == ['labels', 'points', 'lines', 'fills', 'ground']
+    assert [g.get('name') for g in panels[1].findall('layer-tree-group')] == ['labels', 'fills']
     unchecked = {l.get('name') for l in project.iter('layer-tree-layer') if l.get('checked') == 'Qt::Unchecked'}
     assert unchecked == {'容积率', 'cover'}
+    themes = {t.get('name'): t for t in project.findall('visibility-presets/visibility-preset')}
+    assert set(themes) == {'main', 'inset'}
+    assert [n.get('id') for n in themes['inset'].iter('checked-group-node')] == ['inset', 'inset/fills', 'inset/labels']
+    assert [b.get('name') for b in project.iter('Bookmark')] == ['main', 'inset']
+    assert [project.find(f'properties/Gui/CanvasColor{c}Part').text for c in ('Red', 'Green', 'Blue')] == ['180', '214', '226']
+    sources = {l.find('id').text.rsplit('_', 5)[0]: l.find('datasource').text for l in project.iter('maplayer')}
+    assert sources['map_labels_inset'] == './demo-map.gpkg|layername=map_labels|subset="panel" = \'inset\''
     sources = {l.find('layername').text: l.find('datasource').text for l in project.iter('maplayer')}
     assert sources['用地分类'] == './demo-map.gpkg|layername=parcels' and sources['height'] == 'GPKG:./demo-map.gpkg:height'
     assert sources['cover'] == './rasters/cover.tif'
@@ -202,10 +236,16 @@ def test_embedded_project(packs):
 def test_manifest_reports_unsupported_fonts_and_external_data(packs):
     manifest = packs[2]['extent']
     reasons = {(n['layer'], n['item']) for n in manifest['unsupported']}
-    assert ('roads', 'filter') in reasons and ('height', 'renderer.stretch') in reasons
-    assert any('arcade' in n['reason'] for n in manifest['unsupported'])
-    assert manifest['fonts'][0]['family'] == 'Demo Sans' and 'labelPlacements' in manifest['fonts'][0]['used_by']
-    assert any('fonts Demo Sans' in w for w in manifest['warnings'])
+    assert ('roads', 'filter') in reasons and ('height', 'renderer.stretch') in reasons and ('labelPlacements', 'font') in reasons
+    assert any('arcade' in n['reason'] and 'skipped' in n['reason'] for n in manifest['unsupported'])
+    fonts = {row['name']: row for row in manifest['fonts']}
+    assert (fonts['Demo Sans']['family'], fonts['Demo Sans']['style']) == ('Arial', 'Bold') and 'labelPlacements' in fonts['Demo Sans']['used_by']
+    assert fonts['Plain Alias']['unresolved']
+    assert any('fonts Arial Bold, Plain Alias' in w for w in manifest['warnings'])
+    assert manifest['not_packed'] == [{'ref': '@basemap/tiles', 'layers': ['tiles'], 'reason': 'rasterTiles: tiles are not packed'}]
+    assert manifest['producer_notes'][0]['reason'] == 'a made-up note' and any('producer reports 1' in w for w in manifest['warnings'])
+    assert manifest['background'] == '#B4D6E2'
+    assert manifest['panels'] == [{'id': 'main', 'shown': True, 'bookmark': True}, {'id': 'inset', 'shown': False, 'bookmark': True}]
     assert any('external data roots' in w for w in manifest['warnings'])
     assert any('rasters/cover.tif' in w for w in manifest['warnings'])
     layers = {l['id']: l for l in manifest['layers']}
@@ -226,13 +266,29 @@ def test_filters_and_class_edges():
     assert notes and notes[0]['layer'] == 'l'
     layer = {'id': 'g', 'geometry': 'polygon', 'renderer': {'type': 'graduated', 'field': 'v', 'classes': [
         {'range': [0, 1], 'symbol': {'fill': {'color': '#000000'}}}, {'range': [1, 2], 'symbol': {'fill': {'color': '#FFFFFF'}}}]}}
-    text, kind = qgis.qml(layer, [])
+    text, kind = qgis.qml(layer, [], {})
     ranges = ET.fromstring(text.split('\n', 1)[1]).findall('renderer-v2/ranges/range')
     assert kind == 'graduatedSymbol'
     assert float(ranges[0].get('upper')) < 1.0 == float(ranges[1].get('lower'))  # a value of exactly 1 falls in the upper class
     assert float(ranges[1].get('upper')) == 2.0  # the last class includes its high
     with pytest.raises(ValueError):
         _map_style.check_filter({'field': 'a', 'op': 'in', 'value': 1}, 'here')
+
+
+def test_marker_shapes():
+    def marker(spec):
+        layer = {'id': 'm', 'geometry': 'point', 'renderer': {'type': 'single', 'symbol': spec}}
+        text, _ = qgis.qml(layer, notes, {})
+        found = ET.fromstring(text.split('\n', 1)[1]).find(".//layer[@class='SimpleMarker']")
+        values = {o.get('name'): o.get('value') for o in found.find('Option')}
+        return values['name'], values['angle'], values['color']
+    notes = []
+    assert marker({'marker': {'shape': 'arrow', 'size': 8}, 'fill': {'color': '#FF0000'}}) == ('filled_arrowhead', '270', '255,0,0,255')
+    assert marker({'marker': {'shape': 'chevron', 'size': 8, 'rotation': 90}, 'fill': {'color': '#FF0000'}}) == ('arrowhead', '0', '0,0,0,0')
+    assert marker({'marker': {'shape': 'cross', 'size': 8}, 'fill': {'color': '#FF0000'}}) == ('cross_fill', '0', '255,0,0,255')
+    assert marker({'marker': {'shape': 'x', 'size': 8}, 'fill': {'color': '#FF0000'}}) == ('cross_fill', '45', '255,0,0,255')
+    assert marker({'marker': {'shape': 'cross', 'size': 8}, 'stroke': {'color': '#000000', 'width': 1}}) == ('cross', '0', '0,0,0,0')
+    assert marker({'fill': {'color': '#FF0000'}})[0] == 'circle' and notes[-1]['item'] == 'symbol.marker'
 
 
 def test_errors_are_clear(tmp_path):
@@ -270,18 +326,18 @@ def test_errors_are_clear(tmp_path):
 
 def test_unreadable_data_is_listed_not_packed(tmp_path):
     fixture = pack_fixture.build(tmp_path / 'data', with_raster=False)
-    tiles = fixture['basemap'] / 'tiles'
+    tiles = fixture['basemap'] / 'folder'  # tiles without data.kind: GDAL cannot read the folder
     (tiles / '12').mkdir(parents=True)
     (tiles / '12' / '0.png').write_bytes(b'\x89PNG\r\n\x1a\n')
     document = json.loads(fixture['style'].read_text())
     document['dataRoot'] = 'file'
-    document['layers'].insert(0, {'id': 'tiles', 'geometry': 'polygon', 'data': {'path': '@basemap/tiles'},
+    document['layers'].insert(0, {'id': 'tile-folder', 'geometry': 'polygon', 'data': {'path': '@basemap/folder'},
                                   'renderer': {'type': 'single', 'symbol': {'fill': {'color': '#000000'}}}})
     style = fixture['project'] / 'tiles.map-style.json'  # dataRoot "file": paths relative to this file, here the project root
     style.write_text(json.dumps(document))
     manifest = run({**fixture, 'style': style}, tmp_path / 'out')
-    assert [row['ref'] for row in manifest['not_packed']] == ['@basemap/tiles'] and manifest['not_packed'][0]['layers'] == ['tiles']
-    assert 'tiles' not in {l['id'] for l in manifest['layers']}
+    assert {row['ref']: row['layers'] for row in manifest['not_packed']} == {'@basemap/tiles': ['tiles'], '@basemap/folder': ['tile-folder']}
+    assert not {'tiles', 'tile-folder'} & {l['id'] for l in manifest['layers']}
 
 
 @pytest.mark.skipif(QGIS_PYTHON is None, reason='QGIS not installed (set GIS_KIT_QGIS_PYTHON to its Python)')
@@ -300,20 +356,30 @@ def test_qgis_opens_the_package(packs, tmp_path):
     assert result.returncode == 0, result.stderr[-2000:]
     report = json.loads(result.stdout)
     assert report['read'] and report['crs'] == 'EPSG:32632' and report['title'] == 'Demo map'
-    layers = {row['name']: row for row in report['layers'].values()}
-    assert all(row['valid'] for row in layers.values()) and len(layers) == 11
+    by_id = {lid.rsplit('_', 5)[0]: row for lid, row in report['layers'].items()}
+    layers = {row['name']: row for lid, row in report['layers'].items() if 'map_label' not in lid}
+    assert all(row['valid'] for row in report['layers'].values()) and len(by_id) == 15
     assert layers['用地分类']['renderer'] == 'categorizedSymbol'
     assert [(c['value'], c['color'], c['render']) for c in layers['用地分类']['classes']] == [
         ('A 类', '#ed7d31', True), ('B 类', '#4f81bd', True), ('C 类', '#9bbb59', False), ('', '#bbbbbb', True)]
     assert layers['容积率']['renderer'] == 'RuleRenderer' and layers['容积率']['opacity'] == pytest.approx(0.7)
     assert [r['color'] for r in layers['容积率']['rules'][0]['children']] == ['#fff5eb', '#fd8d3c', '#a63603']
-    assert layers['roads']['labels'] and not layers['parcels-outline']['labels'] and layers['labels (placed)']['labels']
+    assert layers['roads']['labels'] and not layers['parcels-outline']['labels'] and by_id['map_labels_main']['labels']
     assert layers['height']['renderer'] == 'singlebandpseudocolor' and layers['cover']['renderer'] == 'paletted'
     assert layers['sites']['size_expression'].startswith('2 * 0.26458333333333334')
     order = [lid.rsplit('_', 5)[0] for lid in report['drawing_order_top_first']]
-    assert order == ['map_labels', 'map_label_leaders', 'names', 'sites', 'roads', 'parcels_outline', 'far', 'parcels', 'cover', 'height', 'ground']
+    assert order == ['map_labels_inset', 'map_labels_main', 'map_label_leaders_inset', 'map_label_leaders_main', 'inset_parcels', 'site_marks',
+                     'names', 'sites', 'roads', 'parcels_outline', 'far', 'parcels', 'cover', 'height', 'ground']
+    assert [t['group'] for t in report['tree']] == ['main', 'inset']
+    assert not report['checked'][next(l for l in report['checked'] if l.startswith('inset_parcels'))]  # the inset panel is hidden
+    assert report['background'] == '#b4d6e2' and report['bookmarks'] == ['main', 'inset']
+    assert sorted(lid.rsplit('_', 5)[0] for lid in report['themes']['inset']) == ['inset_parcels', 'map_label_leaders_inset', 'map_labels_inset']
+    assert by_id['map_labels_inset']['subset'] == '"panel" = \'inset\'' and by_id['map_labels_inset']['features'] == 1
+    first = by_id['map_labels_main']['label_settings'][0]
+    assert (first['family'], first['style'], first['installed'], first['background']) == ('Arial', 'Bold', True, True)
+    assert (layers['names']['label_settings'][0]['family'], layers['names']['label_settings'][0]['style']) == ('Arial', 'Bold')
     alone = report['tables_alone']
-    assert alone['parcels']['renderer'] == 'categorizedSymbol' and alone['parcels']['styles'] == ['far', 'parcels', 'parcels-outline']
+    assert alone['parcels']['renderer'] == 'categorizedSymbol' and alone['parcels']['styles'] == ['far', 'inset.parcels', 'parcels', 'parcels-outline']
     assert alone['map_labels']['renderer'] == 'nullSymbol' and alone['map_labels']['labels']
     colors = [s['color'] for s in report['samples']]
     assert colors[:4] == ['#bbbbbb', '#ed7d31', '#4f81bd', '#4f81bd']  # default class, A, B, B: as the map-style says
