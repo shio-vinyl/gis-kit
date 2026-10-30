@@ -3,8 +3,9 @@
 
 `package.py unpack` lists the archive (7z through bsdtar or 7-Zip, or zip) and refuses absolute paths, '..',
 links and archives larger than --max-bytes before extracting anything; it then checks the extracted sizes against
-the listing. It reads the package information (esriinfo), writes a describe card for every dataset under
-commondata/ (shapefiles, file geodatabases, rasters), and matches each layer file to its data: .lyrx (ArcGIS Pro)
+the listing. It reads the package information (esriinfo), writes a describe card for every dataset (shapefiles,
+file geodatabases, rasters) under commondata/ or in a layer version folder (v10/, v107/ ..., one copy of a dataset
+repeated there), and matches each layer file to its data: .lyrx (ArcGIS Pro)
 is JSON and its renderer fields, label expression and definition query are read; .lyr (ArcMap) is a binary
 format, so only its data-source path and the names it mentions are picked out. Layers whose data is not in the
 package (packaged by reference, or enterprise data left out) are reported. Symbology is not reproduced.
@@ -161,28 +162,72 @@ def xml_fields(path, names):
     return values
 
 
-def datasets(root):
-    """Data under commondata/: shapefiles, file geodatabases and rasters, with describe cards."""
+def dataset_kind(item):
+    suffix = item.suffix.lower()
+    return ('filegdb' if item.is_dir() and suffix == '.gdb'
+            else 'shapefile' if item.is_file() and suffix == '.shp'
+            else 'raster' if item.is_file() and suffix in RASTER_SUFFIXES else None)
+
+
+def dataset_key(path, versions):
+    """A dataset's path as layer files name it: relative to commondata/, or to its layer version folder."""
+    posix = PurePosixPath(path)
+    if posix.parts[0] == 'commondata':
+        return str(posix.relative_to('commondata'))
+    folder = next((v for v in versions if PurePosixPath(v) in posix.parents), None)
+    return str(posix.relative_to(folder)) if folder else path
+
+
+def fingerprint(item):
+    """Names, sizes and digests of a dataset's files (a geodatabase folder, or a shapefile and its sidecars)."""
+    files = (sorted(p for p in item.rglob('*') if p.is_file()) if item.is_dir()
+             else sorted(p for p in item.parent.iterdir() if p.is_file() and (p == item or p.name.startswith(item.stem + '.'))))
+    return [(str(p.relative_to(item if item.is_dir() else item.parent)), p.stat().st_size, digest(p)) for p in files]
+
+
+def datasets(root, versions=()):
+    """Shapefiles, file geodatabases and rasters, with describe cards, and warnings about repeated copies.
+
+    Data sits under commondata/, but ArcMap packages also put data in the layer version folders (v10/, v107/ ...),
+    where each folder's .lyr names it by a relative path. A dataset repeated in several version folders is listed
+    once, from the newest folder, when every copy is identical; differing copies are each listed.
+    """
     from describe import describe
-    data = root / 'commondata'
-    found = []
-    if not data.is_dir():
-        return found
-    for item in sorted(data.rglob('*')):
-        kind = ('filegdb' if item.is_dir() and item.suffix.lower() == '.gdb'
-                else 'shapefile' if item.is_file() and item.suffix.lower() == '.shp'
-                else 'raster' if item.is_file() and item.suffix.lower() in RASTER_SUFFIXES else None)
-        if kind is None or any(parent.suffix.lower() == '.gdb' for parent in item.relative_to(data).parents):
+    groups = {}
+    for item in sorted(root.rglob('*')):
+        relative = item.relative_to(root)
+        kind = dataset_kind(item)
+        if kind is None or relative.parts[0] == 'esriinfo' or any(p.suffix.lower() == '.gdb' for p in relative.parents):
             continue
-        row = {'path': str(item.relative_to(root)), 'kind': kind, 'name': item.stem}
-        try:
-            card = describe(item)
-            card['path'] = row['path']
-            row['card'] = card
-        except Exception as error:  # an unreadable dataset is reported, not fatal
-            row['error'] = f'{type(error).__name__}: {error}'
-        found.append(row)
-    return found
+        path = relative.as_posix()
+        key = path if relative.parts[0] == 'commondata' else dataset_key(path, versions)
+        groups.setdefault(key, []).append((item, path, kind))
+    rank = {folder: i for i, folder in enumerate(versions)}
+    found, warnings = [], []
+    for key, copies in sorted(groups.items(), key=lambda pair: (not pair[1][0][1].startswith('commondata/'), pair[0])):
+        # newest version folder first; a path outside any version folder ranks as the oldest
+        copies.sort(key=lambda copy: -rank.get(next((v for v in versions if copy[1].startswith(v + '/')), None), -1))
+        if len(copies) > 1:
+            prints = [fingerprint(item) for item, _, _ in copies]
+            if any(p != prints[0] for p in prints[1:]):
+                warnings.append(f'{len(copies)} copies of {key} differ ({", ".join(c[1] for c in copies)}); each is listed')
+                listed = [(copy, []) for copy in copies]
+            else:
+                listed = [(copies[0], [c[1] for c in copies[1:]])]
+        else:
+            listed = [(copies[0], [])]
+        for (item, path, kind), others in listed:
+            row = {'path': path, 'kind': kind, 'name': item.stem}
+            if others:
+                row['copies'] = others
+            try:
+                card = describe(item)
+                card['path'] = path
+                row['card'] = card
+            except Exception as error:  # an unreadable dataset is reported, not fatal
+                row['error'] = f'{type(error).__name__}: {error}'
+            found.append(row)
+    return found, warnings
 
 
 def utf16_strings(data, minimum=3):
@@ -197,10 +242,10 @@ def utf16_strings(data, minimum=3):
 
 def lyr_summary(path):
     """What can be read from an ArcMap .lyr without the ArcObjects format: data path, names, label expression."""
-    strings = utf16_strings(path.read_bytes())
+    strings = utf16_strings(path.read_bytes(), minimum=2)  # two-character names (水系, 道路) are common
     sources = [s for s in strings if 'commondata' in s.lower() or re.search(r'\.(gdb|shp|sde)\b', s, re.I)]
     labels = [s for s in strings if re.fullmatch(r'\[[^\]]+\]', s)]
-    return {'format': 'lyr (ArcMap binary)', 'data_sources': sources, 'label_expressions': labels, 'strings': strings[:200],
+    return {'format': 'lyr (ArcMap binary)', 'data_sources': sources, 'label_expressions': labels, 'strings': strings,
             'symbology': 'not read: binary .lyr'}
 
 
@@ -246,8 +291,28 @@ def layer_files(root):
     return files, [str(p.relative_to(root)) for p in lyr_folders]
 
 
-def match(summary, data, layer_name):
-    """Datasets a layer file points at, by name and data path; empty when its data is not in the package."""
+def source_key(text):
+    """A .lyr data source as (in commondata, path relative to commondata/ or to the layer's own folder), lower case."""
+    path = text.replace('\\', '/').strip('/').lower()
+    if path.endswith('commondata'):
+        return True, '.'
+    if 'commondata/' in path:
+        return True, path[path.rindex('commondata/') + len('commondata/'):]
+    return False, path.removeprefix('./')
+
+
+def gdb_layers(row, strings):
+    """'<gdb>:<layer>' for the geodatabase layers a .lyr names; a name may run into neighbouring binary characters."""
+    names = [layer['name'] for layer in (row.get('card') or {}).get('layers', [])]
+    return [f"{row['path']}:{name}" for name in names if len(name) >= 3 and any(name in s for s in strings)]
+
+
+def match(summary, data, layer_name, versions=(), folder=''):
+    """Datasets a layer file points at, by name and data path; empty when its data is not in the package.
+
+    A .lyr path outside commondata/ is relative to the layer file's own folder, so only a dataset there (or
+    an identical copy listed for it) can match.
+    """
     hits = []
     if summary['format'].startswith('lyrx'):
         for layer in summary['layers']:
@@ -264,12 +329,15 @@ def match(summary, data, layer_name):
                     hits.append(row['path'])
         return sorted(set(hits))
     strings = set(summary.get('strings', []))
-    folders = {s.replace('\\', '/').split('commondata/')[-1].strip('/') for s in summary.get('data_sources', []) if 'commondata' in s.lower()}
+    sources = {source_key(s) for s in summary.get('data_sources', [])}
+    commondata = any(inside for inside, _ in sources)
     for row in data:
-        relative = row['path'].split('commondata/')[-1]
-        folder = str(PurePosixPath(relative).parent)
-        if (row['name'] in strings or row['name'] == layer_name) and (not folders or folder in folders or relative in folders):
-            hits.append(row['path'])
+        inside, key = row['path'].startswith('commondata/'), dataset_key(row['path'], versions).lower()
+        if not inside and folder not in {str(PurePosixPath(p).parent) for p in [row['path'], *row.get('copies', [])]}:
+            continue
+        named = row['name'] in strings or row['name'] == layer_name
+        if (inside, key) in sources or (named and ((inside, str(PurePosixPath(key).parent)) in sources or (inside and not commondata))):
+            hits += (gdb_layers(row, strings) if row['kind'] == 'filegdb' else []) or [row['path']]
     return sorted(set(hits))
 
 
@@ -287,20 +355,20 @@ def unpack(args):
         check_extracted(root, total)
         info = xml_fields(root / 'esriinfo' / 'item.pkinfo', ('name', 'version', 'type', 'ID'))
         item = xml_fields(root / 'esriinfo' / 'iteminfo.xml', ('name', 'title', 'summary', 'description', 'tags', 'type'))
-        data = datasets(root)
         files, versions = layer_files(root)
+        data, copy_warnings = datasets(root, versions)
         layers, used = [], set()
         for path, summary in files:
             name = re.sub(r'^\d{4}', '', path.stem)
-            linked = match(summary, data, name) if 'error' not in summary and summary['format'][:3] in ('lyr',) else []
+            linked = match(summary, data, name, versions, path.parent.relative_to(root).as_posix()) if 'error' not in summary and summary['format'][:3] in ('lyr',) else []
             used.update(p.split(':')[0] for p in linked)
             layers.append({'file': str(path.relative_to(root)), 'name': name, **summary, 'data': linked,
                            'data_in_package': bool(linked) if summary['format'][:3] == 'lyr' else None})
             layers[-1].pop('strings', None)
         missing = [layer['name'] for layer in layers if layer['data_in_package'] is False]
-        warnings = []
+        warnings = list(copy_warnings)
         if not data:
-            warnings.append('No data under commondata/: the package holds layer definitions only (data packaged by reference)')
+            warnings.append('No datasets in the package: it holds layer definitions only (data packaged by reference)')
         if missing:
             warnings.append(f'{len(missing)} layers point at data that is not in the package: {", ".join(missing[:5])}')
         unused = [row['path'] for row in data if row['path'] not in used]

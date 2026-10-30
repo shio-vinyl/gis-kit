@@ -20,6 +20,7 @@
 - 只读文件头与系统表，不读要素或像元；要素数或范围需扫描才能得到时为 `null`。
 - 矢量给出图层（最多 20 个，`layer_count` 为总数）、几何类型、要素数、CRS、范围、字段（最多 50 个，`field_count` 为总数）；栅格给出尺寸、波段、数据类型、逐波段 NoData（NaN 记为 `"nan"`，未设置为 `null`）、分辨率、CRS、范围，以及全部波段解码后的字节数 `decoded_bytes`。
 - `crs` 含 `id`（如 `EPSG:4490`，无法识别时为 `null`）、`name`、`geographic`、`units`；没有 CRS 时整个为 `null`。
+- `id` 为 `null` 时，可能另有 `horizontal`：复合坐标系（投影＋高程）的水平部分，或只能低置信度匹配的坐标系（如 ESRI 写的带号前缀高斯投影），推断出的 EPSG。只有候选 EPSG 的投影参数和地理坐标系都与原坐标系相同时才给出，`inferred` 恒为 `true`，`basis` 写明依据，`vertical` 为高程部分的名称。读取方要用它时，应说明这是推断。
 - `warnings` 只列确定性事实（`crs_missing`、`nodata_unset`），不给建议。
 - `revision`（大小与修改时间）供读取方判断卡片是否过期。
 - 兼容变更只新增可选字段，读取方须忽略不认识的字段；不兼容变更才升 `schema_version`。

@@ -29,8 +29,42 @@ def crs_card(crs) -> dict | None:
     parsed = CRS.from_user_input(crs)
     authority = parsed.to_authority(min_confidence=70)
     axis = parsed.axis_info[0] if parsed.axis_info else None
-    return {'id': ':'.join(authority) if authority else None, 'name': parsed.name,
+    card = {'id': ':'.join(authority) if authority else None, 'name': parsed.name,
             'geographic': parsed.is_geographic, 'units': axis.unit_name if axis else None}
+    horizontal = None if authority else horizontal_card(parsed)
+    if horizontal:
+        card['horizontal'] = horizontal
+    return card
+
+
+def horizontal_card(parsed) -> dict | None:
+    """An inferred EPSG for the horizontal part of a CRS that has no id of its own.
+
+    A compound CRS (projected + height) has no EPSG code as a whole, and pyproj matches the
+    horizontal part of an ESRI compound (often a zone-prefixed Gauss-Kruger) only at low
+    confidence. A candidate is kept only when its projection parameters and geodetic CRS
+    are the same as the source's, so a name-only match is never reported.
+    """
+    horizontal = parsed.sub_crs_list[0] if parsed.is_compound else parsed
+    if horizontal.is_compound or not (horizontal.is_projected or horizontal.is_geographic):
+        return None
+    import warnings
+    from pyproj import CRS
+    base = horizontal.geodetic_crs.to_authority(min_confidence=70) if horizontal.geodetic_crs else None
+    if not base:
+        return None
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')  # PROJ strings drop names and axis order, which is all they are compared without
+        for match in horizontal.list_authority(min_confidence=0):
+            candidate = CRS.from_authority(match.auth_name, match.code)
+            if (candidate.to_proj4() == horizontal.to_proj4() and candidate.geodetic_crs
+                    and candidate.geodetic_crs.to_authority(min_confidence=70) == base):
+                vertical = parsed.sub_crs_list[1].name if parsed.is_compound and len(parsed.sub_crs_list) > 1 else None
+                return {'id': f'{match.auth_name}:{match.code}', 'name': candidate.name, 'inferred': True,
+                        'basis': ('horizontal part of a compound CRS' if parsed.is_compound else 'low-confidence match')
+                                 + f' ({match.confidence}%); projection parameters and geodetic CRS are the same',
+                        'vertical': vertical}
+    return None
 
 
 def _extent(bounds) -> list[float] | None:

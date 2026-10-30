@@ -102,6 +102,11 @@ def test_cli_convert_and_gpkg_copy_stream_large_layers(tmp_path):
     back = gpd.read_file(converted, engine='pyogrio')
     pd.testing.assert_frame_equal(back.drop(columns='geometry'), full.drop(columns='geometry'))
     assert back.geometry.geom_equals_exact(full.to_crs('EPSG:3857').geometry, 1e-6).all()
+    thin = tmp_path/'thin.gpkg'
+    run = subprocess.run([sys.executable, str(SCRIPTS/'convert.py'), str(source), '--output', str(thin), '--fields', 'note'],
+                         capture_output=True, text=True)
+    assert run.returncode == 0 and 'Streamed 100050 features' in run.stdout, run.stderr
+    pd.testing.assert_frame_equal(gpd.read_file(thin, engine='pyogrio'), full[['note', 'geometry']])
     copied = tmp_path/'copied.gpkg'
     run = subprocess.run([sys.executable, str(SCRIPTS/'gpkg.py'), 'copy', '--source', str(source), '--target', str(copied),
                           '--target-layer', 'kept'], capture_output=True, text=True)

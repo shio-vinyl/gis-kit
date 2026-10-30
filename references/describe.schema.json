@@ -82,7 +82,19 @@
         "id": { "description": "Authority code such as EPSG:4490, or null when none is identified.", "type": ["string", "null"] },
         "name": { "type": "string" },
         "geographic": { "type": "boolean" },
-        "units": { "type": ["string", "null"] }
+        "units": { "type": ["string", "null"] },
+        "horizontal": {
+          "description": "Only when id is null: an EPSG inferred for the horizontal part (a compound CRS's projected or geographic part, or the CRS itself), kept only when its projection parameters and geodetic CRS match.",
+          "type": "object",
+          "required": ["id", "name", "inferred", "basis", "vertical"],
+          "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "inferred": { "const": true },
+            "basis": { "type": "string" },
+            "vertical": { "description": "Name of the vertical part of a compound CRS, or null.", "type": ["string", "null"] }
+          }
+        }
       }
     },
     "extent": {

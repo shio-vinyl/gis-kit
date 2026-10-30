@@ -132,3 +132,65 @@ def test_unescape_bsdtar_names():
     from package import unescape
     assert unescape('commondata/\\345\\256\\235\\345\\256\\211/a.shp') == 'commondata/宝安/a.shp'
     assert unescape('a\\\\b') == 'a\\b'
+
+
+def zip_tree(tree, archive):
+    with zipfile.ZipFile(archive, 'w') as out:
+        for item in sorted(tree.rglob('*')):
+            if item.is_file():
+                out.write(item, item.relative_to(tree).as_posix())
+    return archive
+
+
+def test_unpack_lists_data_in_version_folders_and_compound_crs(tmp_path):
+    """ArcMap packages may keep a geodatabase in each version folder; .lyr names it by a relative path."""
+    from pyproj import CRS
+    tree = tmp_path/'tree'
+    (tree/'esriinfo').mkdir(parents=True)
+    (tree/'esriinfo'/'item.pkinfo').write_text('<pkinfo><name>base</name></pkinfo>', encoding='utf-8')
+    lyr = (b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1' + bytes(56)
+           + b''.join(s.encode('utf-16le') + bytes(6) for s in ['底图', 'File Geodatabase Feature Class', 'plan.gdb', '[name]'])
+           + '\x1f'.encode('utf-16le') + 'parcels'.encode('utf-16le') + bytes(6))  # a name glued to a binary character
+    (tree/'v10').mkdir()
+    gpd.GeoDataFrame({'name': ['a']}, geometry=[box(0, 0, 1, 1)], crs='EPSG:4547').to_file(
+        tree/'v10'/'plan.gdb', layer='parcels', driver='OpenFileGDB')
+    shutil.copytree(tree/'v10', tree/'v107')
+    for version in ('v10', 'v107'):
+        (tree/version/'0000底图.lyr').write_bytes(lyr)
+    sea = tree/'commondata'/'sea'
+    sea.mkdir(parents=True)
+    gpd.GeoDataFrame({'k': [1]}, geometry=[box(38489000, 2490000, 38489100, 2490100)], crs='EPSG:4526').to_file(sea/'sea.shp')
+    (sea/'sea.prj').write_text(CRS('EPSG:4526+5737').to_wkt('WKT1_ESRI'))  # zone-prefixed Gauss-Kruger + height
+
+    manifest = cli('unpack', zip_tree(tree, tmp_path/'base.lpk'), '--output', tmp_path/'out')
+    rows = {d['path']: d for d in manifest['datasets']}
+    assert set(rows) == {'commondata/sea/sea.shp', 'v107/plan.gdb'}  # the identical v10 copy is listed once
+    assert rows['v107/plan.gdb']['copies'] == ['v10/plan.gdb']
+    assert manifest['layers'][0]['data'] == ['v107/plan.gdb:parcels']
+    crs = rows['commondata/sea/sea.shp']['card']['layers'][0]['crs']
+    assert crs['id'] is None and crs['horizontal']['id'] == 'EPSG:4526' and crs['horizontal']['inferred'] is True
+    assert crs['horizontal']['vertical'] == 'Yellow Sea 1985 height'
+    assert any('not named by any layer file: commondata/sea/sea.shp' in w for w in manifest['warnings'])
+    (tree/'v107'/'0000底图.lyr').write_bytes(lyr + 'sea'.encode('utf-16le') + bytes(2) + '海洋'.encode('utf-16le') + bytes(2))
+    shutil.copy(sea/'sea.shp', sea/'海洋.shp')  # a two-character name, between string terminators
+    for sidecar in ('shx', 'dbf', 'prj'):
+        shutil.copy(sea/f'sea.{sidecar}', sea/f'海洋.{sidecar}')
+    manifest = cli('unpack', zip_tree(tree, tmp_path/'named.lpk'), '--output', tmp_path/'named')
+    assert manifest['layers'][0]['data'] == ['commondata/sea/sea.shp', 'commondata/sea/海洋.shp', 'v107/plan.gdb:parcels']
+
+    gpd.GeoDataFrame({'name': ['a', 'b']}, geometry=[box(0, 0, 1, 1), box(1, 1, 2, 2)], crs='EPSG:4547').to_file(
+        tree/'v10'/'plan.gdb', layer='parcels', driver='OpenFileGDB', mode='w')
+    manifest = cli('unpack', zip_tree(tree, tmp_path/'differ.lpk'), '--output', tmp_path/'differ')
+    assert {'v10/plan.gdb', 'v107/plan.gdb'} <= {d['path'] for d in manifest['datasets']}
+    assert any('2 copies of plan.gdb differ' in w for w in manifest['warnings'])
+    assert [d for d in manifest['layers'][0]['data'] if '.gdb' in d] == ['v107/plan.gdb:parcels']  # the layer file's own copy
+
+
+def test_horizontal_epsg_is_inferred_only_when_parameters_match():
+    sys.path.insert(0, str(SCRIPTS))
+    from describe import crs_card
+    from pyproj import CRS
+    assert 'horizontal' not in crs_card('EPSG:4547')
+    assert crs_card('EPSG:4547+5737')['horizontal']['id'] == 'EPSG:4547'
+    assert crs_card(CRS('EPSG:4526+5737').to_wkt('WKT1_ESRI'))['horizontal']['id'] == 'EPSG:4526'
+    assert 'horizontal' not in crs_card('+proj=tmerc +lon_0=114.3 +x_0=500000 +ellps=GRS80 +units=m')  # local grid

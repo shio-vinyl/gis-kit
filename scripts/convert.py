@@ -36,10 +36,22 @@ def require_layer(path: Path, layer: str | None) -> None:
         raise ValueError(f"{path} has {len(names)} layers ({', '.join(names)}); pass --layer to choose one")
 
 
-def read_file(path: Path, layer: str | None, encoding: str | None) -> gpd.GeoDataFrame:
+def check_fields(path: Path, layer: str | None, fields: list[str] | None) -> None:
+    """Refuse --fields names the source does not have, before anything is written."""
+    if not fields:
+        return
+    available = [str(name) for name in pyogrio.read_info(path, layer=layer)["fields"]]
+    missing = [name for name in fields if name not in available]
+    if missing:
+        raise ValueError(f"{path} has no field {', '.join(missing)}; fields: {', '.join(available)}")
+
+
+def read_file(path: Path, layer: str | None, encoding: str | None, fields: list[str] | None = None) -> gpd.GeoDataFrame:
     kwargs: dict = {"engine": "pyogrio"}
     if layer:
         kwargs["layer"] = layer
+    if fields:
+        kwargs["columns"] = fields
     if encoding:
         kwargs["encoding"] = encoding
     if path.suffix.lower() == ".gdb":
@@ -57,7 +69,7 @@ def write_file(gdf, path, layer, *, overwrite=False, protected_paths=()):
                    required_fields=[c for c in gdf.columns if c != gdf.geometry.name])
 
 
-def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, overwrite) -> bool:
+def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, overwrite, fields=None) -> bool:
     """Chunked read/reproject/append for layers larger than one chunk; False means use one full read."""
     with AtomicVectorOutput(output_path, overwrite=overwrite, protected_paths=[input_path]) as out:
         if out_layer and out.driver == "GPKG":
@@ -71,7 +83,7 @@ def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, ove
 
         count = stream_vector(input_path, write, driver=out.driver, layer=layer,
                               transform=(lambda frame: frame.to_crs(crs)) if crs else None,
-                              **({"encoding": encoding} if encoding else {}))
+                              **({"encoding": encoding} if encoding else {}), **({"columns": fields} if fields else {}))
         if count is None:
             return False
         out.commit(expected_features=count, expected_crs=meta["crs"], required_fields=meta["fields"])
@@ -81,11 +93,12 @@ def stream_convert(input_path, output_path, layer, out_layer, crs, encoding, ove
     return True
 
 
-def convert_single(input_path: Path, output_path: Path, layer: str | None, output_layer: str | None, crs: str | None, encoding: str | None, overwrite=False) -> None:
+def convert_single(input_path: Path, output_path: Path, layer: str | None, output_layer: str | None, crs: str | None, encoding: str | None, overwrite=False, fields: list[str] | None = None) -> None:
     require_layer(input_path, layer)
-    if stream_convert(input_path, output_path, layer, output_layer or layer, crs, encoding, overwrite):
+    check_fields(input_path, layer, fields)
+    if stream_convert(input_path, output_path, layer, output_layer or layer, crs, encoding, overwrite, fields):
         return
-    gdf = read_file(input_path, layer, encoding)
+    gdf = read_file(input_path, layer, encoding, fields)
     print(f"Read {len(gdf)} features from {input_path}" + (f" (layer: {layer})" if layer else ""))
 
     if crs:
@@ -110,8 +123,10 @@ def main() -> None:
     parser.add_argument("--output-layer", help="Output layer name (defaults to source layer)")
     parser.add_argument("--crs", help="Target CRS (e.g., EPSG:4326)")
     parser.add_argument("--encoding", help="Source file encoding (e.g., gbk, gb2312)")
+    parser.add_argument("--fields", help="Comma-separated fields to keep (geometry is always kept); default all")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
+    fields = [name.strip() for name in args.fields.split(",") if name.strip()] if args.fields else None
 
     input_path = Path(args.input)
 
@@ -143,7 +158,7 @@ def main() -> None:
         for f in sorted(files):
             out = output_dir / f"{f.stem}{out_ext}"
             try:
-                convert_single(f, out, args.layer, args.output_layer, args.crs, args.encoding, args.overwrite)
+                convert_single(f, out, args.layer, args.output_layer, args.crs, args.encoding, args.overwrite, fields)
             except Exception as e:
                 failures += 1
                 print(f"ERROR processing {f}: {e}", file=sys.stderr)
@@ -153,7 +168,11 @@ def main() -> None:
         if not args.output:
             print("ERROR: --output is required", file=sys.stderr)
             sys.exit(1)
-        convert_single(input_path, Path(args.output), args.layer, args.output_layer, args.crs, args.encoding, args.overwrite)
+        try:
+            convert_single(input_path, Path(args.output), args.layer, args.output_layer, args.crs, args.encoding, args.overwrite, fields)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
