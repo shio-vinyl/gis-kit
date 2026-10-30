@@ -270,12 +270,9 @@ class AtomicVectorOutput:
         if frame.columns.duplicated().any():
             raise ValueError("Duplicate output field names are forbidden")
         kwargs = {"driver": self.driver, "append": append, **options}
-        if self.layer is not None:
-            kwargs["layer"] = self.layer
-        elif self.driver == "GeoJSON":
-            # GeoJSON stores its layer name in the file; without one GDAL writes the random temporary
-            # name, so the same output would differ from run to run.
-            kwargs["layer"] = self.path.stem
+        # GeoJSON and FlatGeobuf store their layer name in the file; without one GDAL writes the random
+        # temporary name, so the same output would differ from run to run.
+        kwargs["layer"] = self.layer if self.layer is not None else self.path.stem
         pyogrio.write_dataframe(frame, self.temp_path, **kwargs)
 
     def commit(

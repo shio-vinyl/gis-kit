@@ -66,3 +66,24 @@ def test_batch_refuses_outputs_with_the_same_name(tmp_path):
     result = cli(source, '--output', out/'x.gpkg', '--overwrite', success=False)
     assert 'Roads.mif, roads.tab' in result.stderr
     assert not list(out.glob('*.gpkg'))
+
+
+@pytest.mark.parametrize('suffix', ['.geojson', '.fgb', '.gpkg'])
+def test_output_layer_is_named_after_the_file(tmp_path, suffix):
+    source = tmp_path/'source.gpkg'
+    points().to_file(source, layer='pts')
+    cli(source, '--output', tmp_path/f'规划用地{suffix}')
+    assert [name for name, _ in pyogrio.list_layers(tmp_path/f'规划用地{suffix}')] == ['规划用地']  # not the staging name
+
+
+def test_fields_keeps_only_the_named_fields(tmp_path):
+    source = tmp_path/'source.gpkg'
+    frame = points().assign(code=['R1', 'R2'], area=[1.5, 2.5])
+    frame.to_file(source)
+    cli(source, '--output', tmp_path/'thin.geojson', '--fields', 'code, name', '--crs', 'EPSG:3857')
+    thin = gpd.read_file(tmp_path/'thin.geojson')
+    assert list(thin.columns) == ['name', 'code', 'geometry'] and thin.crs.to_epsg() == 3857
+    assert thin.geometry.geom_equals_exact(frame.to_crs(3857).geometry, 1e-6).all()
+    result = cli(source, '--output', tmp_path/'bad.geojson', '--fields', 'code,height', success=False)
+    assert 'no field height' in result.stderr and 'area' in result.stderr
+    assert not (tmp_path/'bad.geojson').exists()
