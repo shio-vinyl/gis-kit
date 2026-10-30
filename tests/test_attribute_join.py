@@ -63,7 +63,7 @@ def test_keys_as_given_and_a_gbk_csv_with_a_title_row(tmp_path):
     with pytest.warns(UserWarning):
         gpd.GeoDataFrame({'编号': ['007', '7']}, geometry=[box(0, 0, 1, 1), box(1, 0, 2, 1)]).to_file(left)
     right = tmp_path/'指标.csv'
-    right.write_bytes('妈湾片区地块指标表\n编号,容积率\n007,2.5\n'.encode('gbk'))
+    right.write_bytes('示例片区地块指标表\n编号,容积率\n007,2.5\n'.encode('gbk'))
     cli('--left', left, '--right', right, '--right-header-row', 2, '--right-encoding', 'gbk', '--on', '编号',
         '--output', tmp_path/'out.gpkg', '--report-json', tmp_path/'out.json')
     out = gpd.read_file(tmp_path/'out.gpkg').set_index('编号')

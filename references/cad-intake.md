@@ -12,7 +12,7 @@ python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/
 - **转换器**：
   - ODA File Converter：免费，安装时要接受 ODA 的许可协议。程序先在 PATH 里找，再找常见安装位置（例如 `/Applications/ODAFileConverter.app`）。
     - 环境变量 `GIS_KIT_ODA` 设成可执行文件路径时，只用这一个；设成空值时不用 ODA。
-    - ODA 的最后一个参数是通配符过滤，不是文件名，所以程序传 `*.DWG`（输入目录里只有那一份副本）。文件名带 `[ ]` 时（例如 `[妈湾片区]`），按文件名过滤会什么都匹配不上，ODA 照样以 0 退出。
+    - ODA 的最后一个参数是通配符过滤，不是文件名，所以程序传 `*.DWG`（输入目录里只有那一份副本）。文件名带 `[ ]` 时（例如 `[示例片区]`），按文件名过滤会什么都匹配不上，ODA 照样以 0 退出。
     - 2026-10 用 27.9 版（macOS arm64）实测，转 AutoCAD 2018（AC1032）的 DWG。
   - LibreDWG 的 `dwg2dxf`：GPL 许可，`brew install libredwg` 即可安装。2026-10 用 0.14 版实测，能转 AutoCAD 2018（AC1032）的 DWG。
   - 两种都没装时报错，提示安装或在 AutoCAD / 中望 CAD 里另存为 DXF。
@@ -25,7 +25,7 @@ python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/
   - 有些 XRECORD 的扩展数据里有组码小于 1000 的标签，ezdxf 的恢复模式会拒绝读取。读取时会在临时副本里去掉这些标签，记下去掉的条数；实体不受影响。
   - 输出的 DXF 文件头里，`$DWGCODEPAGE` 可能写成 ANSI_936，见下文"文字编码"。
   - `ACAD_TABLE` 只剩一行 `0/ACAD_TABLE`，表格和 `*T` 块的对应关系丢失；`OLE2FRAME` 的组码 10/11 是占位值。
-- **两种转换器的对照**（妈湾法图，2026-10-29）：
+- **两种转换器的对照**（示例法图，2026-10-29）：
   - 湘源直取的结果完全一样：99 个面句柄相同，顶点最大差 1.5×10⁻⁹ m；各项统计、面积、填充、设施配对也一样。4 个嵌入工作簿逐字节相同。
   - 只有 ODA 保住了 `ACAD_TABLE`：`*T58` 对应 `tukuang` 块里的表格 5B592；ODA 也把 OLE 框的真实角点写在了 10/11。
   - 314 个格式不对的 XDATA 标签两种输出都有，问题出在原 DWG 本身。
@@ -39,7 +39,7 @@ python cad.py convert 法图.dwg --tool libredwg --version r2013 --output /work/
 python cad.py inspect 控规图则.dxf --output /work/cad/plan
 python cad.py inspect 地形图.dxf --near 117.2,31.8 --output /work/cad/topo   # 剔除离图纸所在地太远的候选
 python cad.py inspect 旧图.dxf --encoding CP936 --output /work/cad/old      # 文件头缺代码页时
-python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad/fatu   # 与已知 CRS 的参考图层比对
+python cad.py inspect 法图.dxf --reference 片区范围.shp --output /work/cad/fatu   # 与已知 CRS 的参考图层比对
 ```
 
 - **输入**：ASCII 或二进制 DXF。DWG 直接拒绝，先用 `cad.py convert` 转换，或在 AutoCAD / 中望 CAD 里另存为 DXF。读模型空间实体，图纸空间（布局）实体单独计数，不参与范围和 CRS 判断。
@@ -63,7 +63,7 @@ python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad
 按代表点的坐标量级判断，然后用 pyproj 的 EPSG 库查出具体坐标系，再用各坐标系的适用范围核对一遍，范围外的列入 `rejected`。
 
 - **带带号的高斯-克吕格坐标**：东坐标为 3 度带 25–45 带或 6 度带 13–23 带的带号 ×10⁶ 加上 500000 左右，直接定出带号。
-- **不带带号的坐标**：东坐标在 0–10⁶ 之间。这样的坐标可能是不带带号的高斯坐标、UTM，也可能是城市或项目独立坐标系（例如深圳独立坐标），单看坐标分不出来，所以**不列任何 EPSG**，状态为 `hold`，给了 `--near` 也一样。要确定坐标系，只能和已知 CRS 的参考图层比对（`--reference`，见下文），或用控制点拟合。
+- **不带带号的坐标**：东坐标在 0–10⁶ 之间。这样的坐标可能是不带带号的高斯坐标、UTM，也可能是城市或项目独立坐标系（例如城市独立坐标），单看坐标分不出来，所以**不列任何 EPSG**，状态为 `hold`，给了 `--near` 也一样。要确定坐标系，只能和已知 CRS 的参考图层比对（`--reference`，见下文），或用控制点拟合。
 - **经纬度**：x、y 落在经纬度范围内时，列 EPSG:4490 和 EPSG:4326。
 - **Web 墨卡托**：只在上面都不匹配、坐标不属于无带号的情况，且给了 `--near` 时，才列 EPSG:3857。
 - **其他**：都对不上时按局部或工程坐标处理，状态为 `hold`，需要控制点配准。
@@ -101,19 +101,19 @@ python cad.py inspect 法图.dxf --reference 前海范围.shp --output /work/cad
 python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /work/cad/fatu-xy
 ```
 
-- **湘源怎么存地块**（妈湾法图实测）：
+- **湘源怎么存地块**（示例法图实测）：
   - 地块边界：`<用地代码>_K` 图层上的闭合多段线（例如 `C1+R2_K`）；填充：`<用地代码>_T` 图层上的 HATCH。
   - 属性：存在边界线的扩展数据里，每个属性单独注册成一个应用名，值放在 1000 组码。数值也存成字符串；空值写成空串，不是省略字段。字段有两套：
     - 湘源 7.0 的地块属性表：`用地名称`、`用地类型`、`第二位比例`、`单位名称` 等。
-    - 深圳汇交的字段：`用地性质`、`主要功能代码`、`管控类型`、`删除标记`、`图则编号` 等。妈湾的 `_K` 面上用的是这一套。
-  - 副本：地块属性还会被复制到图块定义里的道路红线等实体上，例如妈湾的 `luwang`、`luwang0616` 块。这些副本不是地块。
+    - 地方汇交标准的字段：`用地性质`、`主要功能代码`、`管控类型`、`删除标记`、`图则编号` 等。示例图的 `_K` 面上用的是这一套。
+  - 副本：地块属性还会被复制到图块定义里的道路红线等实体上，例如示例图的 `luwang`、`luwang0616` 块。这些副本不是地块。
   - 未炸开的湘源地块是自定义实体 `LZX_LAND`，写进 DXF 时只剩一个类标记，属性全部丢失。
   - 规划控制单元：`用地代码 = DY`。
   - 编号图块：`12 地块编号` 图层上的 `地块编号` 图块，块属性里重复了地块的属性。
   - 配套设施：`配套设施` 图层上的图块，扩展数据里带设施类别、名称、建设状态、所在地块编号。
-  - 指标表：图框旁的表格多半是嵌入的 Excel（`OLE2FRAME`），不是文字。妈湾有 4 个，分别显示逐地块表、规划控制单元表（单元面积、建筑容积总量、各用途比例）、城镇单元表和用地平衡表；4 个工作簿的同名表互相不一致。CAD 自己的表格（`ACAD_TABLE`）画成匿名块 `*T…` 里的文字和线。
+  - 指标表：图框旁的表格多半是嵌入的 Excel（`OLE2FRAME`），不是文字。示例图有 4 个，分别显示逐地块表、规划控制单元表（单元面积、建筑容积总量、各用途比例）、城镇单元表和用地平衡表；4 个工作簿的同名表互相不一致。CAD 自己的表格（`ACAD_TABLE`）画成匿名块 `*T…` 里的文字和线。
 - **地块（`parcels`）**：每条带 `用地代码` 扩展数据的闭合多段线生成一个面，圆弧按 `--arc-tolerance` 离散。
-  - 湘源和深圳字段名单里的扩展数据字段按原名保留（清单 `fields` 列出）；其他插件写的应用（例如 `LHB_YJ`、`HintCAD_*`）合成一个 JSON 字段 `other_xdata`，不丢弃。同一个应用有几个 1000 组码时，按湘源自己的读法取最后一个，并给出警告。
+  - 湘源和地方汇交字段名单里的扩展数据字段按原名保留（清单 `fields` 列出）；其他插件写的应用（例如 `LHB_YJ`、`HintCAD_*`）合成一个 JSON 字段 `other_xdata`，不丢弃。同一个应用有几个 1000 组码时，按湘源自己的读法取最后一个，并给出警告。
   - 数值字段（`用地面积`、`容积率`、`建筑密度`、`绿地率`、`建筑限高`、各类面积、车位、户数、人数等）中，空串转为空值。整列都能解析成数字时转成数值；只要有一个值解析不了，整列保留原文，并在警告里给出示例值。清单的 `summary.numeric_fields` 列出已转换的字段。
   - `--schema` 可以传入一份 JSON，补充字段名单（`land_attribute_fields_order`、`gis_field_mapping` 的键）和数值字段（`numeric_like`）；清单记下它的 SHA-256。
   - 另加 `parcel_id`（地块编号）、`landuse`（用地代码）、`landuse_name`（用地性质）、`control_type`（`地块` / `规划控制单元`）、`unit_id`、`area_m2`（按几何算）、`area_declared`（`用地面积`）、`area_diff`（相对差）、`number_block`（有没有编号图块落在里面且编号一致）、`fills`（落在面里的 `_T` 填充个数）、`valid`、`layer`、`handle`、`other_xdata`。
@@ -125,15 +125,15 @@ python cad.py xiangyuan 法图.dxf --units m --max-area-diff 0.005 --output /wor
     - 几何无效；
     - 给了 `--max-area-diff` 时，面积差超过它。
 - **编号图块核对**：编号图块不在任何面里（`number-block-outside`），或者所在面的编号不一致（`number-block-mismatch`）时，写入 `qa_number_blocks`。
-- **编号图块补空**：面是权威。编号图块只对应一个面时，块属性里有值、而面上为空或没有的字段（限湘源和深圳字段名单，`地块编号`、`用地代码`、`用地性质` 除外）补到面上，`filled_from_block` 列出补了哪些字段；面上已有的值不改。清单 `summary.filled_from_block` 按字段计数。妈湾补了 4 个 `规划项目编号`（值为 `—`）和 2 个 `备注`。
+- **编号图块补空**：面是权威。编号图块只对应一个面时，块属性里有值、而面上为空或没有的字段（限湘源和地方汇交字段名单，`地块编号`、`用地代码`、`用地性质` 除外）补到面上，`filled_from_block` 列出补了哪些字段；面上已有的值不改。清单 `summary.filled_from_block` 按字段计数。示例图补了 4 个 `规划项目编号`（值为 `—`）和 2 个 `备注`。
 - **嵌入的 OLE 对象（`ole_frames`）**：每个 `OLE2FRAME`（模型空间、图纸空间或块里）一条记录，需要 olefile（可选）。
-  - 位置：取二进制数据头部记的四个角点。LibreDWG 写在组码 10/11 里的是占位值（妈湾 4 个框完全相同），只在头部读不出时才用，`corners_from` 记下来源。只有模型空间的框有几何。
+  - 位置：取二进制数据头部记的四个角点。LibreDWG 写在组码 10/11 里的是占位值（示例图 4 个框完全相同），只在头部读不出时才用，`corners_from` 记下来源。只有模型空间的框有几何。
   - 内容：解开 OLE 复合文档，按 `CompObj` 读出类型名（`user_type`）和 ProgID（`prog_id`）。Office 2007 以后的对象把文件原样存在 `Package` 流里，另存为 `ole/<句柄>.xlsx`（或 `.docx`、`.pptx`）；Excel 97 一类存成 `.xls`，其他存成 `.cfb`。清单记文件大小和 SHA-256。
   - 工作表（需要 openpyxl）：`sheets` 列出各表及其范围，`shown_sheet`、`shown_range` 是工作簿保存时的活动表，也就是框里显示的那张表。框的画面本身不渲染。
   - 版本核对：同名工作表在不同工作簿里内容不一样时，清单 `embedded.sheet_versions` 按内容分组，列出各组在哪些框里、在哪个框里显示，并给出警告。不判断哪一份对。
   - 没装 olefile 时照样列出框和位置，不取内容，并给出警告。
 - **表格（`tables/`）**：每个 `*T…` 匿名块里的 TEXT / MTEXT 按位置排成行列（间距在字高一半以内的算同一行或同一列），写成 `tables/<块名>.csv`（UTF-8 带 BOM）：`row`、`col`、`text`、`x`、`y`、`layer`、`handle`。合并单元格的文字落在几行或几列中间，会单独占一个行号或列号，按坐标看。清单 `embedded.tables` 记单元格数、行列数、第一行文字、引用它的 `ACAD_TABLE` 及其所在块、这个块被插入了几次。
-  - LibreDWG 转出的 `ACAD_TABLE` 只剩一行 `0/ACAD_TABLE`，没有内容（妈湾 `tukuang` 块里那张），ezdxf 读不到。程序按组码计数发现这种情况就给出警告：单元格还能从 `*T` 块读出，但表格和块的对应关系丢了；需要它时用 ODA File Converter 重新转换。妈湾的 `*T58` 是旧版的规划区用地汇总表（居住用地 32.45 公顷），`tukuang` 和 `*T58` 都没有被插入到图里。
+  - LibreDWG 转出的 `ACAD_TABLE` 只剩一行 `0/ACAD_TABLE`，没有内容（示例图 `tukuang` 块里那张），ezdxf 读不到。程序按组码计数发现这种情况就给出警告：单元格还能从 `*T` 块读出，但表格和块的对应关系丢了；需要它时用 ODA File Converter 重新转换。示例图的 `*T58` 是旧版的规划区用地汇总表（居住用地 32.45 公顷），`tukuang` 和 `*T58` 都没有被插入到图里。
 - **填充配对**：`<代码>_T` 上的 HATCH 不带属性，只用来核对。清单的 `summary.fills` 列出三项：没有填充的地块数、不在任何地块里的填充数、填充图层代码和地块用地代码不一致的情况。
 - **块内副本**：图块定义里带 `用地代码` 的实体不当作地块。清单的 `block_copies` 按块列出这类实体的个数，以及这个块在模型空间里被插入了几次。
 - **未炸开的自定义实体**：模型空间里有 `LZX_LAND` 实体时直接报错，提示先在湘源里炸开或输出，再重新转换。CLASSES 段只登记了这个类、却没有实例时照常处理，清单 `custom_entities` 记下这一情况。代理实体只给出警告。
@@ -211,7 +211,7 @@ python cad.py polygonize /work/cad/fatu-raw/raw.gpkg --cad-layers 地块界线,�
   - 按图层、图块、范围框、范围多边形的顺序，取第一条命中的规则。线要整条落在范围框或多边形里才剔除；跨过范围边界的线保留、不裁剪，个数记在清单里，并写一条说明。
   - 被剔除的线写入 `excluded` 图层（`layer`、`handle`、`block`、`rule`），检查图里画成灰色虚线。清单的 `exclusion` 记规则文件的路径、SHA-256 和内容，范围多边形的来源和个数，剔除总数，按规则和按图层的计数，跨边界保留的线数，以及一条线也没命中的规则（同时写进说明）。
   - 规则命中了 `--boundary` 规划范围线所在的图层时报错；全部线都被剔除时也报错。
-  - 妈湾法图：把 `_K` 地块线和 `图框_*` 各层一起提取，不剔除时围出 168 个面、共 867 公顷；用 `layers: [图框_*]` 剔除 71 条线（图例 40、图框 22、指北针 6、单元划分图 3）后剩 107 个面，面积 1,218,800 m²，和湘源直取的地块（去掉误标的图框面）一致。
+  - 示例法图：把 `_K` 地块线和 `图框_*` 各层一起提取，不剔除时围出 168 个面、共 867 公顷；用 `layers: [图框_*]` 剔除 71 条线（图例 40、图框 22、指北针 6、单元划分图 3）后剩 107 个面，面积 1,218,800 m²，和湘源直取的地块（去掉误标的图框面）一致。
 - **吸附（`--snap`，米，必填）**：
   - 距离在 `--snap` 以内的端点合并到它们的平均位置。一条线首尾相距不到 `--snap` 时，因此会被闭合。
   - 合并后仍然孤立的端点，如果离别的线在 `--snap` 以内，就移到那条线上最近的点，并在那条线上插入同一个顶点，处理 T 形接头差一点没碰上的情况。
@@ -240,7 +240,7 @@ python cad.py compare-fills /work/cad/fatu-xy/parcels.gpkg --faces-layer parcels
 ```
 
 - **输入**：面图层（`--faces-layer`，默认 `faces`）和 `raw.gpkg` 的 `hatches`（`--fills-layer`）。两边的 CRS 必须相同，或者都没有；带 CRS 时须是以米为单位的投影坐标系。`--cad-layers` 只取这些 CAD 图层上的填充；`--exclude-hold` 去掉 `status = hold` 的面，清单记个数。
-- **配对**：每个填充配给 IoU（交集面积除以并集面积）最大的那个面。按 IoU 而不是按重叠面积，是因为图框、规划范围这类大面和每个填充都重叠，却和哪个都对不上。妈湾法图里误标成 `DY` 的图框面就是这种情况。
+- **配对**：每个填充配给 IoU（交集面积除以并集面积）最大的那个面。按 IoU 而不是按重叠面积，是因为图框、规划范围这类大面和每个填充都重叠，却和哪个都对不上。示例法图里误标成 `DY` 的图框面就是这种情况。
 - **图层 `fills`**：填充的全部字段，另加：
   - `match`：`one face`、`several faces`（同时和几个面有重叠，`faces` 记个数）、`no face`、`invalid fill`、`empty fill`；
   - 最佳面的序号 `face_index` 和字段 `face_face_id`、`face_parcel_id`、`face_landuse`、`face_control_type`、`face_status`、`face_layer`、`face_handle`（面图层里有哪些就带哪些）；
@@ -250,7 +250,7 @@ python cad.py compare-fills /work/cad/fatu-xy/parcels.gpkg --faces-layer parcels
 - **图层 `fill_only`、`face_only`**：两边并集互减后的每一块，带 `area_m2`。贴边的浮点细缝也会列出，面积很小，按 `area_m2` 筛选。
 - **无效几何**：无效的填充和面照样列出，但不参与比较，并给出警告。
 - **输出**：新目录，含 `fill_compare.gpkg`、`check.png`（只有面的部分为橙色，填充为浅蓝，只有填充的部分为红色，面的边界为灰线）、`manifest.json`（`manifest: cad-fill-compare` v1：输入、`summary`（配对情况、没有填充的面数、IoU 中位数和最小值）、`area`（两边面积、共有面积、`fill_only_m2`、`face_only_m2`））和 `record.json`。
-- **妈湾法图实测**（湘源直取地块，`_T` 和 `DY控制地块` 两类填充，去掉 hold 的图框面）：
+- **示例法图实测**（湘源直取地块，`_T` 和 `DY控制地块` 两类填充，去掉 hold 的图框面）：
   - 51 个 `_T` 填充和地块的 IoU 都是 1，边界完全一致；
   - 4 个各 240 m² 的 `_T` 填充不在任何地块里，位于图例区，是图例色块；
   - 07-24 的 G1 填充边界自相交，未参与比较；
@@ -319,7 +319,7 @@ road: {layers: [道路红线], landuse: [S1]}
 
 ```bash
 python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --inspection /work/cad/fatu-inspect --crs EPSG:4547 \
-  --confirmed-by 张三 --basis "与前海范围图层比对重叠，叠加道路中线核对无系统偏移" --output /work/cad/fatu-crs
+  --confirmed-by 张三 --basis "与片区范围图层比对重叠，叠加道路中线核对无系统偏移" --output /work/cad/fatu-crs
 ```
 
 - **确认**：`--confirmed-by`（谁确认的）和 `--basis`（依据什么确认的）必填，不能为空。程序只照实记录，不核实依据本身。
@@ -330,14 +330,14 @@ python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --i
 - **输入**：矢量文件。默认给其中所有图层一起赋 CRS，图层名不变，空图层也照样赋上，例如 `cad.py xiangyuan` 输出的 `parcels.gpkg` 一次就能处理完；只想处理一个图层时用 `--layer`。每个图层的范围都要落在体检记录的范围内；已经有 CRS 的图层直接拒绝，要换坐标系应当做重投影。
 - **CRS**：必须是以米为单位的投影坐标系。
 - **要素核对（证据）**：体检只比外包框，整体平移几十米也能通过，所以下面两种情况赋值前必须核对：
-  - CRS 不带带号（东偏移不到 1,000,000，例如 EPSG:4547 的 500,000）——深圳独立坐标这类城市坐标最容易和它混淆；
+  - CRS 不带带号（东偏移不到 1,000,000，例如 EPSG:4547 的 500,000）——城市独立坐标这类坐标最容易和它混淆；
   - 用了 `--outside-candidates`。
   
   带带号的坐标（例如 EPSG:4527 的 39,500,000）可以不核对；给了核对参数就照样核对。阈值必须自己给，没有默认值。两种证据任选其一，都给了就两个都要通过；不通过时整个结果不发布。
   - **边界重合**：`--check-reference 文件[:图层] --tolerance 米 --min-share 比例`。取源文件线、面图层的全部顶点（`--check-layer` 可以指定图层），量到参考图层边界的最近距离，落在 `--tolerance` 以内的比例要达到 `--min-share`。参考图层必须有 CRS，只读图纸周围的部分，CRS 不同时先换算到赋值的 CRS。参考图层要和图纸共用边界，例如旧版控规、同一片区的规划地块；宗地、建筑等边界本来就不同的图层重合比例低，不适合拿来核对。和平移方向平行的直线检测不出这个平移，参考里要有不同方向的边。
   - **控制点**：`--check-points 点.csv --max-check-error 米`。CSV 格式和 `vector-georef.py` 相同（`id`、`src_x`、`src_y`、`dst_x`、`dst_y`，`role` 可有可无）：`src` 是图上坐标，`dst` 是同一点在所赋 CRS 下的已知坐标。坐标不做任何变换，逐点量两者的距离，最大误差不能超过阈值。
   - 清单的 `evidence` 记下是否必须核对和原因，以及每种证据的输入、哈希、阈值和实测值：边界重合给出重合比例、距离中位数、第 10 百分位、分图层比例；控制点给出逐点误差、最大误差和 RMSE。`zone_prefix` 记下 CRS 是否带带号。
-  - 妈湾法图（EPSG:4547，不带带号）：不核对时拒绝执行。对照 `大前海详细规划`，`--tolerance 0.05 --min-share 0.3` 通过：68.6% 的顶点在 5 cm 以内，地块层 79.6%，距离中位数 0.4 mm。对照 `国有已供用地`，同样的阈值只有 10.2%，被拒绝。
+  - 示例法图（EPSG:4547，不带带号）：不核对时拒绝执行。对照 `片区详细规划`，`--tolerance 0.05 --min-share 0.3` 通过：68.6% 的顶点在 5 cm 以内，地块层 79.6%，距离中位数 0.4 mm。对照 `国有已供用地`，同样的阈值只有 10.2%，被拒绝。
 - **回读核对**：写出 `<输入名>.gpkg` 后逐层重新读回，逐个比对几何的 WKB 和全部属性值，再核对 CRS；任何一层有一项不一致，整个结果都不发布。输入文件不会被改动。
 - **输出**：新目录，含 `<输入名>.gpkg`、`manifest.json`（`manifest: crs-assignment` v1：输入的名称、SHA-256 与图层列表，`crs` 的编号、名称和基准，`confirmed_by`、`basis`、`confirmed_at`，体检报告的路径、SHA-256、对应图纸及其按原坐标列出的候选，`outside_candidates`、`zone_prefix`、`evidence`，`checks`（逐层的要素数、范围和回读核对结果），输出的 SHA-256）和 `record.json`。
 
@@ -347,7 +347,7 @@ python cad.py assign-crs /work/cad/fatu-raw/raw.gpkg --layer closed_polygons --i
 
 ```bash
 python cad.py overlay /work/cad/fatu-crs/parcels.gpkg --exclude-hold \
-  --reference /work/data/前海.gdb:国有已供用地 --reference /work/data/更新范围.shp \
+  --reference /work/data/示例.gdb:国有已供用地 --reference /work/data/更新范围.shp \
   --reference /work/cad/fatu-crs/parcels.gpkg:units --output /work/cad/fatu-overlay
 ```
 

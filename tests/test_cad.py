@@ -219,7 +219,7 @@ def reference(path, crs, bounds):
 
 
 def test_reference_overlap_lists_its_crs_for_unprefixed_coordinates(tmp_path):
-    source = dxf(tmp_path/'qianhai.dxf', site(495_000, 2_490_000))  # CGCS2000 CM 114E without prefix
+    source = dxf(tmp_path/'bare-site.dxf', site(495_000, 2_490_000))  # CGCS2000 CM 114E without prefix
     ref = reference(tmp_path/'range.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000))
     report = inspect(source, tmp_path/'out', '--reference', ref)
     comparison = report['crs']['reference']['comparisons'][0]
@@ -702,7 +702,7 @@ def test_inspect_reads_libredwg_xdata_in_xrecords(tmp_path):
     ezdxf = pytest.importorskip('ezdxf')
     doc = ezdxf.new('R2018')
     doc.modelspace().add_line((0, 0), (10, 10), dxfattribs={'layer': '地块界线'})
-    doc.objects.add_xrecord(doc.rootdict.dxf.handle)  # empty, like the 湘源 reactor records in the Mawan drawing
+    doc.objects.add_xrecord(doc.rootdict.dxf.handle)  # empty, like the 湘源 reactor records in a sample drawing
     source = tmp_path/'libredwg.dxf'
     doc.saveas(source)
     text = source.read_text(encoding='utf-8')
@@ -787,14 +787,14 @@ def fake_oda(folder, prepared):
 def test_convert_with_oda_takes_names_with_brackets(tmp_path):
     prepared = dxf(tmp_path/'prepared.dxf', site(39_500_000, 3_400_000))
     oda = fake_oda(tmp_path/'oda', prepared)
-    source = tmp_path/'法图[妈湾片区]（带编号）.dwg'
+    source = tmp_path/'法图[示例片区]（带编号）.dwg'
     source.write_bytes(b'AC1032' + bytes(200))
     empty = tmp_path/'empty'
     empty.mkdir()
     manifest = run_convert(source, tmp_path/'out', '--tool', 'oda', path=empty, oda=oda)
     assert manifest['converter']['tool'] == 'oda' and manifest['converter']['command'][-1] == '*.DWG'
     assert manifest['converter']['command'][3:6] == ['ACAD2018', 'DXF', '0']
-    assert (tmp_path/'out'/'法图[妈湾片区]（带编号）.dxf').read_bytes() == prepared.read_bytes()
+    assert (tmp_path/'out'/'法图[示例片区]（带编号）.dxf').read_bytes() == prepared.read_bytes()
 
 
 @pytest.mark.skipif(shutil.which('dwg2dxf') is None or shutil.which('dxf2dwg') is None, reason='LibreDWG not installed')
@@ -1368,9 +1368,9 @@ def test_polygonize_exclusion_refusals(tmp_path):
 
 def unprefixed(tmp_path):
     """A drawing in CGCS2000 CM 114E without the zone prefix, inspected against a range layer, and converted."""
-    source = dxf(tmp_path/'qianhai.dxf', site(495_000, 2_490_000))
+    source = dxf(tmp_path/'bare-site.dxf', site(495_000, 2_490_000))
     inspect(source, tmp_path/'inspect', '--reference', reference(tmp_path/'range.gpkg', 'EPSG:4547', (494_000, 2_489_000, 497_000, 2_492_000)))
-    gpkg = tmp_path/'qianhai.gpkg'
+    gpkg = tmp_path/'bare-site.gpkg'
     run = subprocess.run([sys.executable, str(SCRIPTS/'convert.py'), str(source), '--output', str(gpkg)], capture_output=True, text=True)
     assert run.returncode == 0, run.stdout+run.stderr
     return gpkg, tmp_path/'inspect'
@@ -1409,3 +1409,12 @@ def test_assign_crs_without_zone_prefix_needs_a_feature_check(tmp_path):
     loose = assign(gpkg, tmp_path/'g', *base, '--check-points', points, '--max-check-error', 2.5)
     assert loose['evidence']['points']['rmse_m'] == pytest.approx(math.sqrt((0.1**2 + 2**2)/2), abs=1e-4)
     assert 'needs a positive --max-check-error' in assign(gpkg, tmp_path/'h', *base, '--check-points', points, success=False)
+
+
+def test_schema_reads_every_observed_drawing(tmp_path):
+    import cad
+    schema = tmp_path/'schema.json'
+    schema.write_text(json.dumps({'observed_on_a': {'entity_apps': ['甲']}, 'observed_on_b': {'entity_apps': ['乙']}},
+                                 ensure_ascii=False), encoding='utf-8')
+    names, numeric = cad.load_schema(schema)
+    assert names == {'甲', '乙'} and numeric == set()

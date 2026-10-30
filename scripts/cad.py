@@ -182,8 +182,8 @@ def readings(x, y, scale, near, near_km):
     if 0 < n < 6.5e6 and (13 <= zone <= 23 or 25 <= zone <= 45):
         width = 6 if zone <= 23 else 3
         consider(f'gauss-kruger {width}-degree zone {int(zone)} (zone prefix)', gauss_kruger().get((width, int(zone)), []))
-    # Without the zone prefix a Gauss-Kruger grid, a UTM zone and a city or project local grid (Shenzhen's,
-    # for one) look alike, so no EPSG code is listed for them, --near or not.
+    # Without the zone prefix a Gauss-Kruger grid, a UTM zone and a city's or a project's own local grid
+    # look alike, so no EPSG code is listed for them, --near or not.
     bare = 0 < e < 1e6 and 0 < n < 6.5e6
     if not found and not bare and near is not None and abs(e) <= 20037508.35 and abs(n) <= 20037508.35:
         consider('web mercator', [('WGS 84', 'EPSG:3857', 'WGS 84 / Pseudo-Mercator', None)])
@@ -1749,8 +1749,8 @@ XIANGYUAN_KEY = '用地代码'   # 湘源控规 writes each parcel attribute as 
 XIANGYUAN_ALIASES = {'parcel_id': '地块编号', 'landuse': '用地代码', 'landuse_name': '用地性质'}
 XIANGYUAN_FIXED = ('parcel_id', 'landuse', 'landuse_name', 'control_type', 'unit_id', 'status', 'reason', 'area_m2', 'area_declared',
                    'area_diff', 'number_block', 'filled_from_block', 'fills', 'valid', 'layer', 'handle', 'other_xdata')
-# Parcel attribute names seen on 湘源控规 drawings: the land-attribute table of 湘源 7.0 and the Shenzhen submission
-# fields some drawings carry instead. Applications outside this list (other vendors' plug-ins) go to other_xdata.
+# Parcel attribute names seen on 湘源控规 drawings: the land-attribute table of 湘源 7.0 and a local submission
+# standard's fields some drawings carry instead. Applications outside this list (other vendors' plug-ins) go to other_xdata.
 XIANGYUAN_FIELDS = frozenset((
     '地块编号 用地代码 用地名称 用地类型 用地性质 第一位比例 第二位比例 第三位比例 第四位比例 用地主代码 第二位代码 第三位代码 '
     '第四位代码 混合代码 单位名称 单位类别 单位规模 一类兼容 二类兼容 非机车位 机动车位 配套公建 地块标高 总面积 用地面积 道路面积 '
@@ -1789,7 +1789,10 @@ def load_schema(path):
     if not isinstance(data, dict):
         raise ValueError(f'--schema {path} must be a JSON object')
     names = set(data.get('land_attribute_fields_order') or []) | set(data.get('gis_field_mapping') or {})
-    names |= set((data.get('observed_on_mawan') or {}).get('entity_apps') or [])
+    # `observed_on_<drawing>` blocks record the XDATA applications seen on one drawing; any number of them may be given.
+    for key, observed in data.items():
+        if key.startswith('observed_on_') and isinstance(observed, dict):
+            names |= set(observed.get('entity_apps') or [])
     numeric = set(data.get('numeric_like') or [])
     if not names and not numeric:
         raise ValueError(f'--schema {path} has no land_attribute_fields_order, gis_field_mapping or numeric_like')
@@ -2439,7 +2442,7 @@ def convert(args):
         if tool == 'libredwg':
             command = [found[tool], '-y', '--as', as_libredwg, '-o', str(target), str(copy)]
         else:
-            # ODA takes a wildcard filter, not a name: brackets in a name such as 法图[妈湾片区].dwg would match nothing.
+            # ODA takes a wildcard filter, not a name: brackets in a name such as 法图[示例片区].dwg would match nothing.
             # The input folder holds only the copy, so every DWG in it is the one wanted.
             command = [found[tool], str(given), str(out), as_oda, 'DXF', '0', '1', '*.DWG']
         started = time.monotonic()
