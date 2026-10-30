@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unpack an ArcGIS layer or map package (.lpk, .lpkx, .mpk, .mpkx) safely and say what is in it.
+"""Unpack an ArcGIS layer or map package and say what is in it; pack a map-style map into a styled GeoPackage for QGIS.
 
 `package.py unpack` lists the archive (7z through bsdtar or 7-Zip, or zip) and refuses absolute paths, '..',
 links and archives larger than --max-bytes before extracting anything; it then checks the extracted sizes against
@@ -9,12 +9,21 @@ repeated there), and matches each layer file to its data: .lyrx (ArcGIS Pro)
 is JSON and its renderer fields, label expression and definition query are read; .lyr (ArcMap) is a binary
 format, so only its data-source path and the names it mentions are picked out. Layers whose data is not in the
 package (packaged by reference, or enterprise data left out) are reported. Symbology is not reproduced.
+
+`package.py pack` reads a map-style v1 document (gis-plugin contracts) and the data it names, and writes one
+GeoPackage that QGIS opens with the map's styles: one table per dataset in its own CRS (a dataset drawn by several
+layers is stored once), each layer's style as QML in layer_styles, the precomputed label positions as a point layer
+(and leader lines), and a QGIS project inside the GeoPackage with the layer order, groups and map extent. The data
+kept is chosen by the map extent: whole features that touch it (default), features cut at it (--clip, with a
+`clipped` field), or whole datasets (--full); rasters are cut to the extent's window. A manifest lists every
+dataset's source, scope and feature count, what could not be expressed in QGIS, and the fonts the map uses.
 """
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path, PurePosixPath
 import re
 import shutil
@@ -23,6 +32,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from _delivery import bundle, digest, write_json
+import _map_style
 
 VERSION = '0.1.0'
 SUFFIXES = {'.lpk', '.lpkx', '.mpk', '.mpkx'}
@@ -398,6 +408,536 @@ def unpack(args):
     return manifest
 
 
+# --- pack: map-style -> GeoPackage with QGIS styles -----------------------------------------------------------------
+
+RESERVED_TABLES = {'layer_styles', 'qgis_projects', 'map_labels', 'map_label_leaders'}
+GPKG_RASTER_TYPES = {'uint8', 'int16', 'uint16', 'float32'}
+LARGE_BYTES = 500 * 2**20
+DIMENSIONS = {'point': 0, 'line': 1, 'polygon': 2}
+
+
+def gpkg_version(gpkg):
+    """Create the GeoPackage as version 1.2, which the GDAL in older QGIS builds reads without warnings."""
+    return {} if gpkg.exists() else {'dataset_options': {'VERSION': '1.2'}}
+
+
+def parse_margin(text):
+    """--margin as a share of the extent's width and height: 0.1 or 10%."""
+    if text is None:
+        return 0.0
+    value = float(text[:-1]) / 100 if text.endswith('%') else float(text)
+    if not 0 <= value <= 1:
+        raise ValueError('--margin must be between 0 and 100% of the extent')
+    return value
+
+
+def extent_bbox(document, margin):
+    bbox = (document.get('extent') or {}).get('bbox')
+    if bbox is None:
+        return None
+    west, south, east, north = bbox
+    dx, dy = (east - west) * margin, (north - south) * margin
+    return [max(-180.0, west - dx), max(-90.0, south - dy), min(180.0, east + dx), min(90.0, north + dy)]
+
+
+def extent_in(bbox, crs):
+    """The lon/lat extent as a polygon in crs, edges densified so a projected extent keeps its curved sides."""
+    import numpy as np
+    import shapely
+    from pyproj import CRS, Transformer
+    polygon = shapely.segmentize(shapely.box(*bbox), max(bbox[2] - bbox[0], bbox[3] - bbox[1]) / 64)
+    if crs.equals(CRS.from_epsg(4326)):
+        return polygon
+    transformer = Transformer.from_crs(4326, crs, always_xy=True)
+    return shapely.transform(polygon, lambda xy: np.column_stack(transformer.transform(xy[:, 0], xy[:, 1])))
+
+
+def table_name(path, layer, taken):
+    base = re.sub(r'\W+', '_', layer or path.stem).strip('_').lower() or 'data'
+    if base[0].isdigit() or base.startswith(('gpkg_', 'rtree_', 'sqlite_')) or base in RESERVED_TABLES:
+        base = 't_' + base
+    name, n = base, 2
+    while name in taken:
+        name, n = f'{base}_{n}', n + 1
+    taken.add(name)
+    return name
+
+
+def keep_dimension(geometry, dimension):
+    """Parts of a clipped geometry with the layer's dimension (a cut polygon can leave lines and points on the edge)."""
+    import shapely
+    if geometry is None or geometry.is_empty:
+        return None
+    if shapely.get_dimensions(geometry) == dimension and geometry.geom_type != 'GeometryCollection':
+        return geometry
+    parts, stack = [], [geometry]
+    while stack:
+        item = stack.pop()
+        if item.geom_type.startswith('Multi') or item.geom_type == 'GeometryCollection':
+            stack.extend(item.geoms)
+        elif not item.is_empty and shapely.get_dimensions(item) == dimension:
+            parts.append(item)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return {0: shapely.multipoints, 1: shapely.multilinestrings, 2: shapely.multipolygons}[dimension](parts)
+
+
+def vector_layer_name(path, layer):
+    import pyogrio
+    layers = [row[0] for row in pyogrio.list_layers(path)]
+    if layer is None:
+        if len(layers) != 1:
+            raise ValueError(f'{path.name} holds {len(layers)} layers ({", ".join(layers[:8])}); name one with data.layer')
+        return layers[0]
+    if layer not in layers:
+        raise ValueError(f'{path.name} has no layer {layer!r} (layers: {", ".join(layers[:8])})')
+    return layer
+
+
+def select(geometries, selector, scope, geometry, ref):
+    """(features kept, their geometries, which were cut) for one scope; geometries are shapely objects."""
+    import numpy as np
+    import shapely
+    if scope == 'full':
+        return np.ones(len(geometries), bool), geometries, None
+    keep = ~shapely.is_missing(geometries) & shapely.intersects(geometries, selector)
+    geometries = geometries[keep]
+    if scope != 'clip':
+        return keep, geometries, None
+    cut = ~shapely.covered_by(geometries, selector)
+    invalid = int((~shapely.is_valid(geometries[cut])).sum())
+    if invalid:
+        raise ValueError(f'{ref}: {invalid} invalid geometries cross the map extent and cannot be cut; repair them first (fix.py) '
+                         'or pack without --clip')
+    geometries = geometries.copy()
+    geometries[cut] = [keep_dimension(g, DIMENSIONS[geometry]) for g in shapely.intersection(geometries[cut], selector)]
+    survived = ~shapely.is_missing(geometries)  # a piece that only touches the edge leaves nothing of the layer's dimension
+    keep[np.flatnonzero(keep)[~survived]] = False
+    return keep, geometries[survived], cut[survived]
+
+
+def declared_type(declared, geometries):
+    """The geometry type to declare after cutting: multi when cutting split a single part (singles are promoted)."""
+    import shapely
+    base = declared.replace(' Z', '').replace(' M', '')
+    if base.startswith('Multi') or base == 'Unknown' or not len(geometries):
+        return declared, geometries
+    if not any(g.geom_type.startswith('Multi') for g in geometries):
+        return declared, geometries
+    promote = {'Point': shapely.multipoints, 'LineString': shapely.multilinestrings, 'Polygon': shapely.multipolygons}.get(base)
+    if promote is None:
+        return 'Unknown', geometries
+    geometries = geometries.copy()
+    for index, item in enumerate(geometries):
+        if not item.geom_type.startswith('Multi'):
+            geometries[index] = promote([item])
+    return 'Multi' + declared, geometries
+
+
+def pack_vector(entry, gpkg, scope, bbox, geometry):
+    """Copy one vector dataset into the GeoPackage table entry['table']; returns its row for the manifest.
+
+    With pyarrow the attributes go through Arrow untouched (integer fields with NULLs stay integers, boolean
+    subtypes stay boolean); without it they go through pandas, which can widen such fields, and this is warned.
+    """
+    import numpy as np
+    import pyogrio
+    import shapely
+    from pyproj import CRS
+    path = entry['path']
+    layer = vector_layer_name(path, entry['data_layer'])
+    info = pyogrio.read_info(path, layer=layer)
+    crs = CRS.from_user_input(info['crs']) if info.get('crs') else None
+    warnings = []
+    if scope != 'full' and crs is None:
+        raise ValueError(f'{entry["ref"]} has no CRS, so the map extent cannot be placed on it; assign a CRS or use --full')
+    selector = None if scope == 'full' else extent_in(bbox, crs)
+    window = {} if selector is None else {'bbox': tuple(selector.bounds)}
+    if scope == 'clip' and 'clipped' in list(info['fields']):
+        raise ValueError(f'{entry["ref"]} already has a field named "clipped"; --clip adds that field')
+    try:
+        import pyarrow as pa
+        from pyogrio.raw import read_arrow, write_arrow
+    except ImportError:
+        pa = None
+    if pa is not None:
+        meta, table = read_arrow(path, layer=layer, **window)
+        column = meta['geometry_name'] or 'wkb_geometry'
+        geometries = shapely.from_wkb(np.asarray(table[column].to_numpy(zero_copy_only=False), dtype=object))
+        keep, geometries, cut = select(geometries, selector, scope, geometry, entry['ref'])
+        table = table.filter(pa.array(keep))
+        kind = meta['geometry_type']
+        if cut is not None:
+            kind, geometries = declared_type(kind, geometries)
+            position = table.schema.get_field_index(column)
+            table = table.set_column(position, table.schema.field(column), pa.array(shapely.to_wkb(geometries), pa.binary()))
+            table = table.append_column('clipped', pa.array(cut, pa.bool_()))
+        write_arrow(table, gpkg, layer=entry['table'], driver='GPKG', geometry_name='geom', geometry_type=kind, crs=meta['crs'],
+                    **gpkg_version(gpkg))
+    else:
+        import geopandas as gpd
+        frame = pyogrio.read_dataframe(path, layer=layer, **window)
+        keep, geometries, cut = select(frame.geometry.to_numpy(), selector, scope, geometry, entry['ref'])
+        frame = frame[keep]
+        if cut is not None:
+            frame = frame.assign(clipped=cut).set_geometry(gpd.GeoSeries(geometries, index=frame.index, crs=frame.crs))
+        pyogrio.write_dataframe(frame.reset_index(drop=True), gpkg, layer=entry['table'], driver='GPKG',
+                                geometry_type=info['geometry_type'] if not len(frame) else None, **gpkg_version(gpkg))
+        warnings.append(f'{entry["ref"]}: copied without pyarrow; integer and boolean fields with NULLs may be widened to real numbers')
+    if not len(geometries):
+        warnings.append(f'{entry["ref"]}: no features inside the map extent; an empty table is written')
+    else:
+        found = {g.geom_type.replace('Multi', '') for g in geometries if g is not None}
+        expected = {'point': 'Point', 'line': 'LineString', 'polygon': 'Polygon'}[geometry]
+        if found - {expected}:
+            warnings.append(f'{entry["ref"]}: geometry {", ".join(sorted(found))} does not match the layer geometry {geometry}')
+    written = pyogrio.read_info(gpkg, layer=entry['table'])
+    return {'kind': 'vector', 'source_layer': layer, 'crs': crs, 'wkb': written['geometry_type'],
+            'geometry_column': written.get('geometry_name') or 'geom', 'source_features': info.get('features'),
+            'features': int(written['features']), 'clipped_features': None if cut is None else int(cut.sum()), 'warnings': warnings,
+            'bounds': list(shapely.total_bounds(geometries)) if len(geometries) else None}
+
+
+def pack_raster(entry, gpkg, stage, scope, bbox):
+    """Cut a raster to the map extent's window and store it as a GeoPackage raster table when that is lossless.
+
+    GeoPackage tiles hold 1-4 band Byte rasters (PNG) and single-band Int16, UInt16 or Float32 grids; anything else
+    (and Byte rasters with a nodata value, which PNG tiles cannot keep) is written as a GeoTIFF beside the GeoPackage.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.warp import transform_bounds
+    from rasterio.windows import Window, from_bounds
+    with rasterio.open(entry['path']) as source:
+        if source.crs is None:
+            raise ValueError(f'{entry["ref"]} has no CRS')
+        if source.transform.b or source.transform.d:
+            raise ValueError(f'{entry["ref"]} is a rotated raster; only north-up rasters are packed')
+        full = Window(0, 0, source.width, source.height)
+        if scope == 'full':
+            window = full
+        else:
+            cells = from_bounds(*transform_bounds('EPSG:4326', source.crs, *bbox, densify_pts=21), transform=source.transform)
+            col0, row0 = max(0, math.floor(cells.col_off)), max(0, math.floor(cells.row_off))
+            col1 = min(source.width, math.ceil(cells.col_off + cells.width))
+            row1 = min(source.height, math.ceil(cells.row_off + cells.height))
+            if col1 <= col0 or row1 <= row0:
+                raise ValueError(f'{entry["ref"]} does not reach the map extent')
+            window = Window(col0, row0, col1 - col0, row1 - row0)
+        data = source.read(window=window, masked=False)
+        transform = source.window_transform(window)
+        dtype, count, nodata = source.dtypes[0], source.count, source.nodata
+        stats = {}
+        for band in range(1, count + 1):
+            values = data[band - 1]
+            values = values[values != nodata] if nodata is not None else values
+            values = values[np.isfinite(values)] if values.dtype.kind == 'f' else values
+            if values.size:
+                stats[band] = (float(values.min()), float(values.max()))
+        profile = {'width': int(window.width), 'height': int(window.height), 'count': count, 'dtype': dtype, 'crs': source.crs,
+                   'transform': transform, 'nodata': nodata}
+        colormap = None
+        if count == 1 and dtype == 'uint8':
+            try:
+                colormap = source.colormap(1)
+            except ValueError:
+                colormap = None
+        crs = source.crs
+    lossless = (dtype == 'uint8' and count <= 4 and nodata is None) or (count == 1 and dtype in GPKG_RASTER_TYPES - {'uint8'})
+    if lossless:
+        options = {'RASTER_TABLE': entry['table'], 'APPEND_SUBDATASET': 'YES', **gpkg_version(gpkg).get('dataset_options', {})}
+        if dtype == 'uint8':
+            options['TILE_FORMAT'] = 'PNG'
+        with rasterio.open(gpkg, 'w', driver='GPKG', **profile, **options) as target:
+            target.write(data)
+            if colormap:
+                target.write_colormap(1, colormap)
+        storage, file = 'geopackage', None
+    else:
+        folder = stage / 'rasters'
+        folder.mkdir(exist_ok=True)
+        file = f'rasters/{entry["table"]}.tif'
+        with rasterio.open(stage / file, 'w', driver='GTiff', compress='deflate', tiled=True, **profile) as target:
+            target.write(data)
+            if colormap:
+                target.write_colormap(1, colormap)
+        storage = 'geotiff'
+    from pyproj import CRS
+    return {'kind': 'raster', 'crs': CRS.from_user_input(crs.to_wkt()), 'storage': storage, 'file': file,
+            'size': [profile['width'], profile['height']], 'bands': count, 'dtype': dtype, 'stats': stats,
+            'window': None if scope == 'full' else [int(window.col_off), int(window.row_off), int(window.width), int(window.height)],
+            'bounds': list(rasterio.transform.array_bounds(profile['height'], profile['width'], transform)),
+            'warnings': [] if lossless else [f'{entry["ref"]}: {dtype} x {count} band{"s" if count > 1 else ""}'
+                                              f'{" with nodata" if nodata is not None else ""} is not lossless as GeoPackage tiles; written to {file}']}
+
+
+def placement_tables(document, gpkg):
+    """labelPlacements as a point table (map_labels) and their leaders as a line table (map_label_leaders)."""
+    import geopandas as gpd
+    from shapely.geometry import LineString, Point
+    from _qgis_style import QUADRANTS
+    labels, leaders = [], []
+    for index, item in enumerate(document.get('labelPlacements') or []):
+        style = item['style']
+        halo = style.get('halo')
+        labels.append({'label_id': index + 1, 'layer': item.get('layer'), 'feature_id': None if item.get('featureId') is None else str(item['featureId']),
+                       'text': item['text'], 'font': style.get('font'), 'size_px': float(style['size']), 'size_mm': _map_style.mm(style['size']),
+                       'color': style['color'], 'halo_color': halo['color'] if halo else None,
+                       'halo_px': float(halo['width']) if halo else None, 'halo_mm': _map_style.mm(halo['width']) if halo else None,
+                       'anchor': item.get('anchor', 'center'), 'quadrant': QUADRANTS[item.get('anchor', 'center')],
+                       'rotation': float(item.get('rotation', 0)), 'has_leader': bool(item.get('leader')),
+                       'geometry': Point(item['position'])})
+        if item.get('leader'):
+            leaders.append({'label_id': index + 1, 'layer': item.get('layer'), 'text': item['text'], 'color': style['color'],
+                            'geometry': LineString(item['leader'])})
+    import pyogrio
+    if labels:
+        pyogrio.write_dataframe(gpd.GeoDataFrame(labels, crs='EPSG:4326'), gpkg, layer='map_labels', driver='GPKG', **gpkg_version(gpkg))
+    if leaders:
+        pyogrio.write_dataframe(gpd.GeoDataFrame(leaders, crs='EPSG:4326'), gpkg, layer='map_label_leaders', driver='GPKG', **gpkg_version(gpkg))
+    return len(labels), len(leaders)
+
+
+def project_crs(layers, datasets):
+    """The CRS most of the map's own layers use (ground layers count only when nothing else has a CRS); ties go to
+    the higher layer."""
+    from collections import Counter
+    for keep in (lambda l: l.get('group') not in ('ground', 'groundLines'), lambda l: True):
+        found = [datasets[l['_key']]['crs'] for l in layers if keep(l) and l.get('_key') in datasets and datasets[l['_key']].get('crs')]
+        if found:
+            counts = Counter(c.to_wkt() for c in found)
+            best = max(counts.values())
+            return next(c for c in reversed(found) if counts[c.to_wkt()] == best)
+    return None
+
+
+def pack(args):
+    import pyproj
+    import _qgis_style as qgis
+    style_path = Path(args.map_style)
+    document = _map_style.load(style_path)
+    scope = 'clip' if args.clip else 'full' if args.full else 'extent'
+    margin = parse_margin(args.margin)
+    bbox = extent_bbox(document, margin)
+    if bbox is None and scope != 'full':
+        raise ValueError('The map-style has no extent.bbox, so there is no map extent to select by; pass --full to pack whole datasets')
+    overrides = {}
+    for item in args.data_root or []:
+        name, sep, folder = item.partition('=')
+        if not sep or not name or not folder:
+            raise ValueError(f'--data-root expects name=/path, got {item!r}')
+        overrides[name] = folder
+    roots = _map_style.DataRoots(style_path, document.get('dataRoot', 'project'), args.project, overrides)
+    notes = []
+    for layer in document['layers']:
+        where = f'layer {layer["id"]}'
+        if layer.get('filter') is not None:
+            _map_style.check_filter(layer['filter'], where)
+        renderer = layer.get('renderer') or {}
+        for rule in renderer.get('rules', []) if renderer.get('type') == 'rule' else []:
+            _map_style.check_filter(rule['filter'], where)
+    datasets, taken = {}, set()
+    for layer in document['layers']:
+        data = layer['data']
+        path, root = roots.resolve(data['path'])
+        dataset_key = (str(path.resolve()), data.get('layer'))
+        layer['_key'] = dataset_key
+        entry = datasets.get(dataset_key)
+        kind = 'raster' if layer['geometry'] == 'raster' else 'vector'
+        if entry is None:
+            entry = datasets[dataset_key] = {'ref': data['path'], 'root': root, 'path': path, 'data_layer': data.get('layer'),
+                                             'kind': kind, 'geometry': layer['geometry'], 'layers': [], 'refs': {data['path']}}
+            if data.get('sha256'):
+                if not path.is_file():
+                    notes.append({'layer': layer['id'], 'item': 'data.sha256', 'reason': f'{data["path"]} is a folder; its sha256 is not checked'})
+                elif digest(path) != data['sha256']:
+                    raise ValueError(f'{data["path"]} has changed since the map-style was written (sha256 differs); export the map-style again')
+        elif entry['kind'] != kind:
+            raise ValueError(f'{data["path"]} is used both as a raster and as a vector layer')
+        entry['refs'].add(data['path'])
+        entry['layers'].append(layer['id'])
+    with bundle(args.output) as stage:
+        name = re.sub(r'[^\w.-]+', '_', args.name or document['id']).strip('._') or 'map'
+        gpkg = stage / f'{name}.gpkg'
+        not_packed, warnings = [], []
+        for entry in datasets.values():
+            entry['table'] = table_name(entry['path'], entry['data_layer'], taken)
+            try:
+                if entry['kind'] == 'raster':
+                    result = pack_raster(entry, gpkg, stage, scope, bbox)
+                else:
+                    result = pack_vector(entry, gpkg, scope, bbox, entry['geometry'])
+            except Exception as error:  # data GDAL cannot open (a tile folder, say) is listed, not fatal
+                if type(error).__module__.split('.')[0] not in ('pyogrio', 'rasterio'):
+                    raise
+                not_packed.append({'ref': entry['ref'], 'layers': entry['layers'], 'reason': f'cannot be read: {error}'})
+                entry['failed'] = True
+                continue
+            entry.update(result)
+            warnings += result.pop('warnings')
+        packed = {k: v for k, v in datasets.items() if not v.get('failed')}
+        if not packed:
+            raise ValueError('None of the map-style data could be packed: ' + '; '.join(f'{r["ref"]}: {r["reason"]}' for r in not_packed))
+        label_count, leader_count = placement_tables(document, gpkg)
+        project_layers, style_rows, layer_rows = [], [], []
+        defaults = set()
+        for layer in document['layers']:
+            entry = packed.get(layer['_key'])
+            if entry is None:
+                continue
+            title = layer.get('title') or (layer.get('legend') or {}).get('title') or layer['id']
+            row = {'id': layer['id'], 'name': title, 'layer': layer, 'kind': entry['kind'], 'crs': entry['crs']}
+            manifest_row = {'id': layer['id'], 'title': title, 'group': layer.get('group'),
+                            'table': None if entry.get('storage') == 'geotiff' else entry['table'],
+                            'map_style_renderer': (layer['renderer'] or {}).get('type')}
+            if entry['kind'] == 'raster':
+                row.update(provider='gdal', raster={'stats': entry['stats']},
+                           source=f'GPKG:./{gpkg.name}:{entry["table"]}' if entry['storage'] == 'geopackage' else f'./{entry["file"]}')
+                manifest_row['qgis_renderer'] = {'pseudocolor': 'singlebandpseudocolor', 'palette': 'paletted', 'rgb': 'multibandcolor'}[layer['renderer']['type']]
+                manifest_row['style'] = 'project only (QGIS keeps layer_styles for vector tables)'
+            else:
+                text, kind = qgis.qml(layer, notes)
+                default = entry['table'] not in defaults
+                defaults.add(entry['table'])
+                style_rows.append({'table': entry['table'], 'geometry_column': entry['geometry_column'], 'name': layer['id'], 'qml': text,
+                                   'default': default, 'description': f'map-style layer {layer["id"]}: {title}'})
+                row.update(provider='ogr', wkb=entry['wkb'], source=f'./{gpkg.name}|layername={entry["table"]}')
+                labels = layer.get('labels')
+                manifest_row.update(qgis_renderer=kind, default_style=default,
+                                    labels=None if not labels else 'on' if labels.get('enabled', True) else 'off',
+                                    filter=qgis.expression(layer.get('filter'), {}, []))
+            project_layers.append(row)
+            layer_rows.append(manifest_row)
+        crs = project_crs(document['layers'], packed)
+        placement_crs = pyproj.CRS.from_epsg(4326)
+        placements = (('map_label_leaders', leader_count, 'leaders', 'line', 'LineString'),  # leaders draw under their labels
+                      ('map_labels', label_count, 'labels', 'point', 'Point'))
+        for table, count, placement, geometry, wkb in placements:
+            if not count:
+                continue
+            layer_id = table if table not in {l['id'] for l in document['layers']} else f'{table}_placements'
+            pseudo = {'id': layer_id, 'geometry': geometry, 'group': 'labels'}
+            text, kind = qgis.qml(pseudo, notes, placement)
+            style_rows.append({'table': table, 'geometry_column': 'geom', 'name': layer_id, 'qml': text, 'default': True,
+                               'description': 'labels placed by the map-style producer' if placement == 'labels' else 'label leader lines'})
+            project_layers.append({'id': layer_id, 'name': 'labels (placed)' if placement == 'labels' else 'label leaders', 'layer': pseudo,
+                                   'kind': 'vector', 'crs': placement_crs, 'provider': 'ogr', 'wkb': wkb, 'placement': placement,
+                                   'source': f'./{gpkg.name}|layername={table}'})
+            layer_rows.append({'id': layer_id, 'title': project_layers[-1]['name'], 'group': 'labels', 'table': table,
+                               'map_style_renderer': None, 'qgis_renderer': kind, 'default_style': True,
+                               'labels': 'on' if placement == 'labels' else None, 'filter': None})
+        if bbox is not None and crs is not None:
+            extent = tuple(extent_in(bbox, crs).bounds)
+        else:
+            extent = project_extent(packed, crs)
+        tree, seen = [], {}
+        for row in reversed(project_layers):  # QGIS lists groups and layers top first
+            group = row['layer'].get('group')
+            if group not in seen:
+                seen[group] = []
+                tree.append((group, seen[group]))
+            seen[group].append(row['id'])
+        qgs = qgis.project(name, document.get('title') or document['id'], project_layers, tree, crs, extent, notes)
+        qgis.write_styles(gpkg, style_rows)
+        qgis.write_project(gpkg, name, qgs)
+        unique, notes_out = set(), []
+        for note in notes:
+            mark = json.dumps(note, sort_keys=True, ensure_ascii=False)
+            if mark not in unique:
+                unique.add(mark)
+                notes_out.append(note)
+        size = gpkg.stat().st_size + sum(f.stat().st_size for f in stage.glob('rasters/*'))
+        if size > LARGE_BYTES:
+            warnings.append(f'The package is {size / 2**20:.0f} MiB; --clip keeps less, or check what the map really needs')
+        fonts = _map_style.fonts_used(document)
+        if fonts:
+            warnings.append(f'The map uses the fonts {", ".join(f["family"] for f in fonts)}; QGIS substitutes another font where they are not installed')
+        if any(entry['root'].startswith('@') for entry in packed.values()):
+            warnings.append('Some data comes from external data roots (see datasets[].root); check its licence before sending the package')
+        manifest = {
+            'manifest': 'qgis-package', 'schema_version': 1,
+            'map_style': {'file': style_path.name, 'sha256': digest(style_path), 'id': document['id'], 'title': document.get('title'),
+                          'producer': document.get('producer'), 'schema_version': document['schema_version']},
+            'scope': scope, 'margin': margin, 'extent': {'bbox': bbox, 'map_style_bbox': (document.get('extent') or {}).get('bbox')},
+            'geopackage': {'file': gpkg.name, 'bytes': gpkg.stat().st_size, 'project': name,
+                           'tables': sorted({e['table'] for e in packed.values() if e.get('storage') != 'geotiff'}
+                                            | {table for table, count, *_ in placements if count})},
+            'project': {'name': name, 'crs': crs_label(crs), 'extent': [float(v) for v in extent] if extent else None,
+                        'open': f'QGIS: Project > Open From > GeoPackage, or open {gpkg.name} in the Browser and double-click project {name}'},
+            'datasets': [dataset_row(entry, scope) for entry in packed.values()],
+            'layers': layer_rows,
+            'label_placements': {'labels': label_count, 'leaders': leader_count, 'table': 'map_labels' if label_count else None,
+                                 'leader_table': 'map_label_leaders' if leader_count else None},
+            'fonts': fonts,
+            'not_packed': not_packed,
+            'unsupported': notes_out,
+            'bytes': size,
+            'warnings': warnings,
+        }
+        write_json(stage / 'package.json', manifest)
+        files = {p.relative_to(stage).as_posix(): digest(p) for p in sorted(stage.rglob('*')) if p.is_file()}
+        write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'package pack', 'version': VERSION,
+                                            'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
+                                            'source': {'path': str(style_path.absolute()), 'sha256': manifest['map_style']['sha256']},
+                                            'inputs': [{'ref': e['ref'], 'path': str(e['path']), 'sha256': e.get('sha256')} for e in packed.values()],
+                                            'files': files,
+                                            'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                                            'assumptions': ['Sizes: 1 px = 1/96 inch = 0.2646 mm',
+                                                            'Data keep their own CRS; label placements and leaders are stored in EPSG:4326',
+                                                            'Layer sources in the embedded project are relative to the GeoPackage file: keep its name']})
+    return manifest
+
+
+def crs_label(crs):
+    if crs is None:
+        return None
+    authority = crs.to_authority(min_confidence=90)
+    return ':'.join(authority) if authority else crs.name
+
+
+def project_extent(packed, crs):
+    """Without a map extent: the union of the packed data's bounds, in the project CRS."""
+    from pyproj import Transformer
+    boxes = []
+    for entry in packed.values():
+        if not entry.get('bounds') or entry.get('crs') is None:
+            continue
+        xmin, ymin, xmax, ymax = entry['bounds']
+        if crs is not None and not entry['crs'].equals(crs):
+            xmin, ymin, xmax, ymax = Transformer.from_crs(entry['crs'], crs, always_xy=True).transform_bounds(xmin, ymin, xmax, ymax, densify_pts=21)
+        boxes.append((xmin, ymin, xmax, ymax))
+    if not boxes:
+        return None
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def dataset_row(entry, scope):
+    path = entry['path']
+    row = {'ref': entry['ref'], 'root': entry['root'], 'table': None if entry.get('storage') == 'geotiff' else entry['table'], 'kind': entry['kind'],
+           'layers': entry['layers'], 'crs': crs_label(entry['crs']),
+           'scope': ('window' if scope != 'full' else 'full') if entry['kind'] == 'raster' else scope,
+           'source_bytes': path.stat().st_size if path.is_file() else sum(p.stat().st_size for p in path.rglob('*') if p.is_file())}
+    if len(entry['refs']) > 1:
+        row['refs'] = sorted(entry['refs'])
+    if entry['data_layer'] or entry.get('source_layer'):
+        row['source_layer'] = entry['data_layer'] or entry.get('source_layer')
+    if path.is_file():
+        entry['sha256'] = row['sha256'] = digest(path)
+    if entry['kind'] == 'vector':
+        row.update(source_features=entry['source_features'], features=entry['features'])
+        if entry['clipped_features'] is not None:
+            row['clipped_features'] = entry['clipped_features']
+    else:
+        row.update(storage=entry['storage'], size=entry['size'], bands=entry['bands'], dtype=entry['dtype'])
+        if entry['window']:
+            row['window'] = entry['window']
+        if entry['file']:
+            row['file'] = entry['file']
+    return row
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -405,8 +945,26 @@ def main():
     sub.add_argument('source', help='ArcGIS package file')
     sub.add_argument('--output', required=True, help='New directory for package/, package.json and record.json')
     sub.add_argument('--max-bytes', type=int, default=DEFAULT_MAX_BYTES, help='Refuse packages that expand beyond this (default 20 GiB)')
+    sub = commands.add_parser('pack', help='Pack a map-style map and its data into one GeoPackage styled for QGIS')
+    sub.add_argument('map_style', help='map-style v1 JSON file')
+    sub.add_argument('--output', required=True, help='New directory for the GeoPackage, package.json and record.json')
+    scope = sub.add_mutually_exclusive_group()
+    scope.add_argument('--clip', action='store_true', help='Cut features at the map extent and mark them in a "clipped" field')
+    scope.add_argument('--full', action='store_true', help='Keep whole datasets (default: whole features that touch the map extent)')
+    sub.add_argument('--margin', help='Widen the map extent by this share of its width and height before selecting, e.g. 10%% or 0.1')
+    sub.add_argument('--project', help='Project root for dataRoot "project" (default: the folder with gis-project.json above the map-style)')
+    sub.add_argument('--data-root', action='append', metavar='NAME=PATH', help='Path of an external data root @NAME on this device (repeatable)')
+    sub.add_argument('--name', help='GeoPackage and project name (default: the map-style id)')
     args = parser.parse_args()
     try:
+        if args.command == 'pack':
+            manifest = pack(args)
+            print(json.dumps({'output': str(Path(args.output).absolute()), 'geopackage': manifest['geopackage']['file'],
+                              'project': manifest['project']['name'], 'scope': manifest['scope'],
+                              'datasets': [{'ref': d['ref'], 'table': d['table'], 'features': d.get('features')} for d in manifest['datasets']],
+                              'unsupported': len(manifest['unsupported']), 'not_packed': [d['ref'] for d in manifest['not_packed']],
+                              'warnings': manifest['warnings']}, ensure_ascii=False))
+            return
         manifest = unpack(args)
         print(json.dumps({'output': str(Path(args.output).absolute()), 'package': (manifest['package'] or {}).get('name'),
                           'datasets': [d['path'] for d in manifest['datasets']],
