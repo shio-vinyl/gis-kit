@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- `display-vector.py` 的 `--id-field` 可以不给（#39）：只用来填色的面（如地块）没有唯一字段时，用源数据的要素 id（FID）作 id，字段名 `fid`。FID 不随视角变，同一要素在各张图里 id 相同，重复运行逐字节一致；清单 `source.id_generated` 为 `true`，`record.json` 写明它只在这份源数据里唯一。`--keep` 要按名字点单元，没有 `--id-field` 时报错。
+- `display-vector.py --profile print [--dpi 300]`：印刷图的档位（#39）。像素仍是视角的 CSS 像素，屏幕档的半像素容差、4 平方像素最小面积改按印刷像素计，即 0.5 × 96/dpi 与 4 × (96/dpi)²，300 dpi 时为 0.16 与 0.41；显式的 `--tolerance-px`、`--min-area-px` 优先。清单 `display` 新增 `profile` 与印刷档的 `dpi`。Composer 的 `VECTOR_DETAIL_TOO_FINE` 仍按屏幕档判断，印刷档的包可能触发这条警告，差异写在 `references/display-vector.md`。
+- 修复 `display-vector.py`：合并面在 1/20 像素网格上做闭合，`--tolerance-px` 只有几个网格单元时（如印刷档 300 dpi 的 0.16）向内缓冲可能塌成空面，海岸线整条丢失，国界也带上沿海岸的端头。闭合改在浮点精度下进行；测试数据在默认参数下结果逐字节不变。
 - `package.py unpack` 清点图层版本文件夹（`v10/`、`v107/` 等）里的数据集（#36）：ArcMap 包可能把 FileGDB 放在版本文件夹里，由 `.lyr` 按相对路径引用。几份相同的副本只列一次（取版本号最高的那份，其余记入 `copies`），不同的各列一次并警告；`.lyr` 对应到自己文件夹里的那份，FileGDB 对应到 `<gdb>:<图层>`。`.lyr` 的匹配不再只看前 200 个字符串，两个字的名称（如 `水系`）也会取出，此前这两类数据集会被误报为没有图层引用。没有任何数据集时的警告改为 `No datasets in the package`。
 - describe 卡片的 `crs` 在 `id` 为 `null` 时可带 `horizontal`（#36）：复合坐标系（投影＋高程）的水平部分，或只能低置信度匹配的坐标系（如 ESRI 写的带号前缀高斯投影），推断出的 EPSG，`inferred: true`。只有投影参数和地理坐标系都与候选相同时才给出。`describe.schema.json` 新增这个可选字段。
 - `convert.py --fields`：只导出指定字段，几何总是保留，流式写出同样适用；字段不存在时在写出前报错（#37）。FlatGeobuf 输出的图层名改为输出文件名，原来是原子写出用的临时文件名（GeoJSON 已在 #16 修复）；单文件转换的参数错误改为 `ERROR:` 信息并以 1 退出，不再抛出 traceback。

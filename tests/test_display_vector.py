@@ -92,3 +92,69 @@ def test_keep_required_small_units(units, tmp_path):
     manifest = read(out, 'display-vector.json')
     assert manifest['counts']['units_dropped'] == [] and manifest['counts']['kept_small'] == ['D']
     assert [f['properties']['code'] for f in read(out, 'areas.geojson')['features']] == ['A', 'B', 'C', 'D']
+
+
+def test_generated_ids_without_id_field(units, tmp_path):
+    """Without --id-field units are named by their source feature id, the same in every view and every run."""
+    common = ['--source', units, '--layer', 'units', '--fields', 'name', '--view', json.dumps(VIEW)]
+    first, second = tmp_path/'one', tmp_path/'two'
+    result = run(*common, '--output', first)
+    assert result.returncode == 0, result.stderr
+    assert run(*common, '--output', second).returncode == 0
+    for name in ('areas.geojson', 'boundaries.geojson', 'coast.geojson', 'display-vector.json'):
+        assert (first/name).read_bytes() == (second/name).read_bytes()
+    manifest = read(first, 'display-vector.json')
+    assert manifest['source']['id_field'] == 'fid' and manifest['source']['id_generated'] is True
+    # GeoPackage feature ids count from 1 in write order: A, B, C, D.
+    assert [(f['properties']['fid'], f['properties']['name']) for f in read(first, 'areas.geojson')['features']] == [(1, 'Alpha'), (2, 'Beta'), (3, 'Isle')]
+    assert [(f['properties']['a'], f['properties']['b']) for f in read(first, 'boundaries.geojson')['features']] == [(1, 2)]
+    assert manifest['counts']['units_dropped'] == [4]
+    record = read(first, 'record.json')
+    assert record['parameters']['id_field'] is None and any('unique within this source only' in line for line in record['assumptions'])
+    # A view showing only B keeps B's id.
+    narrow = tmp_path/'narrow'
+    assert run('--source', units, '--layer', 'units', '--view', json.dumps({**VIEW, 'center': [15, 5], 'width': 40, 'height': 40}),
+               '--margin', '0', '--output', narrow).returncode == 0
+    assert [f['properties'] for f in read(narrow, 'areas.geojson')['features']] == [{'fid': 2}]
+
+
+def test_real_ids_required_for_keep(units, tmp_path):
+    keep = run('--source', units, '--layer', 'units', '--view', json.dumps(VIEW), '--keep', 'D', '--output', tmp_path/'a')
+    assert keep.returncode == 1 and '--keep names units by --id-field' in keep.stderr and not (tmp_path/'a').exists()
+    clash = run('--source', units, '--layer', 'units', '--fields', 'fid', '--view', json.dumps(VIEW), '--output', tmp_path/'b')
+    assert clash.returncode == 1 and 'fid' in clash.stderr
+
+
+@pytest.fixture
+def islets(tmp_path):
+    """A unit and an islet of about 1.3 square pixels at VIEW's scale: under 4 px², over the print threshold."""
+    path = tmp_path/'islets.geojson'
+    gpd.GeoDataFrame({'code': ['A', 'E']}, geometry=[box(0, 0, 10, 10), box(15, 5, 15.1, 5.1)], crs='EPSG:4326').to_file(path)
+    return path
+
+
+def test_print_profile_and_explicit_overrides(islets, tmp_path):
+    common = ['--source', islets, '--id-field', 'code', '--view', json.dumps(VIEW)]
+    assert run(*common, '--output', tmp_path/'screen').returncode == 0
+    screen = read(tmp_path/'screen', 'display-vector.json')
+    assert screen['display']['profile'] == 'screen' and 'dpi' not in screen['display']
+    assert (screen['display']['tolerance_px'], screen['display']['min_area_px']) == (0.5, 4.0) and screen['counts']['units_dropped'] == ['E']
+    # 300 dpi: 96/300 of a view pixel is one printed pixel, so half a printed pixel and 4 printed px².
+    assert run(*common, '--profile', 'print', '--output', tmp_path/'print').returncode == 0
+    printed = read(tmp_path/'print', 'display-vector.json')
+    assert printed['display']['profile'] == 'print' and printed['display']['dpi'] == 300
+    assert (printed['display']['tolerance_px'], printed['display']['min_area_px']) == (0.16, 0.4096)
+    assert printed['counts']['units_dropped'] == [] and [f['properties']['code'] for f in read(tmp_path/'print', 'areas.geojson')['features']] == ['A', 'E']
+    # The coast survives the finer snap (closing on the 1/20-pixel grid once collapsed it to nothing).
+    assert printed['counts']['coast'] == 2 and sum(shape(f['geometry']).length for f in read(tmp_path/'print', 'coast.geojson')['features']) == pytest.approx(40 + 0.4, abs=0.1)
+    assert run(*common, '--profile', 'print', '--dpi', '600', '--output', tmp_path/'fine').returncode == 0
+    assert (read(tmp_path/'fine', 'display-vector.json')['display']['tolerance_px'], read(tmp_path/'fine', 'display-vector.json')['display']['min_area_px']) == (0.08, 0.1024)
+    # An explicit value wins over the profile's.
+    assert run(*common, '--profile', 'print', '--min-area-px', '4', '--output', tmp_path/'mixed').returncode == 0
+    mixed = read(tmp_path/'mixed', 'display-vector.json')
+    assert (mixed['display']['tolerance_px'], mixed['display']['min_area_px']) == (0.16, 4.0) and mixed['counts']['units_dropped'] == ['E']
+    assert read(tmp_path/'mixed', 'record.json')['parameters']['min_area_px'] == 4.0
+    no_print = run(*common, '--dpi', '300', '--output', tmp_path/'bad')
+    assert no_print.returncode == 1 and '--dpi needs --profile print' in no_print.stderr
+    too_fine = run(*common, '--profile', 'print', '--dpi', '2400', '--output', tmp_path/'bad')
+    assert too_fine.returncode == 1 and '--dpi must be 96..960' in too_fine.stderr

@@ -5,7 +5,9 @@ Reads polygons (a GeoPackage layer or GeoJSON) inside the view of one map — it
 height in Web Mercator with 512-px tiles, as gis-composer's inspect reports it — and generalises them
 for that scale only: parts smaller than --min-area-px square pixels are dropped, the coverage is
 simplified to --tolerance-px pixels with shared edges kept shared, land boundaries are the edges two
-units share, and the coastline is the outline of their union. Writes areas.geojson,
+units share, and the coastline is the outline of their union. Pixels are the view's CSS pixels; a map
+printed at a set dpi has finer ones (--profile print). Without --id-field units are named by their
+source feature id (FID), unique within that source only. Writes areas.geojson,
 boundaries.geojson, coast.geojson, display-vector.json (contract display-vector v1) and record.json
 to a new directory. Display only: never measure or overlay these geometries.
 """
@@ -23,6 +25,26 @@ VERSION = '0.1.0'
 R = 6378137.0
 MAX_LAT = 85.05112878
 FILES = ('areas', 'boundaries', 'coast')
+# Half a pixel and 4 square pixels hide what is dropped on screen, where a CSS pixel is a device pixel.
+SCREEN = {'tolerance_px': 0.5, 'min_area_px': 4.0}
+# gis-composer prints a map at dpi / 96 device pixels per CSS pixel; --profile print applies the same rule to those.
+CSS_DPI = 96
+DEFAULT_DPI = 300
+GENERATED_ID = 'fid'
+
+
+def thresholds(args):
+    """The dpi (None on screen), --tolerance-px and --min-area-px in view (CSS) pixels: given explicitly, else from the profile."""
+    if args.dpi is not None and args.profile != 'print':
+        raise ValueError('--dpi needs --profile print')
+    if args.dpi is not None and not (CSS_DPI <= args.dpi <= 960):
+        raise ValueError('--dpi must be 96..960')
+    dpi = (args.dpi or DEFAULT_DPI) if args.profile == 'print' else None
+    dpi = int(dpi) if dpi is not None and float(dpi).is_integer() else dpi
+    ratio = CSS_DPI / dpi if dpi else 1
+    tolerance = args.tolerance_px if args.tolerance_px is not None else round(SCREEN['tolerance_px'] * ratio, 4)
+    min_area = args.min_area_px if args.min_area_px is not None else round(SCREEN['min_area_px'] * ratio ** 2, 4)
+    return dpi, tolerance, min_area
 
 
 def parse_view(text):
@@ -100,15 +122,26 @@ def lines(geometry):
 
 
 def read_source(source, layer, id_field, fields, bbox):
+    """Units inside bbox, ordered by id. Without id_field the id is the source feature id (FID), the
+    same for a feature in every view of the source, in the GENERATED_ID column."""
     import pyogrio
     info = pyogrio.read_info(source, layer=layer)
     available = list(info['fields'])
-    missing = [field for field in [id_field, *fields] if field not in available]
+    missing = [field for field in [id_field, *fields] if field is not None and field not in available]
     if missing:
         raise ValueError(f'Fields not in source: {", ".join(missing)}; available: {", ".join(available)}')
+    if id_field is None and GENERATED_ID in fields:
+        raise ValueError(f'--fields has {GENERATED_ID}, the name of the generated id; give it as --id-field instead')
     crs = info.get('crs') or ''
     if crs and crs not in ('EPSG:4326', 'OGC:CRS84'):
         raise ValueError(f'Source must be EPSG:4326 longitude/latitude, not {crs}')
+    if id_field is None:
+        frame = pyogrio.read_dataframe(source, layer=layer, bbox=bbox, columns=fields, fid_as_index=True)
+        frame = frame[frame.geometry.notna()]
+        if frame.index.duplicated().any():
+            raise ValueError('Source feature ids repeat; give --id-field')
+        frame = frame.rename_axis(GENERATED_ID).reset_index().astype({GENERATED_ID: 'int64'})
+        return frame.sort_values(GENERATED_ID).reset_index(drop=True)
     frame = pyogrio.read_dataframe(source, layer=layer, bbox=bbox, columns=[id_field, *fields])
     frame = frame[frame.geometry.notna()]
     if frame[id_field].isna().any() or frame[id_field].duplicated().any():
@@ -146,10 +179,12 @@ def generalise(frame, rect, mpp, tolerance_px, min_area_px, keep_rows=()):
         parts = [part for part in candidates if part.area >= min_area or (row in keep_rows and part.area > 0)]
         counts['parts_dropped'] += len(polygons(geometry)) - len(parts)
         areas.append(shapely.MultiPolygon(parts) if parts else None)
-    # The union, closed over sub-pixel gaps between neighbours; its outline is the coastline.
+    # The union, closed over sub-pixel gaps between neighbours; its outline is the coastline. Closed in
+    # floating precision: on the 1/20-pixel grid the inward buffer can collapse to nothing for a snap of
+    # a few cells (0.16 px, the print profile at 300 dpi, did on two squares).
     snap = tolerance
     present = [area for area in areas if area is not None]
-    union = shapely.union_all(present).buffer(snap, join_style='mitre').buffer(-snap, join_style='mitre') if present else shapely.Polygon()
+    union = shapely.set_precision(shapely.union_all(present), 0).buffer(snap, join_style='mitre').buffer(-snap, join_style='mitre') if present else shapely.Polygon()
     outline = union.boundary
     # Land boundaries: the part of each unit's outline lying along another unit (a sub-pixel gap or
     # overlap between neighbours still counts), taken once per pair, without the coast near its ends.
@@ -204,7 +239,12 @@ def execute(args):
     layer = args.layer
     identity = {'name': source.name, 'layer': layer, 'bytes': stat.st_size, 'modified_ns': stat.st_mtime_ns}
     keep = sorted({item.strip() for item in args.keep.split(',') if item.strip()}) if args.keep else []
-    parameters = {'id_field': args.id_field, 'fields': fields, 'tolerance_px': args.tolerance_px, 'min_area_px': args.min_area_px, 'margin': args.margin, 'keep': keep}
+    if keep and args.id_field is None:
+        raise ValueError('--keep names units by --id-field; give --id-field (generated ids are source feature ids, not names)')
+    dpi, tolerance_px, min_area_px = thresholds(args)
+    id_name = args.id_field or GENERATED_ID
+    parameters = {'id_field': args.id_field, 'fields': fields, 'profile': args.profile, 'dpi': dpi,
+                  'tolerance_px': tolerance_px, 'min_area_px': min_area_px, 'margin': args.margin, 'keep': keep}
     mpp, rect = frame_of(view, args.margin)
     west, south = geographic(rect[0], rect[1])
     east, north = geographic(rect[2], rect[3])
@@ -221,19 +261,19 @@ def execute(args):
             frame = read_source(str(source), layer, args.id_field, fields, tuple(bbox))
             if frame.empty:
                 raise ValueError('No features inside the view')
-            keep_rows = {i for i, value in enumerate(frame[args.id_field]) if str(plain(value)) in keep}
-            areas, boundaries, coast, counts = generalise(frame, rect, mpp, args.tolerance_px, args.min_area_px, keep_rows)
-            counts['kept_small'] = sorted(str(plain(frame.at[i, args.id_field])) for i in keep_rows if areas[i] is not None and areas[i].area < args.min_area_px * mpp ** 2)
-            ids = [plain(value) for value in frame[args.id_field]]
+            keep_rows = {i for i, value in enumerate(frame[id_name]) if str(plain(value)) in keep}
+            areas, boundaries, coast, counts = generalise(frame, rect, mpp, tolerance_px, min_area_px, keep_rows)
+            counts['kept_small'] = sorted(str(plain(frame.at[i, id_name])) for i in keep_rows if areas[i] is not None and areas[i].area < min_area_px * mpp ** 2)
+            ids = [plain(value) for value in frame[id_name]]
             decimals = decimals_for(mpp)
-            area_features = [feature(area, {args.id_field: ids[i], **{field: plain(frame.at[i, field]) for field in fields}}, decimals)
+            area_features = [feature(area, {id_name: ids[i], **{field: plain(frame.at[i, field]) for field in fields}}, decimals)
                              for i, area in enumerate(areas) if area is not None]
             write_geojson(stage / 'areas.geojson', area_features)
             write_geojson(stage / 'boundaries.geojson', [feature(geometry, {'a': ids[i], 'b': ids[j]}, decimals) for i, j, geometry in boundaries])
             write_geojson(stage / 'coast.geojson', [feature(segment, {}, decimals) for segment in coast])
             dropped = [ids[i] for i, area in enumerate(areas) if area is None]
             counts = {**counts, 'areas': len(area_features), 'units_dropped': dropped, 'boundaries': len(boundaries), 'coast': len(coast)}
-            warnings = [f'{len(dropped)} units are smaller than {args.min_area_px} px² at this scale and were left out: {", ".join(map(str, dropped))}'] if dropped else []
+            warnings = [f'{len(dropped)} units are smaller than {min_area_px} px² at this scale and were left out: {", ".join(map(str, dropped))}'] if dropped else []
             cache_status = 'miss' if cached is not None else 'off'
             if cached is not None:
                 partial = cached.with_name(cached.name + '.partial')
@@ -247,9 +287,10 @@ def execute(args):
                         'features': len(json.loads((stage / f'{name}.geojson').read_text())['features'])} for name in FILES}
         manifest = {'contract': 'display-vector', 'schema_version': 1,
                     'view': {**view, 'meters_per_pixel': round(mpp, 3), 'bbox': bbox},
-                    'display': {'tolerance_px': args.tolerance_px, 'min_area_px': args.min_area_px, 'margin': args.margin, 'precision_degrees': 10 ** -decimals_for(mpp)},
+                    'display': {'profile': args.profile, **({'dpi': dpi} if dpi else {}), 'tolerance_px': tolerance_px, 'min_area_px': min_area_px,
+                                'margin': args.margin, 'precision_degrees': 10 ** -decimals_for(mpp)},
                     'files': files, 'counts': counts,
-                    'source': {'name': source.name, 'layer': layer, 'id_field': args.id_field, 'fields': fields, 'attribution': args.attribution,
+                    'source': {'name': source.name, 'layer': layer, 'id_field': id_name, 'id_generated': args.id_field is None, 'fields': fields, 'attribution': args.attribution,
                                'bytes': stat.st_size, 'modified': datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(timespec='seconds')},
                     'warnings': warnings, 'record': 'record.json'}
         write_json(stage / 'display-vector.json', manifest)
@@ -260,7 +301,9 @@ def execute(args):
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                             'assumptions': ['Generalised for the stated view only: zoom, size and centre fix the pixel size',
                                                             'Land boundaries are edges two units share (within the simplification tolerance); the source boundaries are not reviewed here',
-                                                            'Display geometry; do not measure, overlay or analyse it']})
+                                                            'Display geometry; do not measure, overlay or analyse it',
+                                                            *([f'No --id-field: units and both sides of each boundary are named by {GENERATED_ID}, the source feature id, '
+                                                               'unique within this source only; do not join other data on it'] if args.id_field is None else [])]})
     return manifest
 
 
@@ -268,11 +311,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True, help='Polygons in EPSG:4326: a GeoPackage (with --layer) or GeoJSON')
     parser.add_argument('--layer', help='Layer name in a multi-layer source, e.g. ADM_0_cn_review_full')
-    parser.add_argument('--id-field', required=True, help='Unique id per unit, kept on areas and naming both sides of each boundary')
+    parser.add_argument('--id-field', help='Unique id per unit, kept on areas and naming both sides of each boundary; '
+                        f'without it units are named by {GENERATED_ID}, the source feature id (unique within this source only)')
     parser.add_argument('--fields', help='Comma-separated attributes to keep on areas')
     parser.add_argument('--view', required=True, help='The map view as JSON or a JSON file: center, zoom, width, height (gis-composer inspect)')
-    parser.add_argument('--tolerance-px', type=float, default=0.5, help='Simplification tolerance in pixels (default 0.5)')
-    parser.add_argument('--min-area-px', type=float, default=4.0, help='Drop parts smaller than this many square pixels (default 4)')
+    parser.add_argument('--profile', choices=('screen', 'print'), default='screen',
+                        help='screen: --tolerance-px 0.5, --min-area-px 4; print: the same in printed pixels, 0.5 x 96/dpi and 4 x (96/dpi)² (0.16 and 0.41 at 300 dpi)')
+    parser.add_argument('--dpi', type=float, help=f'With --profile print: the dpi the map is printed at (gis-composer layout.dpi or print.dpi; default {DEFAULT_DPI})')
+    parser.add_argument('--tolerance-px', type=float, help='Simplification tolerance in view pixels (default from --profile; 0.5 on screen)')
+    parser.add_argument('--min-area-px', type=float, help='Drop parts smaller than this many square view pixels (default from --profile; 4 on screen)')
     parser.add_argument('--keep', help='Comma-separated ids that must stay even when smaller than --min-area-px (their largest part is kept)')
     parser.add_argument('--margin', type=float, default=0.05, help='Read this share of the view beyond each edge (default 0.05)')
     parser.add_argument('--attribution', default='GADM 4.1')
@@ -280,7 +327,8 @@ def main():
     parser.add_argument('--output', required=True, help='New directory, e.g. <project>/inputs/europe-display')
     args = parser.parse_args()
     try:
-        if not (0.05 <= args.tolerance_px <= 5) or not (0 <= args.min_area_px <= 400) or not (0 <= args.margin <= 0.5):
+        _, tolerance_px, min_area_px = thresholds(args)
+        if not (0.05 <= tolerance_px <= 5) or not (0 <= min_area_px <= 400) or not (0 <= args.margin <= 0.5):
             raise ValueError('--tolerance-px must be 0.05..5, --min-area-px 0..400 and --margin 0..0.5')
         manifest = execute(args)
         print(json.dumps({'output': str(Path(args.output).absolute()), 'counts': manifest['counts'],
