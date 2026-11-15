@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](requirements-tested.txt)
-[![Tests](https://github.com/shioo-gis/gis-kit/actions/workflows/tests.yml/badge.svg)](https://github.com/shioo-gis/gis-kit/actions/workflows/tests.yml)
+[![Tests](https://github.com/shio-vinyl/gis-kit/actions/workflows/tests.yml/badge.svg)](https://github.com/shio-vinyl/gis-kit/actions/workflows/tests.yml)
 [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-SKILL.md-8A2BE2.svg)](SKILL.md)
 
 [English](README.md) · 简体中文
@@ -79,13 +79,13 @@ gis-kit 负责空间计算与诊断检查图，正式地图、Scene / Storyboard
 
 ## 配套：gis-plugin
 
-gis-kit 本身只管数据处理，不碰 agent 的运行环境。跨工具、跨引擎的事，我放在另一个项目 [gis-plugin](https://github.com/shioo-gis/gis-plugin) 里做：它是一层很薄的外壳，不含任何读写 GIS 数据的代码，需要数据时调用 gis-kit 等引擎的命令行。目前做了这些：
+gis-kit 本身只管数据处理，不碰 agent 的运行环境。跨工具、跨引擎的事，我放在另一个项目 [gis-plugin](https://github.com/shio-vinyl/gis-plugin) 里做：它是一层很薄的外壳，不含任何读写 GIS 数据的代码，需要数据时调用 gis-kit 等引擎的命令行。目前做了这些：
 
 - **hooks**：agent 读到 GIS 数据时自动注入元数据卡片和字段语义；保护登记过的源数据，不让命令覆盖或改写；项目里有样式约定时提示它在哪里；检查刚写出的 SVG、PPTX、HTML 里有没有防御、解说、免责一类用语。hooks 注入的是事实而不是规则清单，只用 Python 标准库，Claude Code 和 Codex 通用。
 - **约定与诊断**：引擎之间交换文件的格式，以及检查引擎是否装好、版本是否兼容的 `gis-doctor`。
 - **评测**：比较有无外壳时 agent 完成 GIS 任务的差别。
 
-gis-plugin 已经公开，安装和用法见[它的 README](https://github.com/shioo-gis/gis-plugin/blob/main/README.zh-CN.md)。gis-kit 不依赖它，单独使用完整可用。
+gis-plugin 已经公开，安装和用法见[它的 README](https://github.com/shio-vinyl/gis-plugin/blob/main/README.zh-CN.md)。gis-kit 不依赖它，单独使用完整可用。
 
 ## 快速开始
 
@@ -93,9 +93,9 @@ gis-plugin 已经公开，安装和用法见[它的 README](https://github.com/s
 
 ```bash
 # Claude Code
-git clone https://github.com/shioo-gis/gis-kit.git ~/.claude/skills/gis-kit
+git clone https://github.com/shio-vinyl/gis-kit.git ~/.claude/skills/gis-kit
 # Codex
-git clone https://github.com/shioo-gis/gis-kit.git ~/.codex/skills/gis-kit
+git clone https://github.com/shio-vinyl/gis-kit.git ~/.codex/skills/gis-kit
 ```
 
 **2. 准备 Python 环境**（Python ≥ 3.10）

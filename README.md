@@ -8,7 +8,7 @@ A skill for Claude Code, Codex and other agents.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB.svg?logo=python&logoColor=white)](requirements-tested.txt)
-[![Tests](https://github.com/shioo-gis/gis-kit/actions/workflows/tests.yml/badge.svg)](https://github.com/shioo-gis/gis-kit/actions/workflows/tests.yml)
+[![Tests](https://github.com/shio-vinyl/gis-kit/actions/workflows/tests.yml/badge.svg)](https://github.com/shio-vinyl/gis-kit/actions/workflows/tests.yml)
 [![Agent Skill](https://img.shields.io/badge/Agent%20Skill-SKILL.md-8A2BE2.svg)](SKILL.md)
 
 English · [简体中文](README.zh-CN.md)
@@ -79,13 +79,13 @@ This part is fairly niche. It was built specifically for drawings from **Xiangyu
 
 ## Companion: gis-plugin
 
-gis-kit only handles data processing and does not touch the agent's runtime environment. The cross-tool and cross-engine work lives in another project, [gis-plugin](https://github.com/shioo-gis/gis-plugin): a very thin shell that contains no code that reads or writes GIS data and calls the command lines of gis-kit and other engines whenever it needs data. So far it provides:
+gis-kit only handles data processing and does not touch the agent's runtime environment. The cross-tool and cross-engine work lives in another project, [gis-plugin](https://github.com/shio-vinyl/gis-plugin): a very thin shell that contains no code that reads or writes GIS data and calls the command lines of gis-kit and other engines whenever it needs data. So far it provides:
 
 - **Hooks**: when the agent reads GIS data, a metadata card and field semantics are injected automatically; registered source data is protected from being overwritten or rewritten by commands; when a project has a style convention, the hook says where it is; and freshly written SVG, PPTX and HTML are checked for defensive, explanatory or disclaimer wording. Hooks inject facts, not lists of rules, use only the Python standard library, and work in both Claude Code and Codex.
 - **Contracts and diagnostics**: the file formats the engines exchange, and `gis-doctor`, which checks whether the engines are installed and compatible.
 - **Evaluation**: comparing how well an agent completes GIS tasks with and without the shell.
 
-gis-plugin is public; see [its README](https://github.com/shioo-gis/gis-plugin) for installation and usage. gis-kit does not depend on it and is fully usable on its own.
+gis-plugin is public; see [its README](https://github.com/shio-vinyl/gis-plugin) for installation and usage. gis-kit does not depend on it and is fully usable on its own.
 
 ## Quick start
 
@@ -93,9 +93,9 @@ gis-plugin is public; see [its README](https://github.com/shioo-gis/gis-plugin) 
 
 ```bash
 # Claude Code
-git clone https://github.com/shioo-gis/gis-kit.git ~/.claude/skills/gis-kit
+git clone https://github.com/shio-vinyl/gis-kit.git ~/.claude/skills/gis-kit
 # Codex
-git clone https://github.com/shioo-gis/gis-kit.git ~/.codex/skills/gis-kit
+git clone https://github.com/shio-vinyl/gis-kit.git ~/.codex/skills/gis-kit
 ```
 
 **2. Set up the Python environment** (Python ≥ 3.10)

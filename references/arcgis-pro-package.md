@@ -1,6 +1,6 @@
 # 打包成 ArcGIS Pro 图层包（.lpkx）
 
-`package.py pack --format arcgis-pro` 读一份 [`map-style`](https://github.com/shioo-gis/gis-plugin/blob/main/contracts/README.md#map-style) v1 和它引用的数据，写出一个 ArcGIS Pro 图层包（`.lpkx`）。同事把它拖进 Pro 的地图，得到一个按面板、分组排好的组图层，颜色、类别、筛选和标注位置与 gis-composer 出的 PNG 一致。QGIS 的输出见 [qgis-package.md](qgis-package.md)，两者共用同一套取数逻辑。
+`package.py pack --format arcgis-pro` 读一份 [`map-style`](https://github.com/shio-vinyl/gis-plugin/blob/main/contracts/README.md#map-style) v1 和它引用的数据，写出一个 ArcGIS Pro 图层包（`.lpkx`）。同事把它拖进 Pro 的地图，得到一个按面板、分组排好的组图层，颜色、类别、筛选和标注位置与 gis-composer 出的 PNG 一致。QGIS 的输出见 [qgis-package.md](qgis-package.md)，两者共用同一套取数逻辑。
 
 ```bash
 python package.py pack maps/example.map-style.json --output /work/send/example-pro --format arcgis-pro
