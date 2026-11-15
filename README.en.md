@@ -79,13 +79,13 @@ This part is fairly niche. It was built specifically for drawings from **Xiangyu
 
 ## Companion: gis-plugin
 
-gis-kit only handles data processing and does not touch the agent's runtime environment. The cross-tool and cross-engine work lives in another project, gis-plugin: a very thin shell that contains no code that reads or writes GIS data and calls the command lines of gis-kit and other engines whenever it needs data. So far it provides:
+gis-kit only handles data processing and does not touch the agent's runtime environment. The cross-tool and cross-engine work lives in another project, [gis-plugin](https://github.com/shioo-gis/gis-plugin): a very thin shell that contains no code that reads or writes GIS data and calls the command lines of gis-kit and other engines whenever it needs data. So far it provides:
 
 - **Hooks**: when the agent reads GIS data, a metadata card and field semantics are injected automatically; registered source data is protected from being overwritten or rewritten by commands; when a project has a style convention, the hook says where it is; and freshly written SVG, PPTX and HTML are checked for defensive, explanatory or disclaimer wording. Hooks inject facts, not lists of rules, use only the Python standard library, and work in both Claude Code and Codex.
 - **Contracts and diagnostics**: the file formats the engines exchange, and `gis-doctor`, which checks whether the engines are installed and compatible.
 - **Evaluation**: comparing how well an agent completes GIS tasks with and without the shell.
 
-gis-plugin is still in private development. I intend to keep refining it and make it public once it is in good shape; there is no date yet. gis-kit does not depend on it and is fully usable on its own.
+gis-plugin is public; see [its README](https://github.com/shioo-gis/gis-plugin/blob/main/README.en.md) for installation and usage. gis-kit does not depend on it and is fully usable on its own.
 
 ## Quick start
 
