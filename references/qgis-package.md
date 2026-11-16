@@ -1,6 +1,6 @@
 # 打包成带样式的 GeoPackage（QGIS）
 
-`package.py pack` 读一份 [`map-style`](https://github.com/shioo-gis/gis-plugin/blob/main/contracts/README.md#map-style) v1（一张图的图层、数据引用、绘制顺序和样式，与平台无关）和它引用的数据，写出一个 GeoPackage。同事在 QGIS 里打开包里的工程，看到的颜色、类别、标注位置与 gis-composer 出的 PNG 一致；单独把某张表拖进 QGIS，也带着这张图的样式。
+`package.py pack` 读一份 [`map-style`](https://github.com/shio-vinyl/gis-plugin/blob/main/contracts/README.md#map-style) v1（一张图的图层、数据引用、绘制顺序和样式，与平台无关）和它引用的数据，写出一个 GeoPackage。同事在 QGIS 里打开包里的工程，看到的颜色、类别、标注位置与 gis-composer 出的 PNG 一致；单独把某张表拖进 QGIS，也带着这张图的样式。
 
 ```bash
 python package.py pack maps/example.map-style.json --output /work/send/example

@@ -1,6 +1,6 @@
 # 读取平台样式（QGIS、ArcGIS Pro → map-style）
 
-`package.py read` 读一个平台样式文件，转成 [`map-style`](https://github.com/shioo-gis/gis-plugin/blob/main/contracts/README.md#map-style) v1，让已有的样式可以用到自己的图上（gis-composer、QGIS、ArcGIS Pro）。这是 [`pack`](qgis-package.md) 的反方向。
+`package.py read` 读一个平台样式文件，转成 [`map-style`](https://github.com/shio-vinyl/gis-plugin/blob/main/contracts/README.md#map-style) v1，让已有的样式可以用到自己的图上（gis-composer、QGIS、ArcGIS Pro）。这是 [`pack`](qgis-package.md) 的反方向。
 
 ```bash
 python package.py read 用地.qml --output /work/style/landuse --data parcels.gpkg --data-layer parcels

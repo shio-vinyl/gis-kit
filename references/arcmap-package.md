@@ -1,6 +1,6 @@
 # 打包成 ArcMap 图层包（.lpk）
 
-`package.py pack --format arcmap` 读一份 [`map-style`](https://github.com/shioo-gis/gis-plugin/blob/main/contracts/README.md#map-style) v1 和它引用的数据，写出一个 ArcMap 图层包（`.lpk`）。同事在 ArcMap 里“添加数据”或双击它，得到一个按面板、分组排好的组图层，符号颜色与 gis-composer 出的 PNG 逐字节相同。QGIS、ArcGIS Pro 的输出见 [qgis-package.md](qgis-package.md)、[arcgis-pro-package.md](arcgis-pro-package.md)，三者共用同一套取数逻辑。
+`package.py pack --format arcmap` 读一份 [`map-style`](https://github.com/shio-vinyl/gis-plugin/blob/main/contracts/README.md#map-style) v1 和它引用的数据，写出一个 ArcMap 图层包（`.lpk`）。同事在 ArcMap 里“添加数据”或双击它，得到一个按面板、分组排好的组图层，符号颜色与 gis-composer 出的 PNG 逐字节相同。QGIS、ArcGIS Pro 的输出见 [qgis-package.md](qgis-package.md)、[arcgis-pro-package.md](arcgis-pro-package.md)，三者共用同一套取数逻辑。
 
 ```bash
 python package.py pack maps/example.map-style.json --output /work/send/example-arcmap --format arcmap
