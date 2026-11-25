@@ -25,7 +25,7 @@ description: 处理 GIS 矢量与栅格数据、空间分析、DEM 地形、路�
 
 - 先确认输入图层/波段、CRS、计量单位、格网、NoData 及量的含义；总量、密度、比率和类别分别处理。赋 CRS 标签不能替代重投影，投影轴单位不默认是米。要素面积和用地指标可用 `--geodesic` 按源椭球量算，口径随面积字段保存。
 - 保留原件、来源、参数、未知项和 `candidate` / `hold`；插补、推定及显示派生与观测分开。程序完成、几何门槛通过和局部人工接受分别记录，均不证明历史准确性或全图完整。检查器仅覆盖明确选择的字段/对象；没有全链自动语义保证。
-- 按实际接口回读数值、几何、CRS 和文件，图像实际查看；旧接口的覆盖/原子写入行为逐一核实。局部栅格已有窗口链，全局算子及显示派生仍有全量边界。网络接入依赖输入证据，缺需求权重不报告人口覆盖；服务路段与服务面分开。
+- 统计与用地指标的 JSON 输出及缺失值口径见[计量与关联](references/vector-metrics.md)。按实际接口回读数值、几何、CRS 和文件，图像实际查看；旧接口的覆盖/原子写入行为逐一核实。局部栅格已有窗口链，全局算子及显示派生仍有全量边界。网络接入依赖输入证据，缺需求权重不报告人口覆盖；服务路段与服务面分开。
 - 通用公开数据、地名搜索与 geocoding 交给 Agent 和已有工具按任务处理。高级 GIS 优先直接使用成熟库、CLI 或可选专业后端；只有重复需求和稳定封装价值成立才扩展本 skill。不维护通用取数框架、来源注册表或 gazetteer。
 
 ## 按需参考
@@ -36,7 +36,7 @@ description: 处理 GIS 矢量与栅格数据、空间分析、DEM 地形、路�
 - 大表与空间 SQL：先按[Spatial SQL 与规模路径](references/spatial-sql.md)选择 DuckDB / GDAL 等成熟引擎；可选薄入口直接接收原生 SQL，回读检查 Parquet 输出，不默认全量载入 GeoPandas。
 - 矢量准备与分析：[基础工作流](references/vector-workflows.md)、[ArcGIS 图层包 / 地图包](references/esri-package.md)、[日常结果包](references/daily-vector.md)、[匹配与制图综合](references/vector-cartography.md)、[分析扩展](references/analysis-extensions.md)；CAD 图纸先按[清点、提取、围面、挂接与赋 CRS](references/cad-intake.md)看清图层、单位和坐标网（湘源控规图则直接用 `cad.py xiangyuan` 取地块），再提取实体、剔除图框图例后按显式容差围面、按规则挂文字（填充可转成面，用 `cad.py compare-fills` 和围面结果对照），确认后赋 CRS，用 `cad.py overlay` 叠参考图层出检查图；独立坐标用[矢量控制点转换](references/vector-georeferencing.md)。
 - 栅格与专业分析：[数值栅格](references/raster-numeric.md)、[栅格整理](references/raster-cleanup.md)、[地形诊断](references/terrain-analysis.md)、[路网与需求覆盖](references/network-access.md)、[其他专业分析](references/professional-analysis.md)。
-- 文件衔接与复用：[Harness](references/harness.md)、[map-style 打包成带样式的 GeoPackage（QGIS）](references/qgis-package.md)、[ArcGIS Pro 图层包（.lpkx）](references/arcgis-pro-package.md)或 [ArcMap 图层包（.lpk）](references/arcmap-package.md)、[读取 QGIS、ArcGIS Pro 样式转成 map-style](references/style-read.md)、[顺序 recipe 与重复交付](references/repeated-delivery.md)、[Composer 显示交付](references/composer-display.md)、[在线瓦片本地快照](references/tile-snapshot.md)、[场地的行政区链](references/admin-chain.md)、[按图概括的显示矢量](references/display-vector.md)。
+- 文件衔接与复用：[Harness](references/harness.md)、[map-style 打包成带样式的 GeoPackage（QGIS）](references/qgis-package.md)、[ArcGIS Pro 图层包（.lpkx）](references/arcgis-pro-package.md)或 [ArcMap 图层包（.lpk，含 Pro 分级断点处理）](references/arcmap-package.md)、[读取 ArcMap、QGIS、ArcGIS Pro 样式转成 map-style](references/style-read.md)、[顺序 recipe 与重复交付](references/repeated-delivery.md)、[Composer 显示交付](references/composer-display.md)、[在线瓦片本地快照与署名](references/tile-snapshot.md)、[场地的行政区链](references/admin-chain.md)、[按图概括的显示矢量](references/display-vector.md)。
 - 图像描绘与赋位：[标注流程](references/raster-annotation.md)、[配准流程](references/raster-georeferencing.md)；仅写标注 patch 时再读[对象契约](references/raster-schema.md)。
 
 ## 图像标注与配准

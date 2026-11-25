@@ -86,6 +86,12 @@ python3 gis-kit/scripts/stats.py cross --input zones.gpkg --target points.gpkg \
   --zone-field zone_id --sum-field amount --predicate intersects --analysis-crs EPSG:32618
 ```
 
+## 统计与指标的 JSON 输出
+
+`stats.py frequency --json` 输出频数行（`value`、`count`、`pct`）。`spatial --json` 输出数值、分析 CRS、研究面积口径与描述性最近邻指标。零面积分母下密度为 `null`。`cross --json` 的 `rows` 按分区列值，`report` 记录匹配关系。无可加总观测值时合计为 `null`。
+
+`indicators.py far/density/summary --json` 输出地块指标行和 `assignment_report`，`coverage --json` 输出覆盖面积、研究面积和比率。可与原有文件输出同时使用，stdout 可直接作为 JSON 解析。
+
 ## 要素面积字段
 
 `field.py add-area parcels.gpkg --geodesic --output areas.gpkg` 沿相邻顶点间的测地线，在源 CRS 的椭球上量算平方米。投影数据先还原到自身地理 CRS，输出几何保留源 CRS。每个环取较小一侧的面积，外环减去洞，多部件逐面相加。该口径适用于单环所围区域小于半个椭球的面。

@@ -96,3 +96,31 @@ def test_registry_lists_terms_for_every_provider():
             assert entry['attribution'] and entry['license'] and '{z}' in entry['url'], name
         else:
             assert entry['reason'], name
+
+
+def test_snapshot_preserves_provenance_without_network(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+
+    url = 'https://example.invalid/{z}/{y}/{x}.jpg'
+    entry = dict(name='Example mosaic', url=url, cache='allowed', license='Example license',
+                 attribution='Example imagery (two vintages)', terms_url='https://example.invalid/terms',
+                 kind='raster', format='jpg', tile_size=256)
+    monkeypatch.setattr(S, 'providers', lambda: {'example': entry})
+    requests = []
+    def fetch(url):
+        requests.append(url)
+        return b'synthetic tile'
+    monkeypatch.setattr(S, 'fetch', fetch)
+    dest = S.execute(dict(provider='example', bounds=[10, 10, 10.01, 10.01], minzoom=2, maxzoom=2), tmp_path/'snap')
+    manifest = json.loads((dest/'snapshot.json').read_text(encoding='utf-8'))
+    record = json.loads((dest/'record.json').read_text(encoding='utf-8'))
+    tile, = manifest['tiles']
+    assert requests == [url.format(**tile)] == ['https://example.invalid/2/1/2.jpg']
+    assert tile['path'] == 'tiles/2/2/1.jpg'
+    assert record['provider'] == manifest['provider']
+    for key in ('url', 'terms_url', 'attribution', 'license'):
+        assert manifest['provider'][key] == entry[key]
+    assert datetime.fromisoformat(manifest['retrieved_at']).utcoffset() == timedelta(0)
+    assert record['retrieved_at'] == manifest['retrieved_at']
+    assert tile['sha256'] == hashlib.sha256((dest/tile['path']).read_bytes()).hexdigest()
+    assert record['tiles_sha256'] == hashlib.sha256(f"{tile['path']} {tile['sha256']}".encode()).hexdigest()

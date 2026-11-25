@@ -48,7 +48,8 @@ def test_area_method_names_actual_projection(tmp_path, crs, args, method):
 
 
 @pytest.mark.parametrize("command", ["far", "density", "summary", "coverage"])
-def test_indicator_geodesic_areas_across_zones(tmp_path, command):
+@pytest.mark.parametrize("as_json", [False, True])
+def test_indicator_geodesic_areas_across_zones(tmp_path, command, as_json):
     import json
 
     parcels = [box(5.8, 70, 6, 70.2), box(6, 70, 6.2, 70.2)]
@@ -68,8 +69,19 @@ def test_indicator_geodesic_areas_across_zones(tmp_path, command):
         if command == "summary":
             args += ["--green", str(building_path)]
     tool = Path(__file__).resolve().parents[1] / "scripts" / "indicators.py"
-    subprocess.run([sys.executable, str(tool), command, *args], check=True, capture_output=True)
+    if as_json:
+        args.append("--json")
+    run = subprocess.run([sys.executable, str(tool), command, *args], check=True, capture_output=True)
     rows = gpd.read_file(output)
+    if as_json:
+        payload = json.loads(run.stdout)
+        assert payload["meters_per_unit"] is None
+        if command == "coverage":
+            assert payload["analysis_method"] == rows.area_method.iloc[0]
+            assert payload["coverage_ratio"] == pytest.approx(rows.coverage_ratio.iloc[0])
+        else:
+            assert payload["assignment_report"]["analysis_method"] == rows.area_method.iloc[0]
+            assert [row["parcel_area_m2"] for row in payload["rows"]] == pytest.approx(rows.parcel_area_m2.tolist())
     geod = Geod(ellps="WGS84")
     def area(geom):
         return abs(geod.geometry_area_perimeter(geom)[0])

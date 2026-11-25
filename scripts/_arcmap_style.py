@@ -16,6 +16,7 @@ writers. No optional dependency is used: olefile only reads compound files, so t
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 from pathlib import Path
 import re
@@ -56,12 +57,13 @@ ANNOTATION_SET = guid_bytes('1d5849f3-0d33-11d2-a26f-080009b6f22b')
 LABEL_ENGINE = guid_bytes('01004145-0d1c-11d2-a26f-080009b6f22b')
 TEXT_SYMBOL = guid_bytes('b65a3e74-2993-11d1-9a43-0080c7ec5c96')
 STD_FONT = guid_bytes('0be35203-8f91-11ce-9de3-00aa004bb851')
+FEATURE_CLASS_NAME = guid_bytes('75e10086-4226-42ac-afec-cbb9b748f847')
+WORKSPACE_NAME = guid_bytes('5a350011-e371-11d1-aa82-00c04fa33a15')
+PROPERTY_SET = guid_bytes('588e5a11-d09b-11d1-aa7c-00c04fa33a15')
 # Every class that is persisted with an id; the renumbering walks these
 OBJECT_CLASSES = [FEATURE_LAYER, GROUP_LAYER, SIMPLE_RENDERER, UNIQUE_RENDERER, BREAKS_RENDERER, LEGEND_GROUP, LEGEND_CLASS, FILL_SYMBOL, LINE_SYMBOL,
-                  MARKER_SYMBOL, RGB_COLOR, FIELD_INFO, LAYER_EXTENSION, TRANSPARENCY, ENVELOPE, ANNOTATION_SET, LABEL_ENGINE, TEXT_SYMBOL, STD_FONT] + [guid_bytes(g) for g in (
-    '75e10086-4226-42ac-afec-cbb9b748f847',  # FeatureClassName
-    '5a350011-e371-11d1-aa82-00c04fa33a15',  # WorkspaceName
-    '588e5a11-d09b-11d1-aa7c-00c04fa33a15',  # PropertySet
+                  MARKER_SYMBOL, RGB_COLOR, FIELD_INFO, LAYER_EXTENSION, TRANSPARENCY, ENVELOPE, ANNOTATION_SET, LABEL_ENGINE, TEXT_SYMBOL, STD_FONT,
+                  FEATURE_CLASS_NAME, WORKSPACE_NAME, PROPERTY_SET] + [guid_bytes(g) for g in (
     '7e4f4719-8e54-11d2-aad8-000000000000',  # NumericFormat of a field
     'a6a87a80-1dd1-11b2-bf51-08002022f573',  # GeographicCoordinateSystem
     '78ff7fa1-fb2f-11d1-94a2-080009eebecb',  # the layer's tail object
@@ -433,13 +435,21 @@ def empty_symbol(geometry):
 
 # --- renderers -----------------------------------------------------------------------------------------------------
 
-def simple_renderer(symbol_bytes):
+RANGE_CLASS = "map-style graduated interval"
+
+
+def simple_renderer(symbol_bytes, description=None):
     """The single-symbol renderer: the legend class mentions the same symbol object again."""
     block = split_layer(skeleton('polygon'))[1]
     start = block.find(FILL_SYMBOL)
     group = block.find(LEGEND_GROUP)
     mention = block.find(FILL_SYMBOL, group)
-    return block[:start] + symbol_bytes + block[group:mention] + symbol_bytes[:16] + struct.pack('<I', BACK_REFERENCE) + block[mention + 20:]
+    tail = block[mention + 20:]
+    if description:
+        # The legend label and description immediately follow the symbol reference.
+        empty = text_slot('')
+        tail = empty + text_slot(description) + tail[2 * len(empty):]
+    return block[:start] + symbol_bytes + block[group:mention] + symbol_bytes[:16] + struct.pack('<I', BACK_REFERENCE) + tail
 
 
 def class_template(block, label_slot, next_start):
@@ -477,7 +487,10 @@ def unique_renderer(field, heading, classes, default, default_label, spare):
     return bytes(out + replace_slot(bytes(after), '@default', default_label))
 
 
-def breaks_renderer(field, minimum, classes):
+EXCLUSIVE_LIMIT = "map-style exclusive upper bound: "
+
+
+def breaks_renderer(field, minimum, classes, exclusive_limits=()):
     """A class-breaks renderer. classes: (upper bound, label, symbol bytes). Its bounds are a list of doubles, and all its
     classes sit in one legend group."""
     block = split_layer(skeleton('breaks'))[1]
@@ -494,8 +507,11 @@ def breaks_renderer(field, minimum, classes):
     out = bytearray(block[:field_end].replace(text_slot('@field'), text_slot(field))) + struct.pack('<I', len(classes))
     out += b''.join(struct.pack('<d', float(upper)) for upper, _, _ in classes) + bytes(8 * len(classes)) + settings
     out += block[group:first - 4].replace(text_slot('@heading'), text_slot(field)) + struct.pack('<I', len(classes))
-    for _, text, symbol_bytes in classes:
-        out += head + symbol_bytes + text_slot(text) + tail
+    for index, (_, text, symbol_bytes) in enumerate(classes):
+        description = tail
+        if index < len(exclusive_limits):
+            description = text_slot(EXCLUSIVE_LIMIT + number(exclusive_limits[index])) + tail[len(text_slot('')):]
+        out += head + symbol_bytes + text_slot(text) + description
     return bytes(out + block[rest:])
 
 
@@ -681,16 +697,50 @@ def and_query(*queries):
     return ' AND '.join(f'({q})' for q in parts) if len(parts) > 1 else (parts[0] if parts else '')
 
 
-def below(value):
-    """The next double under value: a class holds (previous bound, bound] and map-style's [low, high)."""
-    return math.nextafter(float(value), -math.inf)
+def native_breaks(gdb, table, field, limits):
+    """Return inclusive limits that both engines can draw for the packed values, or None for exact range queries."""
+    import numpy as np
+    import pyogrio
+
+    edges = np.array(limits, dtype='float64')
+    with np.errstate(over='ignore', under='ignore'):
+        single = edges.astype('float32')
+        if not np.isfinite(single).all():
+            return None  # retain the original double bounds in the class queries
+        upper = np.nextafter(single[1:-1], np.float32(-np.inf)).astype('float64')
+    if np.any(upper < edges[:-2]) or np.any(np.abs(upper) < np.finfo('float32').tiny):
+        return None
+    # A native ArcMap class includes its upper bound. Pro draws it at single precision.
+    # Check the actual column, including rows past the first batch, without loading geometry.
+    size = 65536
+    for offset in range(0, pyogrio.read_info(gdb, layer=table, force_feature_count=True)['features'], size):
+        frame = pyogrio.read_dataframe(gdb, layer=table, columns=[field], read_geometry=False, skip_features=offset, max_features=size)
+        values = frame[field].dropna().to_numpy(dtype='float64')
+        with np.errstate(over='ignore', under='ignore'):
+            rounded = values.astype('float32')
+        near_min = (rounded == single[0]) & ((values < edges[0]) | (float(single[0]) != limits[0]))
+        near_max = (rounded == single[-1]) & ((values > edges[-1]) | (float(single[-1]) != limits[-1]))
+        if near_min.any() or near_max.any():
+            return None
+        indices = np.searchsorted(edges[1:-1], values, side='right')
+        before_edge = indices < len(upper)
+        if np.any(values[before_edge] > upper[indices[before_edge]]):
+            return None
+    return [*upper, limits[-1]]
+
+
+def range_query(field, low, high, last):
+    # FileGDB compares adjacent doubles as equal in a plain field comparison.
+    # Subtract first; SIGN returns an integer and retains the direction of the difference.
+    column = cim.sql_field(field)
+    return f'SIGN({column} - {number(low)}) >= 0 AND SIGN({column} - {number(high)}) {"<=" if last else "<"} 0'
 
 
 def has_chinese(*texts):
     return any(0x2E80 <= ord(c) <= 0x9FFF or 0xF900 <= ord(c) <= 0xFAFF or 0xFF00 <= ord(c) <= 0xFF60 for text in texts for c in str(text))
 
 
-def layer_streams(layer, title, table, shape, fields, workspace, names, fonts, notes, read_column):
+def layer_streams(layer, title, table, shape, fields, workspace, names, fonts, notes, read_column, find_breaks):
     """The stream(s) of a map-style vector layer: one feature layer, or a group of them where the renderer is a list of rules."""
     where = {'layer': layer['id']}
     geometry, spec = layer['geometry'], layer['renderer']
@@ -737,11 +787,23 @@ def layer_streams(layer, title, table, shape, fields, workspace, names, fonts, n
         return one(title, block), 'unique values'
     if kind == 'graduated' and cim.contiguous(spec):
         classes = spec['classes']
-        rows = [(float(item['range'][1]) if index == len(classes) - 1 else below(item['range'][1]),
-                 item.get('label', f'{number(item["range"][0])} - {number(item["range"][1])}'),
-                 symbol(item['symbol'], geometry, {**where, 'class': f'{number(item["range"][0])}-{number(item["range"][1])}'}, notes))
-                for index, item in enumerate(classes)]
-        return one(title, breaks_renderer(field, float(classes[0]['range'][0]), rows)), 'class breaks'
+        limits = (float(classes[0]['range'][0]), *(float(item['range'][1]) for item in classes))
+        upper = find_breaks(table, field, limits)
+        rows = []
+        children = []
+        for index, item in enumerate(classes):
+            low, high = item['range']
+            label_text = item.get('label', f'{number(low)} - {number(high)}')
+            blob = symbol(item['symbol'], geometry, {**where, 'class': label_text}, notes)
+            if upper is None:
+                condition = range_query(field, low, high, index == len(classes) - 1)
+                children.append(one(label_text, simple_renderer(blob, RANGE_CLASS), and_query(query, condition)))
+            else:
+                rows.append((upper[index], label_text, blob))
+        if upper is None:
+            notes.append({**where, 'item': 'renderer', 'kind': 'split', 'reason': 'these class bounds or values need double precision: each class uses its own exact range query'})
+            return group_layer(title, list(reversed(children)), visible), 'one layer per class'
+        return one(title, breaks_renderer(field, limits[0], rows, limits[1:-1])), 'class breaks'
     # first-match rules, or classes a class-breaks renderer cannot hold: one single-symbol layer per rule, each with a definition
     # query that leaves out what the rules before it took
     if kind == 'graduated':
@@ -850,6 +912,10 @@ def write_package(ctx, stage, args, shared):
         frame = pyogrio.read_dataframe(gdb, layer=table, columns=[column], read_geometry=False, max_features=LABEL_SCRIPT_ROWS)
         return list(frame[column].dropna().unique()) if column in frame else []
 
+    @lru_cache(maxsize=None)
+    def find_breaks(table, field, limits):
+        return native_breaks(gdb, table, field, limits)
+
     def assemble(workspace):
         """The map as one group layer, with the data at workspace (the path differs in the package and beside the data, and a
         path's length is in the group layer's byte counts, so the stream is put together for each)."""
@@ -876,7 +942,7 @@ def write_package(ctx, stage, args, shared):
                 manifest_rows.append(row)
                 continue
             fields, shape = table_fields(gdb, entry['table'])
-            stream, kind = layer_streams(layer, title_, entry['table'], shape, fields, workspace, entry['renames'], fonts, layer_notes, read_column)
+            stream, kind = layer_streams(layer, title_, entry['table'], shape, fields, workspace, entry['renames'], fonts, layer_notes, read_column, find_breaks)
             labels = layer.get('labels') or {}
             row.update(arcmap_renderer=kind, labels=None if not labels else 'on' if labels.get('enabled', True) else 'off',
                        filter=cim.definition_query(layer.get('filter'), {}, [], entry['renames']))

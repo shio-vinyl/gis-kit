@@ -8,7 +8,7 @@
       "kind": "raster-dem", "encoding": "terrarium", "format": "png", "tile_size": 256, "maxzoom": 15,
       "cache": "allowed",
       "license": "Open data; component sources keep their own terms (SRTM, GMTED2010, ETOPO1, NED and others)",
-      "attribution": "Terrain Tiles © Mapzen, AWS Open Data; sources include SRTM, GMTED2010, ETOPO1",
+      "attribution": "Terrain Tiles by Mapzen via AWS Open Data. SRTM, GMTED2010 and 3DEP courtesy of USGS. ETOPO1 by NOAA. Regional source credits: https://github.com/tilezen/joerd/blob/master/docs/attribution.md",
       "terms_url": "https://github.com/tilezen/joerd/blob/master/docs/attribution.md"
     },
     "eox-s2cloudless-2016": {
@@ -17,8 +17,8 @@
       "kind": "raster", "format": "jpg", "tile_size": 256, "maxzoom": 15,
       "cache": "allowed",
       "license": "CC BY 4.0 (2016 edition)",
-      "attribution": "Sentinel-2 cloudless – s2maps.eu by EOX IT Services GmbH (contains modified Copernicus Sentinel data 2016)",
-      "terms_url": "https://s2maps.eu"
+      "attribution": "EOxCloudless https://cloudless.eox.at by EOX IT Services GmbH (Contains modified Copernicus Sentinel data 2016 & 2017)",
+      "terms_url": "https://cloudless.eox.at/license-non-commercial"
     },
     "osm-standard": {
       "name": "OpenStreetMap standard tiles", "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",

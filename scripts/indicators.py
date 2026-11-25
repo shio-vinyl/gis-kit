@@ -32,6 +32,7 @@ except ImportError:  # Support direct module loading by tests.
 
 from _metric import AreaMeasure, area_frames
 from _budget import check_vector
+from _core import clean
 
 
 def _read(path: str, layer: str | None = None) -> gpd.GeoDataFrame:
@@ -48,6 +49,7 @@ def _write_result(
     *,
     overwrite: bool = False,
     protected_paths: tuple[str, ...] = (),
+    log=None,
 ) -> None:
     if output is None:
         return
@@ -73,30 +75,37 @@ def _write_result(
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        print("CSV output uses same-directory staging and atomic publication.")
+        print("CSV output uses same-directory staging and atomic publication.", file=log)
     else:
         if path.suffix.lower() in {".gpkg", ".geojson", ".json", ".fgb"}:
             evidence = write_vector_atomic(gdf, path, overwrite=overwrite, protected_paths=protected_paths)
-            print(f"=> {path} ({evidence['features']} features; atomic readback verified)")
+            print(f"=> {path} ({evidence['features']} features; atomic readback verified)", file=log)
         else:
             if any(path.resolve(strict=False) == Path(source).resolve(strict=False) for source in protected_paths):
                 raise ValueError(f"Output must not replace an input dataset: {path}")
             if path.exists() and not overwrite:
                 raise FileExistsError(f"Output already exists; pass --overwrite to replace it: {path}")
             gdf.to_file(path, engine="pyogrio")
-            print("Warning: this multi-file/legacy format output is not atomic.")
-            print(f"=> {path}")
+            print("Warning: this multi-file/legacy format output is not atomic.", file=log)
+            print(f"=> {path}", file=log)
 
 
-def _emit_table(rows: list[dict], args: argparse.Namespace, analysis_crs: object, measure: AreaMeasure) -> None:
-    print(tabulate(rows, headers="keys", tablefmt="simple", floatfmt=".4f"))
-    assignment = getattr(args, "assignment", "area")
-    units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
-    print(f"analysis_crs={analysis_crs}; method={measure.method}{units}; assignment={assignment}")
+def _finish_parcels(result, columns, args, analysis_crs, measure: AreaMeasure, report):
+    report.update(analysis_crs=str(analysis_crs), analysis_method=measure.method)
+    rows = result[columns].to_dict("records")
+    if not args.json:
+        print(tabulate(rows, headers="keys", tablefmt="simple", floatfmt=".4f"))
+        units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
+        print(f"analysis_crs={analysis_crs}; method={measure.method}{units}; assignment={args.assignment}")
+        print("Building assignment report: " + json.dumps(report, ensure_ascii=False, sort_keys=True))
+    _write_assignment_report(report, args)
+    protected = (args.parcels, args.buildings) + ((args.green,) if getattr(args, "green", None) else ())
+    _write_result(result, args.output, overwrite=args.overwrite, protected_paths=protected, log=sys.stderr if args.json else None)
+    if args.json:
+        print(json.dumps(clean({"rows": rows, "assignment_report": report, "meters_per_unit": measure.factor}), ensure_ascii=False, allow_nan=False))
 
 
-def _emit_assignment_report(report: dict[str, object], args: argparse.Namespace) -> None:
-    print("Building assignment report: " + json.dumps(report, ensure_ascii=False, sort_keys=True))
+def _write_assignment_report(report: dict[str, object], args: argparse.Namespace) -> None:
     if args.report_json:
         path = Path(args.report_json)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,12 +274,7 @@ def cmd_far(args: argparse.Namespace) -> None:
     result = _base_result(parcels_source, parcels, measure)
     result["total_floor_area_m2"] = floor_area
     result["FAR"] = result["total_floor_area_m2"] / result["parcel_area_m2"]
-    rows = result[[args.parcel_id, "parcel_area_m2", "total_floor_area_m2", "FAR"]].to_dict("records")
-    _emit_table(rows, args, parcels.crs, measure)
-    assignment_report["analysis_crs"] = str(parcels.crs)
-    assignment_report["analysis_method"] = measure.method
-    _emit_assignment_report(assignment_report, args)
-    _write_result(result, args.output, overwrite=args.overwrite, protected_paths=(args.parcels, args.buildings))
+    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "total_floor_area_m2", "FAR"], args, parcels.crs, measure, assignment_report)
 
 
 def cmd_density(args: argparse.Namespace) -> None:
@@ -280,11 +284,7 @@ def cmd_density(args: argparse.Namespace) -> None:
     result = _base_result(parcels_source, parcels, measure)
     result["building_area_m2"] = building_area
     result["density"] = result["building_area_m2"] / result["parcel_area_m2"]
-    _emit_table(result[[args.parcel_id, "parcel_area_m2", "building_area_m2", "density"]].to_dict("records"), args, parcels.crs, measure)
-    assignment_report["analysis_crs"] = str(parcels.crs)
-    assignment_report["analysis_method"] = measure.method
-    _emit_assignment_report(assignment_report, args)
-    _write_result(result, args.output, overwrite=args.overwrite, protected_paths=(args.parcels, args.buildings))
+    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "building_area_m2", "density"], args, parcels.crs, measure, assignment_report)
 
 
 def _green_by_parcel(
@@ -309,13 +309,11 @@ def cmd_coverage(args: argparse.Namespace) -> None:
     clipped = [geom.intersection(study) for geom in targets.geometry]
     green_area_m2 = measure(unary_union([g for g in clipped if not g.is_empty]))
     ratio = green_area_m2 / study_area_m2
-    print(tabulate([
-        {"metric": "green_area_m2", "value": green_area_m2},
-        {"metric": "study_area_m2", "value": study_area_m2},
-        {"metric": "coverage_ratio", "value": ratio},
-    ], headers="keys", tablefmt="simple", floatfmt=".6f"))
-    units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
-    print(f"analysis_crs={boundary.crs}; projection_method={measure.method}; measurement_method=union area{units}")
+    metrics = {"green_area_m2": green_area_m2, "study_area_m2": study_area_m2, "coverage_ratio": ratio}
+    if not args.json:
+        print(tabulate(metrics.items(), headers=["metric", "value"], tablefmt="simple", floatfmt=".6f"))
+        units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
+        print(f"analysis_crs={boundary.crs}; projection_method={measure.method}; measurement_method=union area{units}")
     if args.output:
         output = boundary_source.copy()
         if "area_method" in output:
@@ -324,7 +322,10 @@ def cmd_coverage(args: argparse.Namespace) -> None:
         output["green_area_m2"] = green_area_m2
         output["study_area_m2"] = study_area_m2
         output["coverage_ratio"] = ratio
-        _write_result(output, args.output, overwrite=args.overwrite, protected_paths=(args.boundary, args.target))
+        _write_result(output, args.output, overwrite=args.overwrite, protected_paths=(args.boundary, args.target), log=sys.stderr if args.json else None)
+    if args.json:
+        print(json.dumps({**metrics, "analysis_crs": str(boundary.crs), "analysis_method": measure.method,
+                          "measurement_method": "union area", "meters_per_unit": measure.factor}, allow_nan=False))
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
@@ -348,15 +349,11 @@ def cmd_summary(args: argparse.Namespace) -> None:
     columns = [args.parcel_id, "parcel_area_m2", "building_area_m2", "total_floor_area_m2", "FAR", "density"]
     if args.green:
         columns.append("green_ratio")
-    _emit_table(result[columns].to_dict("records"), args, parcels.crs, measure)
-    assignment_report["analysis_crs"] = str(parcels.crs)
-    assignment_report["analysis_method"] = measure.method
-    _emit_assignment_report(assignment_report, args)
-    protected = (args.parcels, args.buildings) + ((args.green,) if args.green else ())
-    _write_result(result, args.output, overwrite=args.overwrite, protected_paths=protected)
+    _finish_parcels(result, columns, args, parcels.crs, measure, assignment_report)
 
 
 def _add_parcel_options(parser: argparse.ArgumentParser, include_floors: bool = False) -> None:
+    parser.add_argument("--json", action="store_true", help="Pure JSON on stdout")
     parser.add_argument("--parcels", required=True)
     parser.add_argument("--parcels-layer")
     parser.add_argument("--parcel-id", required=True)
@@ -385,6 +382,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--green")
     p.add_argument("--green-layer")
     p = sub.add_parser("coverage", help="Target coverage within a study-area boundary")
+    p.add_argument("--json", action="store_true", help="Pure JSON on stdout")
     p.add_argument("--target", required=True)
     p.add_argument("--target-layer")
     p.add_argument("--boundary", required=True)
