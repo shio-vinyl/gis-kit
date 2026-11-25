@@ -6,9 +6,9 @@ links and archives larger than --max-bytes before extracting anything; it then c
 the listing. It reads the package information (esriinfo), writes a describe card for every dataset (shapefiles,
 file geodatabases, rasters) under commondata/ or in a layer version folder (v10/, v107/ ..., one copy of a dataset
 repeated there), and matches each layer file to its data: .lyrx (ArcGIS Pro)
-is JSON and its renderer fields, label expression and definition query are read; .lyr (ArcMap) is a binary
-format, so only its data-source path and the names it mentions are picked out. Layers whose data is not in the
-package (packaged by reference, or enterprise data left out) are reported. Symbology is not reproduced.
+is JSON and its renderer fields, label expression and definition query are read. Supported ArcMap .lyr
+files yield map-style documents with package-relative data connections. Layers whose data is not in the
+package (packaged by reference, or enterprise data left out) are reported.
 
 `package.py pack` reads a map-style v1 document (gis-plugin contracts) and the data it names, and writes one
 GeoPackage that QGIS opens with the map's styles: one table per dataset in its own CRS (a dataset drawn by several
@@ -26,7 +26,7 @@ the layer file beside the unpacked data. `package.py pack --format arcmap` write
 with binary layer files (.lyr, _arcmap_style.py) in place of the CIM one; --lyr keeps one beside the data. Only the style and
 container writer differs between the formats.
 
-`package.py read` goes the other way: a platform style (QGIS .qml, ArcGIS Pro .lyrx, .stylx) into a map-style
+`package.py read` goes the other way: a platform style (ArcMap .lyr, QGIS .qml, ArcGIS Pro .lyrx, .stylx) into a map-style
 document, reporting what could not be carried; the readers live in _style_read.py and its platform modules.
 """
 from __future__ import annotations
@@ -36,7 +36,8 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
-from pathlib import Path, PurePosixPath
+import posixpath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import shutil
 import subprocess
@@ -279,8 +280,8 @@ def utf16_strings(data, minimum=3):
     return list(dict.fromkeys(s.strip() for s in found if s.strip()))
 
 
-def lyr_summary(path):
-    """What can be read from an ArcMap .lyr without the ArcObjects format: data path, names, label expression."""
+def lyr_string_inventory(path):
+    """Last-resort inventory when the structured reader could not recover any layer."""
     strings = utf16_strings(path.read_bytes(), minimum=2)  # two-character names (水系, 道路) are common
     sources = [s for s in strings if 'commondata' in s.lower() or re.search(r'\.(gdb|shp|sde)\b', s, re.I)]
     labels = [s for s in strings if re.fullmatch(r'\[[^\]]+\]', s)]
@@ -316,10 +317,15 @@ def lyrx_summary(path):
 def layer_files(root):
     """Layer files by format; ArcMap packages hold one folder per ArcGIS version (v10, v105, ...), newest kept."""
     files = []
-    lyr_folders = sorted({p.parent for p in root.rglob('*.lyr')}, key=lambda p: [int(n) for n in re.findall(r'\d+', p.name)] or [0])
-    if lyr_folders:
-        newest = lyr_folders[-1]
-        files += [(p, lyr_summary(p)) for p in sorted(newest.glob('*.lyr'))]
+    versioned = {}
+    for path in sorted(root.rglob('*.lyr')):
+        folder = next((p for p in path.parents if p != root and root in p.parents and re.fullmatch(r'v[0-9]+', p.name, re.I)), None)
+        versioned.setdefault(folder, []).append(path)
+    lyr_folders = sorted((p for p in versioned if p), key=lambda p: (int(p.name[1:]), p.as_posix()))
+    newest = int(lyr_folders[-1].name[1:]) if lyr_folders else None
+    for folder, paths in versioned.items():
+        if (int(folder.name[1:]) if folder else None) == newest:
+            files += [(p, {'format': 'lyr (ArcMap binary)'}) for p in paths]
     for path in sorted(root.rglob('*.lyrx')):
         try:
             files.append((path, lyrx_summary(path)))
@@ -380,6 +386,48 @@ def match(summary, data, layer_name, versions=(), folder=''):
     return sorted(set(hits))
 
 
+def unpack_arcmap_style(path, root, stage, data, summary, style_id):
+    """Bind only workspaces in the extracted inventory. The map-style lives beside package/."""
+    import _arcmap_read
+    folder = path.parent.relative_to(root).as_posix()
+    bindings = {}
+    for row in data:
+        if row['kind'] not in ('filegdb', 'shapefile'):
+            continue
+        for copy in (row['path'], *row.get('copies', [])):
+            path_in_layer = PureWindowsPath(posixpath.relpath(copy, folder))
+            workspace = path_in_layer.parent if row['kind'] == 'shapefile' else path_in_layer
+            for layer in (row.get('card') or {}).get('layers', []):
+                fields = {f['name']: f['type'] for f in layer.get('fields', [])}
+                binding = ('package/' + row['path'], fields)
+                bindings[workspace, layer['name'].casefold()] = binding
+                if row['kind'] == 'shapefile':
+                    bindings[workspace, path_in_layer.name.casefold()] = binding
+    reading = _style_read.Reading(path)
+    try:
+        _arcmap_read.read(path, reading, bindings)
+    except ValueError as error:
+        reading.note('untranslated', 'layer-file', str(error))
+    summary['notes'] = reading.notes
+    if not reading.layers:
+        summary.update(lyr_string_inventory(path))
+        return None
+    document = reading.document()
+    document['id'] = style_id
+    style_file = stage / f'{style_id}.map-style.json'
+    write_json(style_file, document)
+    _map_style.load(style_file)
+    report_file = stage / f'{style_id}.style-read.json'
+    write_json(report_file, _style_read.report_of(reading, path, document, style_file))
+    connections = reading.extra.get('data_connections', [])
+    summary.update(map_style=style_file.name, style_read=report_file.name, symbology='see map-style and style-read report',
+                   data_sources=list(dict.fromkeys(c['workspace'] for c in connections)),
+                   label_expressions=reading.extra.get('label_expressions', []))
+    return sorted({layer['data']['path'][len('package/'):] + (':' + layer['data']['layer'] if 'layer' in layer['data'] else '')
+                   for layer in reading.layers
+                   if layer['data']['path'].startswith('package/')})
+
+
 def unpack(args):
     source = Path(args.source)
     if source.suffix.lower() not in SUFFIXES or not source.is_file():
@@ -397,9 +445,14 @@ def unpack(args):
         files, versions = layer_files(root)
         data, copy_warnings = datasets(root, versions)
         layers, used = [], set()
+        style_ids = _style_read.Reading(source)
         for path, summary in files:
             name = re.sub(r'^\d{4}', '', path.stem)
-            linked = match(summary, data, name, versions, path.parent.relative_to(root).as_posix()) if 'error' not in summary and summary['format'][:3] in ('lyr',) else []
+            linked = None
+            if path.suffix.lower() == '.lyr':
+                linked = unpack_arcmap_style(path, root, stage, data, summary, style_ids.unique_id(path.stem))
+            if linked is None:
+                linked = match(summary, data, name, versions, path.parent.relative_to(root).as_posix()) if 'error' not in summary and summary['format'].startswith('lyr') else []
             used.update(p.split(':')[0] for p in linked)
             layers.append({'file': path.relative_to(root).as_posix(), 'name': name, **summary, 'data': linked,
                            'data_in_package': bool(linked) if summary['format'][:3] == 'lyr' else None})
@@ -429,11 +482,10 @@ def unpack(args):
         write_json(stage / 'record.json', {'schema_version': 1, 'status': 'complete', 'tool': 'package unpack', 'version': VERSION,
                                             'parameters': {k: v for k, v in vars(args).items() if k not in ('output', 'command')},
                                             'source': {'path': str(source.absolute()), 'sha256': manifest['source']['sha256']},
-                                            'files': {'package.json': digest(stage / 'package.json')},
+                                            'files': {p.name: digest(p) for p in sorted(stage.glob('*.json'))},
                                             'finished_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
                                             'assumptions': ['Archive members are checked before extraction; nothing outside package/ is written',
-                                                            'Layer-to-data links in .lyr files are read from embedded strings, not the ArcObjects format',
-                                                            'Symbology is not reproduced']})
+                                                            'Supported ArcMap layers use their stored data connections; legacy inventory falls back to embedded strings']})
     return manifest
 
 

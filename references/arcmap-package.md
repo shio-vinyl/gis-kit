@@ -50,7 +50,7 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 |---|---|
 | `single` | 简单渲染器 |
 | `categorized` | 唯一值渲染器；`default` 接住未列出的值和 NULL（实测）；数值分类写成文本（`1.5`、`4`），ArcMap 按字段值匹配 |
-| `graduated`（相接、升序、无默认、全显示） | 分级渲染器；上界取下一个双精度数，分界值落进上一档，与 PNG 的左闭右开一致（实测） |
+| `graduated`（相接、升序、无默认、全显示） | 通常写为分级渲染器，保留分类字段。两端的精度无法区分包内数值时，每档写为带精确范围查询的要素图层 |
 | `rule`；有缺口、隐藏档或默认的 `graduated` | 一个组图层，每条规则一个单一符号图层加定义查询，后面的规则排除前面已命中的（先命中先用） |
 | 面：`fill`、`stroke` | 简单填充符号；没有 `fill` 或不透明度为 0 写空填充，没有 `stroke` 写空轮廓线 |
 | 线：`stroke` | 简单线符号，颜色、线宽 |
@@ -64,7 +64,7 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 
 两个判断：
 
-- **分类图用真正的唯一值 / 分级渲染器，不用“每类一个图层”。** issue 提过变通办法，但类数和索引表的结构已经摸清（下节），组装结果和 ArcObjects 自己写的文件逐字节相同，300 类也能打开；真渲染器在 ArcMap 里就是一个图层、一个图例，Pro 读出来是 `CIMUniqueValueRenderer` / `CIMClassBreaksRenderer`。变通办法只用于 ArcMap 没有对应渲染器的情况（规则、带缺口的分级）。
+- **分级断点。** map-style 中间档为左闭右开，ArcMap 的分级上界为闭区间，Pro 绘图还有单精度限制。写入器逐批检查包内分类字段。能准确分档时，用单精度前驱作为内部上界，原始开上界写入相应图例项的说明。遇到紧邻边界的双精度值或无法区分的档位，改用同一数据源上的分档图层。定义查询先求字段与断点之差的符号，兼顾相等值与紧邻值。后续编辑或追加分类数值后，应重新打包校验。
 - **符号透明度。** ArcMap 的符号没有透明度。一个图层所有符号部件的不透明度相同时，并进图层透明度，结果准确；不同时画成不透明并记录。
 
 ### 转不了的（列入 `unsupported`）
@@ -101,6 +101,8 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 - **标注**：字段表后的空对象换成标注集合；表达式字符串后面的开关表示是否简单表达式；文字符号里颜色、字号（双精度）、掩膜（样式、大小、填充符号，即晕边）；字体是 OLE StdFont：字符集、标志、字重、以万分之一磅计的字号、ANSI 编码的字体名。字符集写西文时中文标注画成方框，所以含中文的标注写 GB2312（实测）。
 - **组图层**：名称、显示开关、子图层数，每个子图层前有 u64 字节数；子图层可以还是组图层。编号贯穿全部子图层。子图层在列表里靠前的画在上面。
 
+读回独立图层使用 `package.py read`。从包读回时，`package.py unpack` 在结果目录写出最新版本图层的 map-style 与转换报告，详见[平台样式读取](style-read.md)。
+
 ## 骨架
 
 `templates/arcmap/*.lyr` 是 ArcObjects 写的真图层文件，数据全部虚构，参数位置换成了 `@name`、`@workspace` 这样的占位字符串，机器路径和 Windows 语言（要素类类型名、“默认”标注类名）都去掉了；它们仍是能打开的图层文件。`_arcmap_style.py` 只裁切、改写、拼接这些字节，不从零序列化任何类。
@@ -118,7 +120,9 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 - 单元测试（虚构数据）：容器往返和 olefile 交叉校验、字符串改写、编号重排、颜色换算、与 ArcObjects 的逐字节比较、`.lpk` 布局、`unpack` 读回。
 - 真机检查（可选，虚构数据）：设 `GIS_KIT_ARCMAP_PYTHON`（ArcMap 的 Python）、`GIS_KIT_ARCGIS_PYTHON`（Pro 的 Python）后 pytest 会跑 `tests/arcmap_open_check.py`、`tests/arcmap_open_check_pro.py`：读回 `isBroken`、渲染器类型、类和分界值、定义查询、透明度、标注，把图层加进数据框渲染 PNG，按点取色、量线宽和标记大小。
 
-在 ArcMap 10.8、ArcGIS Pro 3.4.3 上实测：图层文件和 `.lpk` 解出的三个版本文件夹全部不断链；唯一值、分级被识别为 `UNIQUE_VALUES`、`GRADUATED_COLORS`，类、标签、分界值读回一致；取色逐字节一致（含分界值、NULL、未列出值、数值分类）；6 px 线宽、30 px 标记、4 px 轮廓都量到；图层上下顺序、隐藏、定义查询、中文名称和中文包名都对；300 类、30 档能打开。Pro 读出的渲染器类型和颜色也一致。
+ArcMap 10.8 可打开包内三个版本的图层，Pro 3.4.3 可打开它解出的最新版本图层。两端均验证了数据连接、唯一值、分类标签、分级和符号颜色读回，并分别导出了 PNG。ArcMap 组合图的 24 个采样点均与目标颜色逐字节相等，另核验了线宽、标记大小和面轮廓。
+
+Pro 3.4.3 导入旧写法时，恰等于 1.5 和 2.5 的要素绘制到了前一档。修正后的原生分级和精确范围查询分别用虚构数据核对，覆盖边界本身及两侧相邻的双精度值。组合图的 24 个采样点在 Pro 中均落入目标类别，22 个像素与请求 RGB 逐字节相同。其余两个均为最高档的 `#A63603`，PNG 像素为 `#A63600`。另在 Pro 中直接新建简单填充符号，使用同一 RGB 值及导出设置，也得到 `#A63600`。两者的 CIM 填充值均为精确的 `[166, 54, 3, 100]`。
 
 ## 没有实测的
 
