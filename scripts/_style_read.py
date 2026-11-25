@@ -1,6 +1,6 @@
 """Platform style -> map-style v1: what every platform reader shares. The other direction is in _map_style.py and the writers.
 
-One reader per platform: `_qgis_read.py` (.qml) and `_arcgis_read.py` (.lyrx, .stylx); a new one (ArcMap .lyr, .style)
+One reader per platform: `_qgis_read.py` (.qml), `_arcgis_read.py` (.lyrx, .stylx) and `_arcmap_read.py` (.lyr); a new one
 is a module with a `read(path, reading)` function and a row in READERS. A reader only understands its platform and
 hands over neutral pieces; nothing below this line knows QML or CIM:
 
@@ -34,7 +34,7 @@ from _delivery import bundle, digest, write_json
 import _map_style
 
 from _version import VERSION
-READERS = {'.qml': ('_qgis_read', 'read'), '.lyrx': ('_arcgis_read', 'read_lyrx'), '.stylx': ('_arcgis_read', 'read_stylx')}
+READERS = {'.lyr': ('_arcmap_read', 'read'), '.qml': ('_qgis_read', 'read'), '.lyrx': ('_arcgis_read', 'read_lyrx'), '.stylx': ('_arcgis_read', 'read_stylx')}
 PX_PER_PT = 96 / 72
 PX_PER_MM = 96 / 25.4
 LEVELS = ('exact', 'svg', 'split', 'approximated', 'lost')
@@ -828,8 +828,8 @@ def render_pass(renderer, depth):
 # --- the command ---------------------------------------------------------------------------------------------------
 
 def add_command(commands):
-    sub = commands.add_parser('read', help='Read a platform style (.qml, .lyrx, .stylx) into a map-style document')
-    sub.add_argument('source', help='Style file: QGIS .qml, ArcGIS Pro .lyrx or .stylx')
+    sub = commands.add_parser('read', help='Read a platform style (.lyr, .qml, .lyrx, .stylx) into a map-style document')
+    sub.add_argument('source', help='Style file: ArcMap .lyr, QGIS .qml, ArcGIS Pro .lyrx or .stylx')
     sub.add_argument('--output', required=True, help='New directory for the map-style, assets/, style-read.json and record.json')
     sub.add_argument('--data', help='Data path relative to the output folder or @root/..., for a source that names none (.qml, .stylx) or one layer of a .lyrx')
     sub.add_argument('--data-layer', help='Layer inside --data')
@@ -852,7 +852,8 @@ def run(args):
     reading = Reading(source, data=args.data, data_layer=args.data_layer, field=args.field, match=args.match, font_dir=args.font_dir)
     getattr(importlib.import_module(entry[0]), entry[1])(source, reading)
     if not reading.layers:
-        raise ValueError(f'{source.name}: nothing in it could be read as a map-style layer')
+        reasons = '; '.join(note['reason'] for note in reading.notes)
+        raise ValueError(f'{source.name}: nothing in it could be read as a map-style layer' + (f': {reasons}' if reasons else ''))
     document = reading.document()
     with bundle(args.output) as stage:
         style_file = stage / f'{document["id"]}.map-style.json'
