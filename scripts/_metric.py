@@ -1,4 +1,4 @@
-"""Shared, fail-closed CRS and geometry handling for planar measurements.
+"""Shared, fail-closed CRS and geometry handling for planar measurements and ellipsoidal area.
 
 ``meters_per_unit`` is metres represented by one coordinate unit in the
 returned projected frame. Areas must therefore be multiplied by its square.
@@ -207,3 +207,78 @@ def analysis_method(source: gpd.GeoDataFrame | str | int | CRS | object, analysi
             return "automatic local UTM because the source projected CRS changes distances too much over this extent"
         return "source projected CRS; suitability is assumed from input metadata"
     return "automatic local UTM only within one zone, <=6 degree longitude and <=8 degree latitude extent, and UTM latitude limits"
+
+
+class AreaMeasure:
+    """Area in square metres for geometries in one known CRS, including polygon overlay results."""
+
+    def __init__(self, crs, method, factor=None):
+        self.method = method
+        self.factor = factor
+        if factor is None:
+            geographic = crs.geodetic_crs
+            self.geod = geographic.get_geod()
+            self.to_geographic = None if crs.equals(geographic) else Transformer.from_crs(crs, geographic, always_xy=True)
+            self.to_degrees = math.degrees(geographic.axis_info[0].unit_conversion_factor)
+
+    def ring_area(self, ring):
+        lon, lat = ring.xy
+        if self.to_geographic is not None:
+            lon, lat = self.to_geographic.transform(lon, lat, errcheck=True)
+        area, _ = self.geod.polygon_area_perimeter(np.asarray(lon) * self.to_degrees, np.asarray(lat) * self.to_degrees)
+        if not math.isfinite(area):
+            raise ValueError("Non-finite geodesic area. Check geographic coordinates")
+        return abs(area)
+
+    def __call__(self, geom):
+        if self.factor is not None:
+            return geom.area * self.factor**2
+        if geom.is_empty:
+            return 0.0
+        if geom.geom_type == "Polygon":
+            area = self.ring_area(geom.exterior) - sum(self.ring_area(hole) for hole in geom.interiors)
+            if area < 0:
+                raise ValueError("Interior rings exceed the ellipsoidal area of the exterior ring")
+            return area
+        if hasattr(geom, "geoms"):
+            return sum(self(part) for part in geom.geoms)
+        return 0.0
+
+    def areas(self, series):
+        return series.area * self.factor**2 if self.factor is not None else series.map(self)
+
+
+def area_frames(layers, analysis_crs=None, *, geodesic=False):
+    """Align inputs for overlay and select the area measure. Geodesic edges join the stored vertices."""
+    source = layers[0].crs
+    if geodesic:
+        if analysis_crs is not None:
+            raise ValueError("Choose geodesic area or an explicit projected analysis CRS")
+        if source is None or not (source.is_projected or source.is_geographic):
+            raise ValueError("Geodesic area requires a known geographic or projected CRS")
+        frames = []
+        for layer in layers:
+            validate_measurement_geometries(layer)
+            if layer.crs is not None and layer.crs.is_projected:
+                _horizontal_meters_per_unit(layer.crs)
+            frame = reproject(layer, source, purpose="align") if layer.crs != source else layer
+            if len(layers) > 1 and source.is_geographic:
+                bounds = frame.geometry.bounds
+                if ((bounds.maxx - bounds.minx) * source.axis_info[0].unit_conversion_factor > math.pi).any():
+                    raise ValueError("Geographic overlay spans the longitude seam; use a continuous source projection")
+            frames.append(frame)
+        return frames, AreaMeasure(source, f"ellipsoidal geodesic ({source.geodetic_crs.ellipsoid.name})")
+
+    if len(layers) == 1:
+        work, factor = analysis_frame(layers[0], analysis_crs)
+        frames = [work]
+    else:
+        frames, factor = analysis_frames(layers, analysis_crs)
+    used = frames[0].crs
+    if analysis_crs is not None:
+        method = f"explicit projected CRS ({used})"
+    elif used.equals(source):
+        method = f"source projected CRS ({used})"
+    else:
+        method = f"automatic UTM {used.utm_zone} ({used})"
+    return frames, AreaMeasure(used, method, factor)

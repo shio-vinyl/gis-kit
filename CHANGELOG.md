@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- field add-area 和 indicators 的四项指标可用 --geodesic 按源 CRS 的椭球量算面积，结果记录实际面积方法。
+
 ## v0.2.0 — 2026-11-12
 
 本版汇总 v0.1.0 之后的 CAD 规划图纸处理、平台样式与图层包转换、Composer 文件交接，以及数据安全和跨平台修复。

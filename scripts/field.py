@@ -15,7 +15,7 @@ from pathlib import Path
 import geopandas as gpd
 import pyogrio
 from _core import read_vector, reproject
-from _metric import analysis_frame
+from _metric import analysis_frame, area_frames
 from _safe_io import write_vector_atomic
 
 
@@ -160,8 +160,11 @@ def cmd_add_area(args):
     name = args.name or "area_m2"
     if name in gdf.columns:
         raise ValueError(f"Field already exists: {name}")
-    work, factor = analysis_frame(gdf, args.crs)
-    gdf[name] = work.geometry.area * factor**2
+    if name == "area_method" or "area_method" in gdf.columns:
+        raise ValueError("Area method field collision: area_method")
+    (work,), measure = area_frames([gdf], args.crs, geodesic=args.geodesic)
+    gdf[name] = measure.areas(work.geometry)
+    gdf["area_method"] = measure.method
     write_output(gdf, args)
 
 
@@ -221,7 +224,9 @@ def main():
     p_area = subs.add_parser("add-area", help="Add area field")
     add_common_args(p_area)
     p_area.add_argument("--name", default="area_m2", help="Field name for area")
-    p_area.add_argument("--crs", help="Projected CRS for calculation")
+    area_mode = p_area.add_mutually_exclusive_group()
+    area_mode.add_argument("--crs", help="Projected CRS for calculation")
+    area_mode.add_argument("--geodesic", action="store_true", help="Measure on the source ellipsoid along geodesic edges")
 
     p_length = subs.add_parser("add-length", help="Add length field")
     add_common_args(p_length)

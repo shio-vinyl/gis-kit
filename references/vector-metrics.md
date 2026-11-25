@@ -85,3 +85,11 @@ python3 gis-kit/scripts/stats.py spatial points.gpkg --study-area study_area.gpk
 python3 gis-kit/scripts/stats.py cross --input zones.gpkg --target points.gpkg \
   --zone-field zone_id --sum-field amount --predicate intersects --analysis-crs EPSG:32618
 ```
+
+## 要素面积字段
+
+`field.py add-area parcels.gpkg --geodesic --output areas.gpkg` 沿相邻顶点间的测地线，在源 CRS 的椭球上量算平方米。投影数据先还原到自身地理 CRS，输出几何保留源 CRS。每个环取较小一侧的面积，外环减去洞，多部件逐面相加。该口径适用于单环所围区域小于半个椭球的面。
+
+默认沿用受范围和尺度约束的投影路径，也可用 `--crs` 显式选投影。结果的 `area_method` 字段随面积保存，分别写出椭球、自动 UTM 带号与 CRS、源投影 CRS 或显式投影 CRS。
+
+`indicators.py far/density/summary/coverage` 同样接受 `--geodesic`。相交、裁剪和合并在地块或研究边界的源 CRS 中进行，随后在该 CRS 的椭球上量算各面的面积。建筑按面积分摊时，将相交部分和未覆盖部分的椭球面积作为权重分配原建筑面积。这样即使切分引入新顶点，总建筑面积仍守恒。空间关系跨经度接缝时，应先把输入放在连续的源投影中。
