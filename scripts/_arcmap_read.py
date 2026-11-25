@@ -9,7 +9,7 @@ from uuid import UUID
 
 import _arcmap_style as arc
 from _arcgis_read import GROUPS, label_source
-from _style_read import PX_PER_PT, hex_color, line, paint, parse_filter, tidy
+from _style_read import PX_PER_PT, Reading, hex_color, line, paint, parse_filter, tidy
 
 
 class Cursor:
@@ -147,10 +147,12 @@ def renderer(at, geometry, where, reading):
     def legend():
         at.object(arc.LEGEND_CLASS)
         blob, label, description = symbol(), at.text(), at.text()
+        at.take(20)
+        return blob, label, description
+
+    def note_description(description):
         if description:
             reading.note('untranslated', 'legend-description', f'legend description {description!r} has no map-style field', where, 'renderer')
-        at.take(20)
-        return blob, label
 
     if kind == arc.SIMPLE_RENDERER:
         return {'type': 'single', 'passes': passes(symbol())}
@@ -171,9 +173,17 @@ def renderer(at, geometry, where, reading):
         for index, upper in enumerate(bounds):
             # ArcMap includes the upper edge. Map-style excludes it except in the last class.
             high = math.nextafter(upper, math.inf) if index + 1 < n else upper
+            blob, label, description = legend()
+            if index + 1 < n and description.startswith(arc.EXCLUSIVE_LIMIT):
+                try:
+                    exclusive = float(description[len(arc.EXCLUSIVE_LIMIT):])
+                    if math.isfinite(exclusive) and arc.cim.below(exclusive) == upper:
+                        high, description = exclusive, ''
+                except ValueError:
+                    pass
+            note_description(description)
             if not math.isfinite(low) or not math.isfinite(high) or high < low:
                 raise ValueError('invalid class-break bounds')
-            blob, label = legend()
             classes.append({'range': [low, high], 'label': label, 'passes': passes(blob, label)})
             low = high
         return {'type': 'graduated', 'field': field, 'method': 'manual', 'classes': classes}
@@ -189,7 +199,9 @@ def renderer(at, geometry, where, reading):
         heading, count = group()
         if count != 1:
             raise ValueError('unsupported multi-class unique-value legend group')
-        groups.append((heading, *legend()))
+        blob, label, description = legend()
+        note_description(description)
+        groups.append((heading, blob, label))
         at.take(2)
     at.expect(bytes(16))
     classes, used = [], set()
@@ -285,7 +297,7 @@ def source_header(at):
     return workspace, dataset, geometry, shapefile
 
 
-def feature(data, at, layer_id, name, visible, parents, reading, bindings):
+def feature(data, at, layer_id, visible, parents, reading, bindings):
     where = {'layer': layer_id}
     at.text()  # localized layer category
     header = at.pos
@@ -293,7 +305,10 @@ def feature(data, at, layer_id, name, visible, parents, reading, bindings):
     at.take(4)
     workspace, dataset, geometry, shapefile = source_header(at)
     key = (PureWindowsPath(workspace), dataset.casefold())
-    reading.extra.setdefault('data_connections', []).append({'layer': layer_id, 'workspace': workspace, 'dataset': dataset})
+    connection = {'layer': layer_id, 'workspace': workspace, 'dataset': dataset}
+    connections = reading.extra.setdefault('data_connections', [])
+    if not connections or connections[-1] != connection:
+        connections.append(connection)
     if reading.data:
         source = {'path': reading.data, **({'layer': reading.data_layer} if reading.data_layer else {})}
     elif key in bindings:
@@ -324,6 +339,7 @@ def feature(data, at, layer_id, name, visible, parents, reading, bindings):
         drawn = None
 
     extra = {'visible': visible, 'group': next((p for p in reversed(parents) if p in GROUPS), None)}
+    query = ''
     fields = data.find(arc.FIELD_INFO, header)
     try:
         if fields < 0:
@@ -333,7 +349,15 @@ def feature(data, at, layer_id, name, visible, parents, reading, bindings):
         query_pos = previous_slot(data, query_end)
         query = Cursor(data, query_pos).text()
         if query:
-            extra['filter'] = parse_filter(query, 'sql')
+            cut = interval(query)
+            if cut:
+                base, field, low, high, op = cut
+                terms = [{'field': field, 'op': '>=', 'value': low}, {'field': field, 'op': op, 'value': high}]
+                if base:
+                    terms.insert(0, parse_filter(base, 'sql'))
+                extra['filter'] = {'all': terms}
+            else:
+                extra['filter'] = parse_filter(query, 'sql')
         shown = Cursor(data, query_pos - 38 + arc.LABELS_SHOWN).number('H')
         extra['labels'] = label_properties(data, bool(shown), where, reading)
     except (ValueError, IndexError) as error:
@@ -351,7 +375,79 @@ def feature(data, at, layer_id, name, visible, parents, reading, bindings):
             reading.note('untranslated', 'display-filter', 'unsupported display filter', where, 'opacity')
     else:
         reading.note('untranslated', 'display-filter', 'missing layer extension for transparency', where, 'opacity')
+    return geometry, drawn, source, extra, query
+
+
+# A precision-split group carries a legend description on each child. Only rejoin
+# it when its actual filters, field, connection and layer properties still agree.
+INTERVAL = re.compile(r'SIGN\((?P<field>[^\W\d]\w*|"(?:[^"]|"")*") - (?P<lo>[+\-\deE.]+)\) >= 0 AND '
+                      r'SIGN\((?P=field) - (?P<hi>[+\-\deE.]+)\) (?P<op><=?) 0')
+
+
+def interval(query):
+    base, separator, suffix = query.rpartition(') AND (SIGN(')
+    if separator and query.startswith('(') and suffix.endswith(')'):
+        query, base = 'SIGN(' + suffix[:-1], base[1:]
+    else:
+        base = ''
+    found = INTERVAL.fullmatch(query)
+    if found is None:
+        return None
+    field = found['field']
+    if field.startswith('"'):
+        field = field[1:-1].replace('""', '"')
+    try:
+        low, high = float(found['lo']), float(found['hi'])
+    except ValueError:
+        return None
+    if math.isfinite(low) and math.isfinite(high):
+        return base, field, low, high, found['op']
+    return None
+
+
+def read_range_group(children, name, parents, visible, reading, bindings):
+    marker = arc.text_slot(arc.RANGE_CLASS)
+    if not children or not all(child.startswith(arc.FEATURE_LAYER) and marker in child for child in children):
+        return False
+    # Read into a separate report until the complete group has been validated.
+    group = Reading(reading.source, data=reading.data, data_layer=reading.data_layer)
+    classes = []
+    for index, data in enumerate(reversed(children)):
+        try:
+            at = Cursor(data, 22)
+            title = at.text()
+            geometry, drawn, source, extra, query = feature(data, at, name, visible, parents, group, bindings)
+        except (ValueError, IndexError):
+            return False  # ordinary traversal can still recover the other children
+        bounds = interval(query)
+        if bounds is None or not drawn or drawn['type'] != 'single':
+            return False
+        base, field, low, high, op = bounds
+        extra.pop('filter', None)
+        properties = (geometry, source, extra, base, field)
+        if index == 0:
+            common = properties
+        if (properties != common or len(group.extra['data_connections']) != 1 or
+                op != ('<=' if index == len(children) - 1 else '<') or not low < high or
+                (classes and low != classes[-1]['range'][1])):
+            return False
+        classes.append({'range': [low, high], 'label': title, 'passes': drawn['passes']})
+    layer_id = reading.unique_id(name)
+    reading.symbols.update(group.symbols)
+    reading.losses.update(group.losses)
+    reading.notes.extend({**note, 'layer': layer_id} for note in group.notes)
+    reading.extra.setdefault('data_connections', []).append({**group.extra['data_connections'][0], 'layer': layer_id})
+    if parents:
+        reading.extra.setdefault('group_members', {})[layer_id] = list(parents)
+    for expr in group.extra.get('label_expressions', []):
+        expressions = reading.extra.setdefault('label_expressions', [])
+        if expr not in expressions:
+            expressions.append(expr)
+    if base:
+        extra['filter'] = parse_filter(base, 'sql')
+    drawn = {'type': 'graduated', 'field': field, 'method': 'manual', 'classes': classes}
     reading.add_layer(layer_id, geometry, drawn, source, title=name, **extra)
+    return True
 
 
 def read(path, reading, bindings=None):
@@ -371,13 +467,16 @@ def read(path, reading, bindings=None):
                 at.take(20)
                 children = [at.take(at.number('Q')) for _ in range(at.number('I'))]
                 reading.extra.setdefault('groups', []).append({'path': list(parents + (name,)), 'visible': visible})
+                if read_range_group(children, name, parents, visible, reading, bindings or {}):
+                    continue
                 if name not in GROUPS:
                     reading.note('approximated', 'group-layers', f'group {name!r} is flattened in drawing order', prop='group')
                 pending.extend((child, parents + (name,), visible) for child in children)
             elif kind == arc.FEATURE_LAYER:
                 layer_id = reading.unique_id(name)
                 where = {'layer': layer_id}
-                feature(data, at, layer_id, name, visible, parents, reading, bindings or {})
+                geometry, drawn, source, extra, _ = feature(data, at, layer_id, visible, parents, reading, bindings or {})
+                reading.add_layer(layer_id, geometry, drawn, source, title=name, **extra)
             else:
                 raise ValueError(f'unsupported layer CLSID {UUID(bytes_le=kind)}')
         except (ValueError, IndexError) as error:

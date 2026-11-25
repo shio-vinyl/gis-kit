@@ -842,3 +842,54 @@ def test_unknown_arcmap_renderer_keeps_the_layer_and_reports_clsid(tmp_path):
     layer, = doc['layers']
     assert layer['renderer'] is None and layer['data']['path'] == 'shapes.gpkg'
     assert any('unsupported renderer CLSID ' + unknown in note['reason'] for note in doc['notes'])
+
+
+@pytest.mark.parametrize('tight', [False, True])
+def test_graduated_edges_keep_double_precision_and_the_original_field(tmp_path, tight):
+    path = build_check_map(tmp_path)
+    doc = json.loads(path.read_text(encoding='utf-8'))
+    layer = next(layer for layer in doc['layers'] if layer['id'] == 'bands')
+    doc['layers'] = [layer]
+    layer['renderer']['field'] = 'score'
+    layer['filter'] = {'field': 'keep', 'op': '==', 'value': 1}
+    classes = layer['renderer']['classes']
+    for label, item in zip(('first', 'second', 'third'), classes):
+        item['label'] = label
+    scores = [0.5, 1.5, 2.5, 3.0]
+    if tight:
+        scores += [float(np.nextafter(v, toward)) for v in (1.5, 2.5) for toward in (-np.inf, np.inf)]
+    frame = gpd.GeoDataFrame({'score': scores, 'keep': [1] * len(scores)},
+                             geometry=[box(10, .42, 10.001, .421)] * len(scores), crs=4326)
+    frame.to_file(path.parent / 'cells.gpkg', layer='cells')
+    layer['data'] = {'path': 'cells.gpkg', 'layer': 'cells'}
+    path.write_text(json.dumps(doc), encoding='utf-8')
+    packed = tmp_path / 'package'
+    manifest = run(path, packed, '--lyr')
+    row, = manifest['layers']
+    assert row['arcmap_renderer'] == ('one layer per class' if tight else 'class breaks')
+    assert pyogrio.read_dataframe(packed/'check-map.gdb', layer='cells').score.tolist() == scores
+
+    from _style_read import Reading
+    import _arcmap_read
+    lyr = packed/'check-map.lyr'
+    reading = Reading(lyr)
+    _arcmap_read.read(lyr, reading)
+    actual, = reading.layers
+    assert actual['renderer'] == {**layer['renderer'], 'default': None}
+    assert actual['filter'] == layer['filter']
+    assert actual['title'] == layer['title']
+    stream = arcmap.read_layer_file(lyr.read_bytes())
+    if tight:
+        for i, item in enumerate(classes):
+            condition = arcmap.range_query('score', *item['range'], i == len(classes) - 1)
+            assert condition.encode('utf-16le') in stream
+        # An edit to a class query changes its meaning. Keep the edited native layers.
+        expr = 'SIGN(score - 1.5) >= 0'.encode('utf-16le')
+        edited = stream.replace(expr, 'SIGN(score - 1.4) >= 0'.encode('utf-16le'), 1)
+        assert edited != stream
+        lyr.write_bytes(arcmap.write_layer_file(edited))
+        reading = Reading(lyr)
+        _arcmap_read.read(lyr, reading)
+        assert len(reading.layers) == len(classes) and all(r['renderer']['type'] == 'single' for r in reading.layers)
+    else:
+        assert struct.pack('<3d', arcmap.cim.below(1.5), arcmap.cim.below(2.5), 3.0) in stream

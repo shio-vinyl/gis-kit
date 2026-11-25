@@ -25,7 +25,7 @@ map-style 是最小公约数，符号只有 `fill`、`stroke`、`marker` 各一�
 
 ## ArcMap 图层文件
 
-`python package.py read example.lyr --output example-style` 可读取已识别的 ArcMap 要素、分组图层和简单符号。单一符号、单字段唯一值和分级渲染器支持面、线、点；长度由 pt 换到 px，颜色按 ArcMap 的 Apple RGB 还原。定义查询转为结构化过滤或 SQL 表达式。分级的中间上界由闭区间转为 map-style 的开区间，移到下一个可表示的双精度数。单级字段标注带回字号、颜色、字体及可识别的光晕。
+`python package.py read example.lyr --output example-style` 可读取已识别的 ArcMap 要素、分组图层和简单符号。单一符号、单字段唯一值和分级渲染器支持面、线、点；长度由 pt 换到 px，颜色按 ArcMap 的 Apple RGB 还原。定义查询转为结构化过滤或 SQL 表达式。原生分级的中间闭上界按下一个双精度值换成开上界。gis-kit 写出的图例说明若与实际断点相符，直接还原原始开上界。带精确范围查询的分档组在源字段、实际查询和图层属性一致时恢复为一个分级图层，编辑后无法合并的组保留各子图层。单级字段标注带回字号、颜色、字体及可识别的光晕。
 
 分组中的绘制顺序和有效可见性随图层保存，`style-read.json` 的 `groups` 与 `group_members` 保留组路径。map-style 支持的组名直接沿用，展开的组写进 `notes`。无法识别的渲染器保留图层、记录 CLSID。单独的图层文件保留数据源末级名称，转包前应绑定数据。唯一值在文件中是文本，解包时按包内字段类型恢复数值；单独读时缺少类型证据的数字字符串保留原样并记录。
 
