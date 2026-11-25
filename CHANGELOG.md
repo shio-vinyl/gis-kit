@@ -6,6 +6,7 @@
 - 修正 Pro 导入 ArcMap 包时的分级边界，保留原字段、双精度相邻值和中间区间的开上界。
 - 更新 EOX 2016 拼图与 AWS 地形瓦片的署名和来源链接。
 - 为 stats 的 frequency、spatial、cross 和 indicators 的四个子命令增加纯 JSON 输出，缺失统计保留 null。
+- field add-area 和 indicators 的四项指标可用 --geodesic 按源 CRS 的椭球量算面积，结果记录实际面积方法。
 
 ## v0.2.0 — 2026-11-12
 

@@ -30,11 +30,7 @@ except ImportError:  # Support direct module loading by tests.
         sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _safe_io import write_vector_atomic
 
-try:
-    from _metric import analysis_frame, analysis_frames, analysis_method
-except ImportError:  # Support direct module loading in the regression tests.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _metric import analysis_frame, analysis_frames, analysis_method
+from _metric import AreaMeasure, area_frames
 from _budget import check_vector
 from _core import clean
 
@@ -94,19 +90,19 @@ def _write_result(
             print(f"=> {path}", file=log)
 
 
-def _finish_parcels(result, columns, args, analysis_crs, factor, report):
-    method = analysis_method(result.crs, args.analysis_crs, used=analysis_crs)
-    report.update(analysis_crs=str(analysis_crs), analysis_method=method)
+def _finish_parcels(result, columns, args, analysis_crs, measure: AreaMeasure, report):
+    report.update(analysis_crs=str(analysis_crs), analysis_method=measure.method)
     rows = result[columns].to_dict("records")
     if not args.json:
         print(tabulate(rows, headers="keys", tablefmt="simple", floatfmt=".4f"))
-        print(f"analysis_crs={analysis_crs}; method={method}; meters_per_unit={factor:.12g}; assignment={args.assignment}")
+        units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
+        print(f"analysis_crs={analysis_crs}; method={measure.method}{units}; assignment={args.assignment}")
         print("Building assignment report: " + json.dumps(report, ensure_ascii=False, sort_keys=True))
     _write_assignment_report(report, args)
     protected = (args.parcels, args.buildings) + ((args.green,) if getattr(args, "green", None) else ())
     _write_result(result, args.output, overwrite=args.overwrite, protected_paths=protected, log=sys.stderr if args.json else None)
     if args.json:
-        print(json.dumps(clean({"rows": rows, "assignment_report": report, "meters_per_unit": factor}), ensure_ascii=False, allow_nan=False))
+        print(json.dumps(clean({"rows": rows, "assignment_report": report, "meters_per_unit": measure.factor}), ensure_ascii=False, allow_nan=False))
 
 
 def _write_assignment_report(report: dict[str, object], args: argparse.Namespace) -> None:
@@ -147,7 +143,7 @@ def _check_parcels(parcels: gpd.GeoDataFrame, parcel_id: str) -> None:
         raise ValueError("Parcel ID field must be unique and non-null")
 
 
-def _reject_overlapping_parcels(parcels: gpd.GeoDataFrame, factor: float) -> None:
+def _reject_overlapping_parcels(parcels: gpd.GeoDataFrame, measure: AreaMeasure) -> None:
     """Reject positive-area parcel overlap; boundary touches remain valid."""
     index = parcels.sindex
     for i, geom in enumerate(parcels.geometry):
@@ -155,7 +151,7 @@ def _reject_overlapping_parcels(parcels: gpd.GeoDataFrame, factor: float) -> Non
             j = int(j)
             if j <= i:
                 continue
-            overlap_m2 = geom.intersection(parcels.geometry.iloc[j]).area * factor * factor
+            overlap_m2 = measure(geom.intersection(parcels.geometry.iloc[j]))
             if overlap_m2 > 0:
                 raise ValueError(f"Parcels at source rows {i} and {j} overlap by {overlap_m2:.9g} m²")
 
@@ -180,20 +176,21 @@ def _prepare(
     buildings_source: gpd.GeoDataFrame,
     parcel_id: str,
     analysis_crs: str | None,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, float]:
+    geodesic: bool,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, AreaMeasure]:
     _check_parcels(parcels_source, parcel_id)
-    (parcels, buildings), factor = analysis_frames([parcels_source, buildings_source], analysis_crs)
-    parcel_areas = parcels.geometry.area * factor * factor
+    (parcels, buildings), measure = area_frames([parcels_source, buildings_source], analysis_crs, geodesic=geodesic)
+    parcel_areas = measure.areas(parcels.geometry)
     if (parcel_areas <= 0).any():
         raise ValueError("Parcel geometries must have positive area")
-    _reject_overlapping_parcels(parcels, factor)
-    return parcels, buildings, factor
+    _reject_overlapping_parcels(parcels, measure)
+    return parcels, buildings, measure
 
 
 def _allocate_buildings(
     parcels: gpd.GeoDataFrame,
     buildings: gpd.GeoDataFrame,
-    factor: float,
+    measure: AreaMeasure,
     assignment: str,
     floors: list[float] | None = None,
 ) -> tuple[list[float], list[float], dict[str, object]]:
@@ -214,14 +211,14 @@ def _allocate_buildings(
         "unallocated_footprint_area_m2": 0.0,
     }
     for bpos, geom in enumerate(buildings.geometry):
-        source_area = geom.area * factor * factor
+        source_area = measure(geom)
         if not math.isfinite(source_area) or source_area <= 0:
             raise ValueError(f"Building source row {bpos} must have positive finite area")
         report["source_footprint_area_m2"] += source_area
         intersections: list[tuple[int, float]] = []
         for raw_pos in parcel_index.query(geom, predicate="intersects"):
             ppos = int(raw_pos)
-            overlap = geom.intersection(parcels.geometry.iloc[ppos]).area * factor * factor
+            overlap = measure(geom.intersection(parcels.geometry.iloc[ppos]))
             if overlap > 0:
                 intersections.append((ppos, overlap))
         if not intersections:
@@ -234,24 +231,37 @@ def _allocate_buildings(
             ppos, _ = max(intersections, key=lambda item: (item[1], -item[0]))
             allocation = [(ppos, source_area)]
         else:
+            allocated = sum(area for _, area in intersections)
             allocation = intersections
-            allocated = sum(area for _, area in allocation)
-            if allocated < source_area - 1e-7:
+            remainder = source_area - allocated
+            if measure.factor is None:
+                # A cut introduces vertices on a geodesic edge. Use piece areas as
+                # weights (including the uncovered piece) to conserve the original footprint.
+                covered = unary_union([parcels.geometry.iloc[i] for i, _ in intersections])
+                uncovered = measure(geom.difference(covered))
+                scale = source_area / (allocated + uncovered)
+                allocation = [(i, area * scale) for i, area in intersections]
+                remainder = uncovered * scale
+            if remainder > 1e-7:
                 report["partially_unallocated_buildings"] += 1
-                report["unallocated_footprint_area_m2"] += source_area - allocated
+                report["unallocated_footprint_area_m2"] += remainder
         for ppos, area_m2 in allocation:
             building_area[ppos] += area_m2
             if floors is not None:
                 floor_area[ppos] += area_m2 * floors[bpos]
-    if sum(building_area) > buildings.geometry.area.sum() * factor * factor + 1e-7 and assignment == "area":
+    source_total = report["source_footprint_area_m2"]
+    if assignment == "area" and sum(building_area) > source_total + max(1e-7, source_total * 1e-12):
         raise ValueError("Allocated building area exceeds source building area; parcel overlap may be present")
     report["allocated_footprint_area_m2"] = sum(building_area)
     return building_area, floor_area, report
 
 
-def _base_result(source_parcels: gpd.GeoDataFrame, analysis_parcels: gpd.GeoDataFrame, factor: float) -> gpd.GeoDataFrame:
+def _base_result(source_parcels: gpd.GeoDataFrame, analysis_parcels: gpd.GeoDataFrame, measure: AreaMeasure) -> gpd.GeoDataFrame:
     result = source_parcels.copy()
-    result["parcel_area_m2"] = analysis_parcels.geometry.area.to_numpy() * factor * factor
+    result["parcel_area_m2"] = measure.areas(analysis_parcels.geometry).to_numpy()
+    if "area_method" in result:
+        raise ValueError("Area method field collision: area_method")
+    result["area_method"] = measure.method
     return result
 
 
@@ -259,83 +269,87 @@ def cmd_far(args: argparse.Namespace) -> None:
     parcels_source, buildings_source = _read(args.parcels, args.parcels_layer), _read(args.buildings, args.buildings_layer)
     _check_parcels(parcels_source, args.parcel_id)
     floors = _floor_counts(buildings_source, args.floors_field)
-    parcels, buildings, factor = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs)
-    _, floor_area, assignment_report = _allocate_buildings(parcels, buildings, factor, args.assignment, floors)
-    result = _base_result(parcels_source, parcels, factor)
+    parcels, buildings, measure = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs, args.geodesic)
+    _, floor_area, assignment_report = _allocate_buildings(parcels, buildings, measure, args.assignment, floors)
+    result = _base_result(parcels_source, parcels, measure)
     result["total_floor_area_m2"] = floor_area
     result["FAR"] = result["total_floor_area_m2"] / result["parcel_area_m2"]
-    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "total_floor_area_m2", "FAR"], args, parcels.crs, factor, assignment_report)
+    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "total_floor_area_m2", "FAR"], args, parcels.crs, measure, assignment_report)
 
 
 def cmd_density(args: argparse.Namespace) -> None:
     parcels_source, buildings_source = _read(args.parcels, args.parcels_layer), _read(args.buildings, args.buildings_layer)
-    parcels, buildings, factor = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs)
-    building_area, _, assignment_report = _allocate_buildings(parcels, buildings, factor, args.assignment)
-    result = _base_result(parcels_source, parcels, factor)
+    parcels, buildings, measure = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs, args.geodesic)
+    building_area, _, assignment_report = _allocate_buildings(parcels, buildings, measure, args.assignment)
+    result = _base_result(parcels_source, parcels, measure)
     result["building_area_m2"] = building_area
     result["density"] = result["building_area_m2"] / result["parcel_area_m2"]
-    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "building_area_m2", "density"], args, parcels.crs, factor, assignment_report)
+    _finish_parcels(result, [args.parcel_id, "parcel_area_m2", "building_area_m2", "density"], args, parcels.crs, measure, assignment_report)
 
 
 def _green_by_parcel(
-    parcels: gpd.GeoDataFrame, greens: gpd.GeoDataFrame, factor: float
+    parcels: gpd.GeoDataFrame, greens: gpd.GeoDataFrame, measure: AreaMeasure
 ) -> list[float]:
     index = greens.sindex
     values: list[float] = []
     for parcel in parcels.geometry:
         clipped = [parcel.intersection(greens.geometry.iloc[int(i)]) for i in index.query(parcel, predicate="intersects")]
         clipped = [geom for geom in clipped if not geom.is_empty and geom.area > 0]
-        values.append(unary_union(clipped).area * factor * factor if clipped else 0.0)
+        values.append(measure(unary_union(clipped)) if clipped else 0.0)
     return values
 
 
 def cmd_coverage(args: argparse.Namespace) -> None:
     boundary_source, target_source = _read(args.boundary, args.boundary_layer), _read(args.target, args.target_layer)
-    (boundary, targets), factor = analysis_frames([boundary_source, target_source], args.analysis_crs)
-    study_area_m2 = unary_union(boundary.geometry.tolist()).area * factor * factor
+    (boundary, targets), measure = area_frames([boundary_source, target_source], args.analysis_crs, geodesic=args.geodesic)
+    study = unary_union(boundary.geometry.tolist())
+    study_area_m2 = measure(study)
     if not math.isfinite(study_area_m2) or study_area_m2 <= 0:
         raise ValueError("Boundary must have positive finite area")
-    clipped = [geom.intersection(unary_union(boundary.geometry.tolist())) for geom in targets.geometry]
-    green_area_m2 = unary_union([g for g in clipped if not g.is_empty]).area * factor * factor
+    clipped = [geom.intersection(study) for geom in targets.geometry]
+    green_area_m2 = measure(unary_union([g for g in clipped if not g.is_empty]))
     ratio = green_area_m2 / study_area_m2
     metrics = {"green_area_m2": green_area_m2, "study_area_m2": study_area_m2, "coverage_ratio": ratio}
-    method = analysis_method(boundary_source.crs, args.analysis_crs, used=boundary.crs)
     if not args.json:
         print(tabulate(metrics.items(), headers=["metric", "value"], tablefmt="simple", floatfmt=".6f"))
-        print(f"analysis_crs={boundary.crs}; projection_method={method}; measurement_method=union area; meters_per_unit={factor:.12g}")
+        units = f"; meters_per_unit={measure.factor:.12g}" if measure.factor is not None else ""
+        print(f"analysis_crs={boundary.crs}; projection_method={measure.method}; measurement_method=union area{units}")
     if args.output:
         output = boundary_source.copy()
+        if "area_method" in output:
+            raise ValueError("Area method field collision: area_method")
+        output["area_method"] = measure.method
         output["green_area_m2"] = green_area_m2
         output["study_area_m2"] = study_area_m2
         output["coverage_ratio"] = ratio
         _write_result(output, args.output, overwrite=args.overwrite, protected_paths=(args.boundary, args.target), log=sys.stderr if args.json else None)
     if args.json:
-        print(json.dumps({**metrics, "analysis_crs": str(boundary.crs), "analysis_method": method,
-                          "measurement_method": "union area", "meters_per_unit": factor}, allow_nan=False))
+        print(json.dumps({**metrics, "analysis_crs": str(boundary.crs), "analysis_method": measure.method,
+                          "measurement_method": "union area", "meters_per_unit": measure.factor}, allow_nan=False))
 
 
 def cmd_summary(args: argparse.Namespace) -> None:
     parcels_source, buildings_source = _read(args.parcels, args.parcels_layer), _read(args.buildings, args.buildings_layer)
     _check_parcels(parcels_source, args.parcel_id)
     floors = _floor_counts(buildings_source, args.floors_field)
-    parcels, buildings, factor = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs)
-    building_area, floor_area, assignment_report = _allocate_buildings(parcels, buildings, factor, args.assignment, floors)
-    result = _base_result(parcels_source, parcels, factor)
+    parcels, buildings, measure = _prepare(parcels_source, buildings_source, args.parcel_id, args.analysis_crs, args.geodesic)
+    building_area, floor_area, assignment_report = _allocate_buildings(parcels, buildings, measure, args.assignment, floors)
+    result = _base_result(parcels_source, parcels, measure)
     result["building_area_m2"] = building_area
     result["total_floor_area_m2"] = floor_area
     result["FAR"] = result["total_floor_area_m2"] / result["parcel_area_m2"]
     result["density"] = result["building_area_m2"] / result["parcel_area_m2"]
     if args.green:
         green_source = _read(args.green, args.green_layer)
-        (parcels_for_green, greens), green_factor = analysis_frames([parcels_source, green_source], args.analysis_crs)
-        if not math.isclose(factor, green_factor, rel_tol=1e-12) or parcels_for_green.crs != parcels.crs:
+        (parcels_for_green, greens), _ = area_frames([parcels_source, green_source], args.analysis_crs, geodesic=args.geodesic)
+        if parcels_for_green.crs != parcels.crs:
             raise ValueError("Green and parcel analysis CRS differ; specify a suitable --analysis-crs")
-        result["green_area_m2"] = _green_by_parcel(parcels, greens, factor)
+        result["green_area_m2"] = _green_by_parcel(parcels, greens, measure)
         result["green_ratio"] = result["green_area_m2"] / result["parcel_area_m2"]
     columns = [args.parcel_id, "parcel_area_m2", "building_area_m2", "total_floor_area_m2", "FAR", "density"]
     if args.green:
         columns.append("green_ratio")
-    _finish_parcels(result, columns, args, parcels.crs, factor, assignment_report)
+    _finish_parcels(result, columns, args, parcels.crs, measure, assignment_report)
 
 
 def _add_parcel_options(parser: argparse.ArgumentParser, include_floors: bool = False) -> None:
@@ -345,7 +359,9 @@ def _add_parcel_options(parser: argparse.ArgumentParser, include_floors: bool = 
     parser.add_argument("--parcel-id", required=True)
     parser.add_argument("--buildings", required=True)
     parser.add_argument("--buildings-layer")
-    parser.add_argument("--analysis-crs", help="Explicit projected CRS; wide-area geographic work requires this")
+    area_mode = parser.add_mutually_exclusive_group()
+    area_mode.add_argument("--analysis-crs", help="Explicit projected CRS for measurement")
+    area_mode.add_argument("--geodesic", action="store_true", help="Measure areas on the source ellipsoid")
     parser.add_argument("--assignment", choices=["area", "unique"], default="area", help="Area-proportional or whole-building parcel assignment")
     parser.add_argument("--output")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output where supported")
@@ -371,7 +387,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-layer")
     p.add_argument("--boundary", required=True)
     p.add_argument("--boundary-layer")
-    p.add_argument("--analysis-crs", help="Explicit projected CRS for measurement")
+    area_mode = p.add_mutually_exclusive_group()
+    area_mode.add_argument("--analysis-crs", help="Explicit projected CRS for measurement")
+    area_mode.add_argument("--geodesic", action="store_true", help="Measure areas on the source ellipsoid")
     p.add_argument("--output")
     p.add_argument("--overwrite", action="store_true", help="Replace an existing output where supported")
     return parser
