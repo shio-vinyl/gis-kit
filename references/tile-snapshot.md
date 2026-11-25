@@ -18,3 +18,5 @@ python snapshot.py --params snapshot.json --output /absolute/project/inputs/site
 - **不在范围**：矢量瓦片（PMTiles 裁切）与 WMS/WCS 尚未支持；大体量矢量切片见 Composer #4。
 
 Composer 侧以 `{"type":"tile-snapshot","path":"../inputs/site-imagery/snapshot.json"}` 引用，读取前逐个核对瓦片哈希。
+
+EOX 的 2016 版拼图使用 2016、2017 两年的影像，显示时保留完整署名。AWS 地形瓦片由多个来源拼成，发布地图时按覆盖范围核对清单条款链接里的区域署名。服务端模板可用不同的行列顺序，本地瓦片始终按 XYZ 路径读取。
