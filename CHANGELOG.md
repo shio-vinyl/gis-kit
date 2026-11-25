@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 支持将 ArcMap .lyr 读成 map-style，并从 .lpk 最新版本图层恢复样式和包内数据连接。
+
 ## v0.2.0 — 2026-11-12
 
 本版汇总 v0.1.0 之后的 CAD 规划图纸处理、平台样式与图层包转换、Composer 文件交接，以及数据安全和跨平台修复。

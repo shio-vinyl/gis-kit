@@ -776,3 +776,69 @@ def check_pro_report(report):
         assert plain['single']['colours'][-1] == [0x12, 0x34, 0x56]
         classes = {c['label']: c['colours'] for c in plain['文字分类']['classes']}
         assert classes['甲'][-1] == [0xED, 0x7D, 0x31] and classes['乙类'][-1] == [0x4F, 0x81, 0xBD]
+
+
+def test_read_and_unpack_arcmap_styles(tmp_path):
+    style = build_check_map(tmp_path)
+    document = json.loads(style.read_text(encoding='utf-8'))
+    by_id = {layer['id']: layer for layer in document['layers']}
+    by_id['single']['group'] = 'fills'
+    style.write_text(json.dumps(document), encoding='utf-8')
+    packed = tmp_path / 'packed'
+    run(style, packed, '--lyr')
+    for command, source in [('read', packed/'check-map.lyr'), ('unpack', packed/'check-map.lpk')]:
+        dest = tmp_path / command
+        subprocess.run([sys.executable, str(SCRIPTS/'package.py'), command, str(source), '--output', str(dest)],
+                       check=True, capture_output=True)
+        if command == 'read':
+            report_file = dest/'style-read.json'
+        else:
+            manifest = json.loads((dest/'package.json').read_text(encoding='utf-8'))
+            row, = manifest['layers']
+            assert row['file'].startswith('v107/') and row['data_in_package']
+            report_file = dest/row['style_read']
+        report = json.loads(report_file.read_text(encoding='utf-8'))
+        actual = json.loads((dest/report['map_style']['file']).read_text(encoding='utf-8'))
+        layers = {layer['title']: layer for layer in actual['layers']}
+        for name in ('single', 'lines', 'points', 'circle', 'half', 'off'):
+            original, back = by_id[name], layers[name]
+            assert back['geometry'] == original['geometry']
+            assert back['renderer'] == original['renderer']
+            assert back.get('opacity', 1) == original.get('opacity', 1)
+            assert back.get('visible', True) == original.get('visible', True)
+            assert back.get('filter') == original.get('filter')
+        assert layers['single']['group'] == 'fills'
+        assert 'fills' in report['group_members'][layers['single']['id']]
+        assert layers['circle']['labels']['field'] == by_id['circle']['labels']['field']
+        text = layers['circle']['labels']['text']
+        assert {k: text[k] for k in ('color', 'size', 'halo')} == by_id['circle']['labels']['text']
+        classified = layers['文字分类']['renderer']
+        assert classified['field'] == '类别' and classified['type'] == 'categorized'
+        assert [c['value'] for c in classified['classes']] == ['甲', '乙', '丁']
+        assert classified['classes'][1] == by_id['text']['renderer']['classes'][1]
+        assert classified['classes'][0]['symbol'] == by_id['text']['renderer']['classes'][0]['symbol']
+        assert classified['default'] == by_id['text']['renderer']['default']
+        graduated = layers['分级']['renderer']
+        assert graduated['field'] == '容积率' and graduated['type'] == 'graduated'
+        assert [{k: c[k] for k in ('range', 'symbol')} for c in graduated['classes']] == by_id['bands']['renderer']['classes']
+        assert [c['label'] for c in graduated['classes']] == ['0 - 1.5', '1.5 - 2.5', '2.5 - 3']
+        assert layers['lines']['data']['layer'] == 'lines'
+        if command == 'unpack':
+            assert (dest/layers['lines']['data']['path']).is_dir()
+            assert [c['value'] for c in layers['number']['renderer']['classes']] == [1.5, 4]
+            subprocess.run([sys.executable, str(SCRIPTS/'package.py'), 'pack', str(dest/row['map_style']),
+                            '--output', str(tmp_path/'qgis'), '--full'], check=True, capture_output=True)
+
+
+def test_unknown_arcmap_renderer_keeps_the_layer_and_reports_clsid(tmp_path):
+    unknown = 'fee1dead-0001-4000-8011-012345678901'
+    stream = arcmap.skeleton('polygon').replace(arcmap.SIMPLE_RENDERER, arcmap.guid_bytes(unknown))
+    path = tmp_path/'unknown.lyr'
+    path.write_bytes(arcmap.write_layer_file(stream))
+    dest = tmp_path/'read'
+    subprocess.run([sys.executable, str(SCRIPTS/'package.py'), 'read', str(path), '--output', str(dest),
+                    '--data', 'shapes.gpkg'], check=True, capture_output=True)
+    doc = json.loads((dest/'unknown.map-style.json').read_text(encoding='utf-8'))
+    layer, = doc['layers']
+    assert layer['renderer'] is None and layer['data']['path'] == 'shapes.gpkg'
+    assert any('unsupported renderer CLSID ' + unknown in note['reason'] for note in doc['notes'])

@@ -56,12 +56,13 @@ ANNOTATION_SET = guid_bytes('1d5849f3-0d33-11d2-a26f-080009b6f22b')
 LABEL_ENGINE = guid_bytes('01004145-0d1c-11d2-a26f-080009b6f22b')
 TEXT_SYMBOL = guid_bytes('b65a3e74-2993-11d1-9a43-0080c7ec5c96')
 STD_FONT = guid_bytes('0be35203-8f91-11ce-9de3-00aa004bb851')
+FEATURE_CLASS_NAME = guid_bytes('75e10086-4226-42ac-afec-cbb9b748f847')
+WORKSPACE_NAME = guid_bytes('5a350011-e371-11d1-aa82-00c04fa33a15')
+PROPERTY_SET = guid_bytes('588e5a11-d09b-11d1-aa7c-00c04fa33a15')
 # Every class that is persisted with an id; the renumbering walks these
 OBJECT_CLASSES = [FEATURE_LAYER, GROUP_LAYER, SIMPLE_RENDERER, UNIQUE_RENDERER, BREAKS_RENDERER, LEGEND_GROUP, LEGEND_CLASS, FILL_SYMBOL, LINE_SYMBOL,
-                  MARKER_SYMBOL, RGB_COLOR, FIELD_INFO, LAYER_EXTENSION, TRANSPARENCY, ENVELOPE, ANNOTATION_SET, LABEL_ENGINE, TEXT_SYMBOL, STD_FONT] + [guid_bytes(g) for g in (
-    '75e10086-4226-42ac-afec-cbb9b748f847',  # FeatureClassName
-    '5a350011-e371-11d1-aa82-00c04fa33a15',  # WorkspaceName
-    '588e5a11-d09b-11d1-aa7c-00c04fa33a15',  # PropertySet
+                  MARKER_SYMBOL, RGB_COLOR, FIELD_INFO, LAYER_EXTENSION, TRANSPARENCY, ENVELOPE, ANNOTATION_SET, LABEL_ENGINE, TEXT_SYMBOL, STD_FONT,
+                  FEATURE_CLASS_NAME, WORKSPACE_NAME, PROPERTY_SET] + [guid_bytes(g) for g in (
     '7e4f4719-8e54-11d2-aad8-000000000000',  # NumericFormat of a field
     'a6a87a80-1dd1-11b2-bf51-08002022f573',  # GeographicCoordinateSystem
     '78ff7fa1-fb2f-11d1-94a2-080009eebecb',  # the layer's tail object

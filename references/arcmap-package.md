@@ -101,6 +101,8 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 - **标注**：字段表后的空对象换成标注集合；表达式字符串后面的开关表示是否简单表达式；文字符号里颜色、字号（双精度）、掩膜（样式、大小、填充符号，即晕边）；字体是 OLE StdFont：字符集、标志、字重、以万分之一磅计的字号、ANSI 编码的字体名。字符集写西文时中文标注画成方框，所以含中文的标注写 GB2312（实测）。
 - **组图层**：名称、显示开关、子图层数，每个子图层前有 u64 字节数；子图层可以还是组图层。编号贯穿全部子图层。子图层在列表里靠前的画在上面。
 
+读回独立图层使用 `package.py read`。从包读回时，`package.py unpack` 在结果目录写出最新版本图层的 map-style 与转换报告，详见[平台样式读取](style-read.md)。
+
 ## 骨架
 
 `templates/arcmap/*.lyr` 是 ArcObjects 写的真图层文件，数据全部虚构，参数位置换成了 `@name`、`@workspace` 这样的占位字符串，机器路径和 Windows 语言（要素类类型名、“默认”标注类名）都去掉了；它们仍是能打开的图层文件。`_arcmap_style.py` 只裁切、改写、拼接这些字节，不从零序列化任何类。
@@ -119,6 +121,8 @@ python package.py pack maps/example.map-style.json --output /work/send/example-a
 - 真机检查（可选，虚构数据）：设 `GIS_KIT_ARCMAP_PYTHON`（ArcMap 的 Python）、`GIS_KIT_ARCGIS_PYTHON`（Pro 的 Python）后 pytest 会跑 `tests/arcmap_open_check.py`、`tests/arcmap_open_check_pro.py`：读回 `isBroken`、渲染器类型、类和分界值、定义查询、透明度、标注，把图层加进数据框渲染 PNG，按点取色、量线宽和标记大小。
 
 在 ArcMap 10.8、ArcGIS Pro 3.4.3 上实测：图层文件和 `.lpk` 解出的三个版本文件夹全部不断链；唯一值、分级被识别为 `UNIQUE_VALUES`、`GRADUATED_COLORS`，类、标签、分界值读回一致；取色逐字节一致（含分界值、NULL、未列出值、数值分类）；6 px 线宽、30 px 标记、4 px 轮廓都量到；图层上下顺序、隐藏、定义查询、中文名称和中文包名都对；300 类、30 档能打开。Pro 读出的渲染器类型和颜色也一致。
+
+在 Pro 3.4.3 中打开 ArcMap 包时，CIM 读回的分级上界和颜色可能与导出的像素表现不同。测试图的 1.5、2.5 两个边界值在 Pro 导出时落入前一档，最高档的 `#A63603` 导出为 `#A63600`。ArcMap 10.8 导出与 map-style 的区间和目标颜色一致。
 
 ## 没有实测的
 
