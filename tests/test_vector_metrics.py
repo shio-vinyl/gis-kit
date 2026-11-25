@@ -16,6 +16,7 @@ from shapely.geometry import Point, Polygon, box
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
 
 
 def _load(name: str, path: Path):
@@ -252,3 +253,49 @@ def test_stats_cross_rejects_output_name_conflicts(tmp_path: Path) -> None:
     result = _run("stats.py", "cross", "--input", str(zones), "--target", str(targets), "--zone-field", "count")
     assert result.returncode != 0
     assert "conflicts" in result.stderr
+
+
+def _json_result(script, *args):
+    import json
+    result = _run(script, *args, "--json")
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_stats_json_frequency_spatial_and_cross(tmp_path):
+    points = _write(tmp_path / "points.gpkg", gpd.GeoDataFrame(
+        {"count": ["one", "one"], "weight": [2.5, 1.0]}, geometry=[Point(5, 5), Point(8, 5)], crs="EPSG:32631"))
+    zones = _write(tmp_path / "zones.gpkg", gpd.GeoDataFrame(
+        {"key": ["a", "b"]}, geometry=[box(0, 0, 10, 10), box(10, 0, 20, 10)], crs="EPSG:32631"))
+    assert _json_result("stats.py", "frequency", points, "--field", "count") == [{"value": "one", "count": 2, "pct": 100}]
+    spatial = _json_result("stats.py", "spatial", points, "--analysis-crs", "EPSG:32631")
+    assert spatial["feature_count"] == 2 and spatial["mean_nearest_neighbor_m"] == 3
+    assert spatial["study_area_m2"] == 0 and spatial["density_per_km2"] is None and spatial["nearest_neighbor_index"] is None
+    cross = _json_result("stats.py", "cross", "--input", zones, "--target", points, "--zone-field", "key", "--sum-field", "weight")
+    assert cross["rows"] == [{"key": "a", "count": 2, "sum_weight": 3.5}, {"key": "b", "count": 0, "sum_weight": None}]
+    assert cross["report"]["matched_target_features"] == 2
+
+
+@pytest.mark.parametrize("command", ["far", "density", "summary", "coverage"])
+def test_indicator_json_with_file_output(tmp_path, command):
+    parcels = _write(tmp_path / "parcels.gpkg", gpd.GeoDataFrame(
+        {"pid": ["p"]}, geometry=[box(500000, 0, 500010, 10)], crs="EPSG:32631"))
+    buildings = _write(tmp_path / "buildings.gpkg", gpd.GeoDataFrame(
+        {"floors": [2]}, geometry=[box(500000, 0, 500005, 5)], crs="EPSG:32631"))
+    output = tmp_path / "result.csv"
+    if command == "coverage":
+        result = _json_result("indicators.py", command, "--boundary", parcels, "--target", buildings, "--output", output)
+        assert result["study_area_m2"] == 100 and result["coverage_ratio"] == 0.25
+    else:
+        args = ["--parcels", parcels, "--parcel-id", "pid", "--buildings", buildings, "--output", output]
+        if command in {"far", "summary"}:
+            args += ["--floors-field", "floors"]
+        result = _json_result("indicators.py", command, *args)
+        row, = result["rows"]
+        assert row["pid"] == "p" and row["parcel_area_m2"] == 100
+        if command in {"far", "summary"}:
+            assert row["FAR"] == 0.5
+        if command in {"density", "summary"}:
+            assert row["density"] == 0.25
+        assert result["assignment_report"]["allocated_footprint_area_m2"] == 25
+    assert output.is_file()
