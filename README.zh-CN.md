@@ -46,7 +46,7 @@ python scripts/gis.py describe parcels.gpkg --json # 只读文件头元数据，
 
 ### 2. 平台包与样式互转
 
-- **拆包与读取样式**（`package.py`）：`unpack` 先检查归档路径与解压体积，再安全解开 ArcGIS 图层包和地图包（`.lpk`、`.lpkx`、`.mpk`、`.mpkx`），清点数据集并对应图层定义（[ArcGIS 包清点](references/esri-package.md)）；`read` 读取 QGIS `.qml`、ArcGIS Pro `.lyrx` 与 `.stylx` 符号库，转成平台无关的 `map-style` 文档，逐项记下近似或无法转换的符号（[读取平台样式](references/style-read.md)）。
+- **拆包与读取样式**（`package.py`）：`unpack` 先检查归档路径与解压体积，再安全解开 ArcGIS 图层包和地图包（`.lpk`、`.lpkx`、`.mpk`、`.mpkx`），清点数据集并对应图层定义（[ArcGIS 包清点](references/esri-package.md)）；`read` 读取 ArcMap `.lyr`、QGIS `.qml`、ArcGIS Pro `.lyrx` 与 `.stylx` 符号库，转成平台无关的 `map-style` 文档，逐项记下近似或无法转换的符号（[读取平台样式](references/style-read.md)）。
 - **按图打包**（`package.py pack`）：把一张图的 `map-style` 连同按图幅选取、裁切或整份保留的数据打成目标平台的包：内嵌图层顺序、QML 样式与预设标注点的 QGIS GeoPackage（[QGIS 打包](references/qgis-package.md)）；含文件地理数据库与 CIM 图层文件的 ArcGIS Pro 图层包 `.lpkx`（[ArcGIS Pro 打包](references/arcgis-pro-package.md)）；或由 ArcObjects 骨架拼装二进制 `.lyr` 的 ArcMap 图层包 `.lpk`（[ArcMap 打包](references/arcmap-package.md)）。
 
 ### 3. 栅格、DEM 地形与路网覆盖

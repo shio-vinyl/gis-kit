@@ -1,4 +1,4 @@
-# 读取平台样式（QGIS、ArcGIS Pro → map-style）
+# 读取平台样式（ArcMap、QGIS、ArcGIS Pro → map-style）
 
 `package.py read` 读一个平台样式文件，转成 [`map-style`](https://github.com/shio-vinyl/gis-plugin/blob/main/contracts/README.md#map-style) v1，让已有的样式可以用到自己的图上（gis-composer、QGIS、ArcGIS Pro）。这是 [`pack`](qgis-package.md) 的反方向。
 
@@ -22,6 +22,12 @@ map-style 是最小公约数，符号只有 `fill`、`stroke`、`marker` 各一�
 | `record.json` | 运行记录，源文件和产物的哈希 |
 
 `symbols` 的档位按损失最重的算：`exact` 原样，`svg` 合成一张图但没有损失，`split` 拆成多个图层，`approximated` 有近似，`lost` 有丢失。
+
+## ArcMap 图层文件
+
+`python package.py read example.lyr --output example-style` 可读取已识别的 ArcMap 要素、分组图层和简单符号。单一符号、单字段唯一值和分级渲染器支持面、线、点；长度由 pt 换到 px，颜色按 ArcMap 的 Apple RGB 还原。定义查询转为结构化过滤或 SQL 表达式。原生分级的中间闭上界按下一个双精度值换成开上界。gis-kit 写出的图例说明若与实际断点相符，直接还原原始开上界。带精确范围查询的分档组在源字段、实际查询和图层属性一致时恢复为一个分级图层，编辑后无法合并的组保留各子图层。单级字段标注带回字号、颜色、字体及可识别的光晕。
+
+分组中的绘制顺序和有效可见性随图层保存，`style-read.json` 的 `groups` 与 `group_members` 保留组路径。map-style 支持的组名直接沿用，展开的组写进 `notes`。无法识别的渲染器保留图层、记录 CLSID。单独的图层文件保留数据源末级名称，转包前应绑定数据。唯一值在文件中是文本，解包时按包内字段类型恢复数值；单独读时缺少类型证据的数字字符串保留原样并记录。
 
 ## 数据
 
@@ -91,7 +97,7 @@ map-style 是最小公约数，符号只有 `fill`、`stroke`、`marker` 各一�
 - `scripts/_qgis_read.py`、`scripts/_arcgis_read.py`：每个平台一个读取器。
 - `package.py` 只有注册和调用两行。
 
-加一个平台（ArcMap 的 `.lyr`、`.style`）只需要：
+加一个平台格式（如 ArcMap 的 `.style`）只需要：
 
 1. 新建 `_arcmap_read.py`，提供 `read(path, reading)`，在 `_style_read.READERS` 里加后缀。
 2. 把一个符号转成**部件**，自下而上：`{kind: fill, color, opacity}`、`{kind: pattern, pattern}`、`{kind: stroke, stroke}`、`{kind: marker, marker, fill, stroke, ops, place}`。`marker` 为 `None` 时按 `ops` 画成 SVG。用 `reading.symbol(geometry, where, convert)` 换回“几次绘制”，这一步同时统计损失。
