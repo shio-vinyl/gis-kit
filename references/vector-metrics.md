@@ -85,3 +85,9 @@ python3 gis-kit/scripts/stats.py spatial points.gpkg --study-area study_area.gpk
 python3 gis-kit/scripts/stats.py cross --input zones.gpkg --target points.gpkg \
   --zone-field zone_id --sum-field amount --predicate intersects --analysis-crs EPSG:32618
 ```
+
+## 统计与指标的 JSON 输出
+
+`stats.py frequency --json` 输出频数行（`value`、`count`、`pct`）。`spatial --json` 输出数值、分析 CRS、研究面积口径与描述性最近邻指标。零面积分母下密度为 `null`。`cross --json` 的 `rows` 按分区列值，`report` 记录匹配关系。无可加总观测值时合计为 `null`。
+
+`indicators.py far/density/summary --json` 输出地块指标行和 `assignment_report`，`coverage --json` 输出覆盖面积、研究面积和比率。可与原有文件输出同时使用，stdout 可直接作为 JSON 解析。

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 为 stats 的 frequency、spatial、cross 和 indicators 的四个子命令增加纯 JSON 输出，缺失统计保留 null。
+
 ## v0.2.0 — 2026-11-12
 
 本版汇总 v0.1.0 之后的 CAD 规划图纸处理、平台样式与图层包转换、Composer 文件交接，以及数据安全和跨平台修复。

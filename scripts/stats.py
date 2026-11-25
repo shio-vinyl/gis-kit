@@ -37,6 +37,7 @@ except ImportError:  # Support direct module loading by tests.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from _metric import analysis_frame, analysis_frames, analysis_method
 from _budget import check_vector
+from _core import clean
 
 
 def _setup_chinese_font():
@@ -98,9 +99,12 @@ def cmd_frequency(args):
     gdf = _read(args.input, args.layer)
     if args.field not in gdf.columns:
         sys.exit(f"field not found: {args.field}")
-    counts = gdf[args.field].value_counts().reset_index()
-    counts.columns = [args.field, "count"]
+    counts = gdf[args.field].value_counts().rename_axis("value").reset_index(name="count")
     counts["pct"] = (counts["count"] / counts["count"].sum() * 100).round(2)
+    if args.json:
+        print(counts.to_json(orient="records", force_ascii=False, double_precision=15, date_format="iso"))
+        return
+    counts.columns = [args.field, "count", "pct"]
     print(tabulate(counts, headers="keys", tablefmt="simple", showindex=False))
 
 
@@ -136,6 +140,31 @@ def cmd_spatial(args):
     bounds_area_m2 = width * height * meters_per_unit**2
     n = len(gdf)
 
+    density = n / study_area_m2 * 1_000_000 if study_area_m2 > 0 else None
+    method = analysis_method(source.crs, args.analysis_crs, used=gdf.crs)
+    mean_nn_m = expected_nn_m = nni = None
+    if n > 1:
+        from scipy.spatial import cKDTree
+        centroids = gdf.geometry.centroid
+        coords = np.column_stack([centroids.x, centroids.y])
+        tree = cKDTree(coords)
+        dists, _ = tree.query(coords, k=2)
+        nn_dists_m = dists[:, 1] * meters_per_unit
+        mean_nn_m = float(nn_dists_m.mean())
+        if study_area_m2 > 0:
+            expected_nn_m = 0.5 / np.sqrt(n / study_area_m2)
+            nni = mean_nn_m / expected_nn_m
+
+    if args.json:
+        print(json.dumps(clean({
+            "feature_count": n, "bounds": bounds.tolist(), "analysis_crs": str(gdf.crs), "analysis_method": method,
+            "width_m": width * meters_per_unit, "height_m": height * meters_per_unit,
+            "bounding_area_m2": bounds_area_m2, "study_area_m2": study_area_m2, "study_area_method": area_method,
+            "density_per_km2": density, "mean_nearest_neighbor_m": mean_nn_m,
+            "csr_reference_distance_m": expected_nn_m, "nearest_neighbor_index": nni,
+        }), ensure_ascii=False, allow_nan=False))
+        return
+
     rows = [
         ("feature count", n),
         ("extent xmin (analysis CRS units)", f"{xmin:.6f}"),
@@ -147,25 +176,16 @@ def cmd_spatial(args):
         ("bounding area m2", f"{bounds_area_m2:.6f}"),
         ("study area m2", f"{study_area_m2:.6f}" if study_area_m2 > 0 else "N/A: zero-area bbox"),
         ("study area method", area_method),
-        ("feature density per km2", f"{n / study_area_m2 * 1_000_000:.6f}" if study_area_m2 > 0 else "N/A: zero-area denominator"),
+        ("feature density per km2", f"{density:.6f}" if density is not None else "N/A: zero-area denominator"),
         ("analysis CRS", str(gdf.crs)),
-        ("analysis CRS method", analysis_method(source.crs, args.analysis_crs, used=gdf.crs)),
+        ("analysis CRS method", method),
     ]
 
     if n > 1:
-        from scipy.spatial import cKDTree
-        centroids = gdf.geometry.centroid
-        coords = np.column_stack([centroids.x, centroids.y])
-        tree = cKDTree(coords)
-        dists, _ = tree.query(coords, k=2)
-        nn_dists_m = dists[:, 1] * meters_per_unit
-        mean_nn_m = float(nn_dists_m.mean())
-        expected_nn_m = 0.5 / np.sqrt(n / study_area_m2) if study_area_m2 > 0 else float("nan")
-        nni = mean_nn_m / expected_nn_m if math.isfinite(expected_nn_m) else float("nan")
         rows += [
             ("mean nearest neighbor distance m", f"{mean_nn_m:.6f}"),
-            ("CSR reference distance m (descriptive)", f"{expected_nn_m:.6f}" if math.isfinite(expected_nn_m) else "N/A: zero-area denominator"),
-            ("nearest neighbor index (descriptive; no significance test)", f"{nni:.4f}" if math.isfinite(nni) else "N/A: zero-area denominator"),
+            ("CSR reference distance m (descriptive)", f"{expected_nn_m:.6f}" if expected_nn_m is not None else "N/A: zero-area denominator"),
+            ("nearest neighbor index (descriptive; no significance test)", f"{nni:.4f}" if nni is not None else "N/A: zero-area denominator"),
         ]
     else:
         rows.append(("nearest neighbor statistics", "N/A: fewer than two features"))
@@ -226,6 +246,9 @@ def cmd_cross(args):
         "meters_per_unit": factor,
         "boundary_policy": "within excludes boundary-only features" if args.predicate == "within" else "intersects includes boundary contacts and may match multiple zones",
     }
+    if args.json:
+        print(json.dumps(clean({"rows": rows, "report": report}), ensure_ascii=False, allow_nan=False))
+        return
     print(tabulate(rows, headers="keys", tablefmt="simple", showindex=False))
     print("Cross match report: " + json.dumps(report, ensure_ascii=False, sort_keys=True))
 
@@ -273,12 +296,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # frequency
     s = sub.add_parser("frequency", help="frequency table for a categorical field")
+    s.add_argument("--json", action="store_true", help="Pure JSON on stdout")
     s.add_argument("input", help="input vector file")
     s.add_argument("--field", required=True)
     s.add_argument("--layer", default=None)
 
     # spatial
     s = sub.add_parser("spatial", help="spatial statistics")
+    s.add_argument("--json", action="store_true", help="Pure JSON on stdout")
     s.add_argument("input", help="input vector file")
     s.add_argument("--layer", default=None)
     s.add_argument("--analysis-crs", help="Explicit projected CRS; required for broad geographic layers")
@@ -288,6 +313,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # cross
     s = sub.add_parser("cross", help="cross analysis (point-in-polygon / overlay)")
+    s.add_argument("--json", action="store_true", help="Pure JSON on stdout")
     s.add_argument("--input", required=True, help="zones layer")
     s.add_argument("--target", required=True, help="features to count/sum")
     s.add_argument("--zone-field", required=True, help="field identifying zones")
